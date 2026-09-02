@@ -6,6 +6,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+## Added
+
+- `RustErrorKind.anchorNotFound`: a proposal that fails because the wallet has not scanned to an
+  anchorable height is classified on its own instead of as `proposalInvalid`, so a wallet can say
+  "scan further and retry" — the case it used to recognise by the upstream error text, which
+  redaction now removes.
+
 # 4.4.0 - 2026-09-10
 
 ## Added

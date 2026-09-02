@@ -32,6 +32,9 @@ public enum RustErrorKind: UInt32, Equatable {
     case expiryHeightInvalid = 18
     case balanceOverflow = 19
     case noteMismatch = 20
+    /// The wallet has not scanned to a height it can anchor the proposal on — "scan further,
+    /// then retry", where every other proposal failure is `proposalInvalid`.
+    case anchorNotFound = 21
 
     init(ffiValue: UInt32) {
         self = RustErrorKind(rawValue: ffiValue) ?? .unclassified
