@@ -25,6 +25,7 @@ use std::os::raw::c_char;
 
 use tracing::debug;
 use zcash_client_backend::data_api::error::Error as WalletError;
+use zcash_client_backend::proposal::ProposalError;
 use zcash_protocol::value::Zatoshis;
 
 /// Stable discriminants for the conditions a wallet is expected to render itself rather than
@@ -79,6 +80,7 @@ pub enum ErrorKind {
     BalanceOverflow = 19,
     /// A note being spent belongs to neither the internal nor the external viewing key.
     NoteMismatch = 20,
+    AnchorNotFound = 21,
 }
 
 /// The two amounts describing an [`ErrorKind::InsufficientFunds`] condition.
@@ -190,6 +192,14 @@ impl ClassifiedError {
             WalletError::Change(_) => (
                 ErrorKind::ChangeSelectionFailed,
                 "change selection failed, possibly for lack of spendable funds",
+            ),
+            // The wallet has not scanned to a height it can anchor the proposal on. It is the one
+            // proposal failure the wallet treats as "scan further, then retry" rather than as a bad
+            // request, so it gets its own kind instead of disappearing into `ProposalInvalid` —
+            // the wallet used to recognise it by its upstream text, which redaction removes.
+            WalletError::Proposal(ProposalError::AnchorNotFound(_)) => (
+                ErrorKind::AnchorNotFound,
+                "the wallet has not scanned far enough to anchor this payment; retry once scanning catches up",
             ),
             WalletError::Proposal(_) => (
                 ErrorKind::ProposalInvalid,
@@ -412,6 +422,20 @@ mod tests {
     }
 
     #[test]
+    fn anchor_not_found_is_classified_and_says_so() {
+        let e = ClassifiedError::classify(
+            "propose_transfer",
+            &TestError::Proposal(ProposalError::AnchorNotFound(1_000_000.into())),
+        );
+
+        assert_eq!(e.kind(), ErrorKind::AnchorNotFound);
+        assert_eq!(e.amounts(), None);
+        assert!(e.to_string().contains("anchor"));
+        // the height is a wallet-state detail; it must not reach the report
+        assert!(!e.to_string().contains("1000000"));
+    }
+
+    #[test]
     fn insufficient_funds_reports_amounts_out_of_band() {
         let available = Zatoshis::const_from_u64(120_000_000);
         let required = Zatoshis::const_from_u64(200_000_000);
@@ -522,6 +546,7 @@ mod tests {
             TestError::ExpiryHeightConflictsWithCanonicalCrossing {
                 requested: 1_000_000.into(),
             },
+            TestError::Proposal(ProposalError::AnchorNotFound(1_000_000.into())),
         ];
 
         for case in &cases {
