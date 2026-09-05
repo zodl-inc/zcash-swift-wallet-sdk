@@ -188,32 +188,65 @@ extension SlipstreamSynchronizer {
     }
 }
 
-// MARK: - PendingStopSlot (Phase E / audit SDK-2)
+// MARK: - LifecycleQueue (audit R1/R2, MOB-1850)
 
-/// Lock-guarded task slot backing the nonisolated `stop()` → isolated `start()` ordering
-/// contract: `stop()` must REGISTER its teardown synchronously (so an immediately-following
-/// `start()` can await it), but an actor's nonisolated members cannot write actor state.
-/// Consecutive stops CHAIN (each new task awaits the previous), so `take()` returns a task
-/// that transitively covers every registered stop. NSLock (not OSAllocatedUnfairLock) keeps
-/// the SDK's deployment floor.
-final class PendingStopSlot: @unchecked Sendable {
+/// One FIFO for every pass-owning lifecycle operation of `SlipstreamSynchronizer`: an app-driven
+/// start, a stop teardown, a server switch, an account import or delete, a rewind, a wipe, and the
+/// stall recovery's restart. Operations run strictly one after another, so a teardown can never
+/// interleave with a start, and an account mutation's stopped interval — the window that exists
+/// precisely so no pass scans across the mutation — can never be entered by another operation.
+///
+/// Generalises the `PendingStopSlot` it replaces. That slot solved one instance of this problem (a
+/// `stop()` landing after the `start()` that followed it) by chaining stop teardowns and having
+/// `start()` await the chain; here the chained task simply IS the queue tail, and every lifecycle
+/// operation joins it rather than only the stops. `start()` therefore no longer awaits anything
+/// explicitly: ordering is structural.
+///
+/// Two properties are load-bearing:
+///
+/// - **The tail is a separate task.** `enqueue` returns the caller's task so the caller can await
+///   its own result, while `tail` is a wrapper that swallows that result (and, in the throwing
+///   case, the error). Making the tail the caller's own task would either force every waiter to
+///   share a return type or let one operation's failure cancel the queue for the next.
+/// - **Unstructured tasks, so cancellation does not inherit.** The recovery is requested from
+///   inside `pollTask`, whose first act is to be cancelled by the very restart it asked for; a
+///   child task would die with it. For the same reason `stop()` — called from a nonisolated,
+///   possibly cancelled context — still runs its teardown to completion.
+///
+/// `NSLock` (not `OSAllocatedUnfairLock`) keeps the SDK's iOS 13 / macOS 12 deployment floor, as
+/// `PendingStopSlot` did.
+final class LifecycleQueue: @unchecked Sendable {
     private let lock = NSLock()
-    private var task: Task<Void, Never>?
+    private var tail: Task<Void, Never>?
 
-    /// Replace the slot with `make(previous)` — the maker chains onto the prior task.
-    func chain(_ make: (Task<Void, Never>?) -> Task<Void, Never>) {
+    /// Appends a non-throwing operation. The returned task completes with the operation's value,
+    /// once every operation enqueued before it has finished.
+    @discardableResult
+    func enqueue<T: Sendable>(_ operation: @escaping @Sendable () async -> T) -> Task<T, Never> {
         lock.lock()
         defer { lock.unlock() }
-        task = make(task)
+        let previous = tail
+        let task = Task<T, Never> {
+            await previous?.value
+            return await operation()
+        }
+        tail = Task { _ = await task.value }
+        return task
     }
 
-    /// Remove and return the pending chain (awaited once by `start()`).
-    func take() -> Task<Void, Never>? {
+    /// Appends a throwing operation. A failure is the caller's to handle: the queue itself only
+    /// waits for the operation to end, so the next one runs whether this one threw or not.
+    @discardableResult
+    func enqueueThrowing<T: Sendable>(_ operation: @escaping @Sendable () async throws -> T) -> Task<T, Error> {
         lock.lock()
         defer { lock.unlock() }
-        let pending = task
-        task = nil
-        return pending
+        let previous = tail
+        let task = Task<T, Error> {
+            await previous?.value
+            return try await operation()
+        }
+        tail = Task { _ = try? await task.value }
+        return task
     }
 }
 
