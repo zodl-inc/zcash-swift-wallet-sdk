@@ -1640,6 +1640,21 @@ public class SDKSynchronizer: Synchronizer {
         }
     }
 
+    /// [MOB-1850] The bounded rebuild: switch to `endpoint` first when it names a different server
+    /// (reusing `switchTo`'s own reopen + restart), then start unconditionally. `switchTo` never
+    /// gates on `endpoint` — it always tears down and rebuilds the dependency graph regardless of
+    /// whether the server actually changed — so this only calls it for an actual change, to avoid
+    /// that needless rebuild; `start(retry:)` alone then covers the case `switchTo` does not: the
+    /// synchronizer was not running before the call. `start(retry:)` is idempotent against an
+    /// already-syncing processor (see its `.syncing` case), so calling it after a `switchTo` that
+    /// already restarted one is harmless.
+    public func restartSync(at endpoint: LightWalletEndpoint) async throws {
+        if !endpoint.isSameServer(as: initializer.endpoint) {
+            try await switchTo(endpoint: endpoint)
+        }
+        try await start(retry: true)
+    }
+
     // MARK: notify state
 
     private func snapshotState(status: InternalSyncStatus) async -> SynchronizerState {

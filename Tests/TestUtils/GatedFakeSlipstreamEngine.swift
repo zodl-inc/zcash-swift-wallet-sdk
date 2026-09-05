@@ -203,10 +203,15 @@ actor GatedFakeSlipstreamEngine: SlipstreamEngineControlling {
     func start(ufvk: String?, birthday: BlockHeight, torDir: String?) async throws {
         record("start")
         await startGate.wait()
+        // [MOB-1850 hardening] In a `defer`, not a trailing statement, so a scripted `startError`
+        // still leaves a complete "start"/"start:done" pair. Entry order alone cannot tell a caller
+        // whether a start that appears in the log ever RETURNED — which is exactly what
+        // `firstTeardownWhileAStartIsInFlight` needs to answer — and a start that failed still
+        // returned (by throwing), so its trace must close the same way a successful one's does.
+        defer { record("start:done") }
         if let startError {
             throw startError
         }
-        record("start:done")
     }
 
     func stop() async {

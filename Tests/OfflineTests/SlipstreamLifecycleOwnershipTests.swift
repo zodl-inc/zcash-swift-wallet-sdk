@@ -339,6 +339,146 @@ final class SlipstreamLifecycleOwnershipTests: ZcashTestCase {
         XCTAssertEqual(callsAfterTheWipe.filter { $0 == "start" }.count, 1, "and no pass was started after the wipe")
     }
 
+    // MARK: - restartSync(at:): the bounded rebuild after a terminal recovery failure
+
+    /// The recovery path named in `restartSync(at:)`'s doc: a stall recovery's reopen fails, the
+    /// handle is gone, and the host calls `restartSync` at the SAME endpoint to rebuild it and start
+    /// a pass again.
+    func testRestartSyncRebuildsANilHandleAtTheSameEndpointAndStarts() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setNextSnapshot(SlipstreamSnapshot.testSyncing(progressPermille: 100))
+        let sync = try makeSlipstreamSynchronizer(engine: engine, container: mockContainer)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+        try await sync.start(retry: false)
+
+        // Simulate the terminal recovery failure: reopen fails, the handle is gone.
+        await engine.setReopenError(ZcashError.rustSlipstreamOpen("boom"))
+        await sync.runStallRecovery(
+            expectedPassGeneration: await sync.passGenerationForTesting(),
+            expectedStopRequestGeneration: await sync.stopRequestGenerationForTesting(),
+            attempt: 1
+        )
+        let closedAfterFailedReopen = await engine.isOpen
+        XCTAssertFalse(closedAfterFailedReopen, "the failed reopen left the handle closed")
+        await engine.setReopenError(nil)
+
+        let endpoint = await sync.currentEndpointForTesting()
+        try await sync.restartSync(at: endpoint)
+
+        let openAfterRestart = await engine.isOpen
+        XCTAssertTrue(openAfterRestart, "restartSync rebuilds the handle")
+        XCTAssertTrue(sync.latestState.internalSyncStatus.isSyncing, "and starts a pass")
+        let calls = await engine.calls
+        XCTAssertEqual(calls.filter { $0 == "start" }.count, 2, "the original start, then restartSync's own: \(calls)")
+
+        sync.stop()
+    }
+
+    /// `restartSync(at:)` starts a pass even when nothing was running before it, and records the new
+    /// endpoint — unlike `switchTo`, which only restarts a pass that was already up.
+    func testRestartSyncAtAnotherEndpointStartsEvenWhenNothingWasRunning() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setNextSnapshot(SlipstreamSnapshot.testSyncing(progressPermille: 100))
+        let sync = try makeSlipstreamSynchronizer(engine: engine)
+        await sync.setInternalSyncStatusForTesting(.stopped)
+
+        let other = LightWalletEndpoint(address: "other.example.com", port: 443, secure: true)
+        try await sync.restartSync(at: other)
+
+        XCTAssertTrue(
+            sync.latestState.internalSyncStatus.isSyncing,
+            "restartSync starts a pass regardless of the prior status: \(sync.latestState.internalSyncStatus)"
+        )
+        let calls = await engine.calls
+        XCTAssertTrue(calls.contains("reopen(other.example.com:443)"), "the handle is rebuilt at the new endpoint: \(calls)")
+        let currentEndpoint = await sync.currentEndpointForTesting()
+        XCTAssertEqual(currentEndpoint, other, "the new endpoint is recorded")
+
+        sync.stop()
+    }
+
+    /// A `restartSync(at:)` that lands while a migration submission is in flight must propagate the
+    /// same privacy gate `start(retry:)` enforces, and must not report a pass as syncing.
+    func testRestartSyncPropagatesMigrationBlockedStart() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setNextSnapshot(SlipstreamSnapshot.testSyncing(progressPermille: 100))
+        let welding = ZcashRustBackendWeldingMock()
+        let blockedAccount = TestsData.mockedAccountUUID
+        welding.listAccountsReturnValue = [
+            Account(id: blockedAccount, name: nil, keySource: nil, seedFingerprint: nil, hdAccountIndex: nil, ufvk: nil, uivk: nil)
+        ]
+        let sync = try makeSlipstreamSynchronizer(engine: engine, welding: welding)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+
+        // Mark the account's migration broadcast as in flight, so the REAL `OrchardMigrationHost`
+        // the synchronizer builds internally (wired to this `welding` and `generalStorageURL`)
+        // reports `isSyncBlocked() == true` -- the same privacy gate `startImpl` consults.
+        MigrationSyncGate(directory: testGeneralStorageDirectory, accountUUID: blockedAccount, logger: logger).markBroadcastInFlight()
+
+        let other = LightWalletEndpoint(address: "other.example.com", port: 443, secure: true)
+        do {
+            try await sync.restartSync(at: other)
+            XCTFail("expected restartSync to propagate the migration-blocked error")
+        } catch ZcashError.migrationSyncBlocked {
+            // expected
+        }
+
+        XCTAssertFalse(
+            sync.latestState.internalSyncStatus.isSyncing,
+            "a migration-blocked restart must not report a pass as syncing: \(sync.latestState.internalSyncStatus)"
+        )
+    }
+
+    // MARK: - Account mutations must not leave the poll loop alive across their stopped interval
+
+    /// `deleteAccount`'s stopped interval must be genuinely silent. Before this hardening,
+    /// `deleteAccountOnLifecycleQueue` left `isRunning == true` and the poll loop alive across its
+    /// own teardown: a fresh tick spawned by that still-alive loop captures `passGeneration` FRESH
+    /// (at the top of its own call), so the mutation's own generation bump does not retire it, and
+    /// only `isRunning` stood between it and publishing state for an engine that is mid-delete.
+    ///
+    /// `deleteAccount` stands in for `importAccount`/`rewind`, which share the identical
+    /// stop-mutate-restart shape (see `testStallRecoveryCannotStartTheEngineInsideAnAccountMutationsStoppedInterval`'s
+    /// doc for why `deleteAccount` is the offline stand-in for `importAccount`).
+    func testDeleteAccountsStoppedIntervalPublishesNoStrayState() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setNextSnapshot(SlipstreamSnapshot.testSyncing(progressPermille: 100))
+        let welding = ZcashRustBackendWeldingMock()
+        welding.deleteAccountClosure = { _ in }
+        let sync = try makeSlipstreamSynchronizer(engine: engine, welding: welding)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+        let statuses = RecordedSyncStatuses()
+        sync.stateStream.sink { statuses.append($0.internalSyncStatus) }.store(in: &cancellables)
+
+        try await sync.start(retry: false)
+        // Establish that the poll loop is genuinely alive before the mutation begins.
+        let firstTickSeen = await waitUntil { await engine.calls.filter { $0 == "snapshot" }.count >= 1 }
+        XCTAssertTrue(firstTickSeen, "the poll loop must be running before the mutation starts")
+
+        await engine.closeGate(.stop)
+        let delete = Task { try await sync.deleteAccount(TestsData.mockedAccountUUID) }
+        let stopped = await waitUntil { await engine.calls.contains("stop") }
+        XCTAssertTrue(stopped, "the delete's turn reached its teardown and is held there")
+
+        let emissionsAtHold = statuses.all.count
+
+        // A NEGATIVE claim — that the held interval produces no emission — so real time has to
+        // pass: long enough for a still-alive (pre-fix) poll loop to fire at least one more tick.
+        try await Task.sleep(nanoseconds: 2_500_000_000)
+
+        XCTAssertEqual(
+            statuses.all.count,
+            emissionsAtHold,
+            "no state may be published while an account mutation holds the engine stopped: \(statuses.all)"
+        )
+
+        await engine.openGate(.stop)
+        try await delete.value
+
+        let restarted = await waitUntil { statuses.all.count > emissionsAtHold }
+        XCTAssertTrue(restarted, "the mutation's own restart publishes state once it completes")
+    }
+
     // MARK: - The failure half of a recovery
 
     /// A reopen that fails ends the recovery, and the give-up is reported exactly once.

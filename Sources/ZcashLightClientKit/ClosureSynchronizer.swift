@@ -198,6 +198,9 @@ public protocol ClosureSynchronizer {
     /// Closure counterpart of `Synchronizer.transactionSubmissionStatus(for:)`.
     func transactionSubmissionStatus(for rawID: Data, completion: @escaping (TransactionSubmissionStatus?) -> Void)
 
+    /// Closure counterpart of `Synchronizer.restartSync(at:)`.
+    func restartSync(at endpoint: LightWalletEndpoint, completion: @escaping (Error?) -> Void)
+
     func refreshExchangeRateUSD()
 
     func estimateBirthdayHeight(for date: Date, completion: @escaping (BlockHeight) -> Void)

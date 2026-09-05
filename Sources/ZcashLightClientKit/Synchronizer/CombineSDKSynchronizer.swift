@@ -285,6 +285,12 @@ extension CombineSDKSynchronizer: CombineSynchronizer {
         }
     }
 
+    public func restartSync(at endpoint: LightWalletEndpoint) -> CompletablePublisher<Error> {
+        AsyncToCombineGateway.executeThrowingAction() {
+            try await self.synchronizer.restartSync(at: endpoint)
+        }
+    }
+
     public func refreshExchangeRateUSD() {
         synchronizer.refreshExchangeRateUSD()
     }
