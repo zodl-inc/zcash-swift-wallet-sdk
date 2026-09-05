@@ -69,6 +69,24 @@ extension SlipstreamSynchronizer {
         return true
     }
 
+    /// [MOB-1850] Test-only seam: backdates the handle-lifetime baseline, so the next
+    /// `checkStallWatchdog` evaluates the engine-reported stall span at face value instead of
+    /// clamping it to a handle that was opened moments ago.
+    ///
+    /// It is only HALF of what a test needs, because the predicate takes the minimum of two spans
+    /// (`effectiveStallSeconds`): the snapshot the engine serves must also carry a
+    /// `stalledSeconds` at or above `stallWatchdogThresholdSeconds`. There is no seam for that half
+    /// and there should not be — the stall FACT is engine-owned, so a test states it by scripting
+    /// the snapshot (`SlipstreamSnapshot.testSyncing(stalledSeconds:)`), which is what a stalled
+    /// engine really does. Only the clamp, which is Swift-side policy, needs a way in.
+    ///
+    /// The MOMENT it is called matters as much as the value: every tick from here on sees a stall,
+    /// so a test that wants a particular tick to be the one that observes it must arrange for that
+    /// tick to be the next one.
+    func seedStallClockForTesting(secondsAgo: TimeInterval) {
+        watchdogHandleStartedAt = Date().addingTimeInterval(-secondsAgo)
+    }
+
     /// B4: re-arms the stall watchdog for a new run/handle (start, switchTo, wipe), including
     /// the [MOB-1850] recovery budget — the caller is opening a handle whose stall history is
     /// its own. (The stall clock itself is engine-owned and resets with the pass; only the

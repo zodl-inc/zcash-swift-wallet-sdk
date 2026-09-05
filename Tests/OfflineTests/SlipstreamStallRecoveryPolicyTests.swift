@@ -231,21 +231,27 @@ final class SlipstreamStallRecoveryPolicyTests: ZcashTestCase {
 
     /// A failed restart must report the give-up on attempt 1, not only at the cap.
     ///
-    /// `restartHandleForRecovery` calls `stopPolling()` before anything else and `start()` throws
-    /// before it reaches `startPolling()`, so a restart whose `start()` fails leaves no poll loop
-    /// at all: nothing ticks, nothing re-decides, and the `.giveUp` branch — which lives in
-    /// `tickPoll` — can never fire. While the give-up report was gated on
+    /// `runStallRecovery` calls `stopPolling()` before anything else and `startImpl` throws before
+    /// it reaches `startPolling()`, so a restart whose start fails leaves no poll loop at all:
+    /// nothing ticks, nothing re-decides, and the `.giveUp` branch — which lives in `tickPoll` —
+    /// can never fire. While the give-up report was gated on
     /// `stallRestartAttempts >= maxStallRestartsPerHandle`, a failure on attempt 1 or 2 therefore
     /// left the synchronizer permanently stopped AND permanently silent: a host that had just been
     /// handed `.syncStalled(attempt: 1, gaveUp: false)` waited forever for a resolution nothing
-    /// could produce. This synchronizer is unprepared, so its `start()` throws
-    /// `.synchronizerNotPrepared` on the very first attempt — the most reachable of the three ways
-    /// `start()` can fail, alongside the migration gate and a dead transport failing
-    /// `engine.start()`.
+    /// could produce.
+    ///
+    /// [MOB-1850] The failure is now injected through the engine (`startError`) rather than by
+    /// leaving the synchronizer unprepared. `runStallRecovery` validates that the wallet IS prepared
+    /// before it touches anything — an unprepared synchronizer no longer reaches its restart at all,
+    /// which is the point of the test below — so the reachable ways to fail a restart's start are
+    /// the migration gate and `engine.start()` itself, which is exactly what a dead transport fails.
     func testRestartWhoseStartFailsReportsGiveUpOnTheFirstAttempt() async throws {
-        let synchronizer = try makeSynchronizer()
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setStartError(ZcashError.rustSlipstreamNotOpen)
+        let synchronizer = try makeSlipstreamSynchronizer(engine: engine)
+        await synchronizer.setInternalSyncStatusForTesting(.disconnected)
         let giveUp = XCTestExpectation(description: "give-up stall event")
-        var events: [SynchronizerEvent] = []
+        let events = RecordedEvents()
         let subscription = synchronizer.eventStream.sink { event in
             events.append(event)
             if case .syncStalled(_, let gaveUp) = event, gaveUp {
@@ -254,18 +260,19 @@ final class SlipstreamStallRecoveryPolicyTests: ZcashTestCase {
         }
         defer { subscription.cancel() }
 
-        // Generation 0 is the value a poll tick would capture on a synchronizer nothing has
-        // stopped, so both of the recovery's generation guards pass and it reaches its `start()`.
-        await synchronizer.restartHandleForRecovery(expectedStopGeneration: 0)
+        // The generations a poll tick would capture on a synchronizer nothing has stopped, so the
+        // recovery's validation passes and it reaches its restart.
+        await synchronizer.runStallRecovery(
+            expectedPassGeneration: await synchronizer.passGenerationForTesting(),
+            expectedStopRequestGeneration: await synchronizer.stopRequestGenerationForTesting(),
+            attempt: 1
+        )
 
         await fulfillment(of: [giveUp], timeout: 5)
         XCTAssertEqual(
-            events.compactMap { event -> Int? in
-                guard case .syncStalled(let attempt, let gaveUp) = event, gaveUp else { return nil }
-                return attempt
-            },
-            [1],
-            "exactly one give-up, naming the attempt that failed"
+            events.syncStalledEvents,
+            [SyncStalledReport(attempt: 1, gaveUp: false), SyncStalledReport(attempt: 1, gaveUp: true)],
+            "the restart it announced, then exactly one give-up naming the attempt that failed"
         )
     }
 
@@ -279,30 +286,70 @@ final class SlipstreamStallRecoveryPolicyTests: ZcashTestCase {
     /// a `.syncStalled(gaveUp: true)` here would tell a host the SDK had stopped trying when it
     /// has not, and a `.syncStalled(gaveUp: false)` would promise a restart nobody is performing.
     ///
-    /// `-1` stands in for "somebody bumped the counter while this restart was in flight": the
-    /// generation only ever climbs from 0, so no synchronizer can hold it and the test needs to
+    /// `-1` stands in for "somebody bumped the counter while this restart was waiting for its turn":
+    /// the generation only ever climbs from 0, so no synchronizer can hold it and the test needs to
     /// win no race to be sure the guard is the thing it exercises.
     func testRestartWithAStaleGenerationAbandonsSilently() async throws {
-        let synchronizer = try makeSynchronizer()
-        var events: [SynchronizerEvent] = []
+        let engine = GatedFakeSlipstreamEngine()
+        let synchronizer = try makeSlipstreamSynchronizer(engine: engine)
+        let events = RecordedEvents()
         let subscription = synchronizer.eventStream.sink { events.append($0) }
         defer { subscription.cancel() }
 
-        await synchronizer.restartHandleForRecovery(expectedStopGeneration: -1)
+        await synchronizer.runStallRecovery(
+            expectedPassGeneration: -1,
+            expectedStopRequestGeneration: await synchronizer.stopRequestGenerationForTesting(),
+            attempt: 1
+        )
 
-        let stallEvents = events.filter { event in
-            if case .syncStalled = event {
-                return true
-            }
-            return false
-        }
-        XCTAssertTrue(stallEvents.isEmpty, "an abandoned restart owes the host no stall report, and must not forge one")
-        XCTAssertTrue(events.isEmpty, "nor anything else: it touched no transaction and found nothing")
+        XCTAssertTrue(
+            events.syncStalledEvents.isEmpty,
+            "an abandoned restart owes the host no stall report, and must not forge one"
+        )
+        XCTAssertTrue(events.all.isEmpty, "nor anything else: it touched no transaction and found nothing")
+        // [MOB-1850] The engine is untouched, not merely un-restarted. The old restart tore the pass
+        // down BEFORE it compared generations, so `engine.stop()` had already landed by the time it
+        // abandoned; validation now happens first, so a stale recovery makes no engine call at all.
+        let calls = await engine.calls
+        XCTAssertTrue(calls.isEmpty, "and made no engine call whatsoever: \(calls)")
         XCTAssertEqual(
             synchronizer.latestState.internalSyncStatus,
             .unprepared,
             "and it started nothing: the synchronizer is exactly as the guard found it"
         )
+    }
+
+    /// A recovery restart must not reset the budget that bounds it.
+    ///
+    /// The restart brings the pass back up through `startImpl(retry:resetRecoveryBudget:)`, and
+    /// `startImpl` re-arms the stall watchdog — including, for an app-driven start, the per-handle
+    /// restart budget. If the recovery's own restart cleared that budget, `stallRestartAttempts`
+    /// would return to zero after every attempt, the cap would be unreachable and a permanently
+    /// stalled server would be restarted forever. The flag argument is what keeps the two apart;
+    /// before it, the same distinction was inferred from `stallRecoveryInFlight`, which could not
+    /// tell a recovery's restart from an app start that merely overlapped one.
+    func testRecoveryRestartPreservesTheBudgetItIsSpending() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setNextSnapshot(SlipstreamSnapshot.testSyncing(progressPermille: 100))
+        let synchronizer = try makeSlipstreamSynchronizer(engine: engine)
+        await synchronizer.setInternalSyncStatusForTesting(.disconnected)
+
+        await synchronizer.runStallRecovery(
+            expectedPassGeneration: await synchronizer.passGenerationForTesting(),
+            expectedStopRequestGeneration: await synchronizer.stopRequestGenerationForTesting(),
+            attempt: 1
+        )
+
+        let attemptsAfterRecovery = await synchronizer.stallRestartAttemptsForTesting()
+        XCTAssertEqual(attemptsAfterRecovery, 1, "the successful restart spent one attempt and did not hand itself a fresh budget")
+
+        // An app-driven start is the opposite case: a new run of the host's own deserves a clean
+        // slate, so it clears what the recovery preserved.
+        try await synchronizer.start(retry: false)
+        let attemptsAfterAppStart = await synchronizer.stallRestartAttemptsForTesting()
+        XCTAssertEqual(attemptsAfterAppStart, 0, "an app-driven start opens a new run and resets the budget")
+
+        synchronizer.stop()
     }
 
     // MARK: - Helpers
@@ -319,12 +366,13 @@ final class SlipstreamStallRecoveryPolicyTests: ZcashTestCase {
         )
     }
 
-    /// A prepared-nothing synchronizer: no engine handle, `.unprepared` status, no poll loop.
+    /// A prepared-nothing synchronizer over the REAL engine: no handle opened, `.unprepared`
+    /// status, no poll loop.
     ///
     /// Enough to drive `checkStallWatchdog`, which reads only the snapshot it is handed and the
-    /// watchdog's own Swift-side state, and enough to drive `restartHandleForRecovery`, whose
-    /// `engine.reopen` opens a real (idle) handle against the test wallet database while its
-    /// `start()` fails on the `isPrepared` guard. Neither touches the network.
+    /// watchdog's own Swift-side state. The recovery tests above use the gated fake instead
+    /// ([MOB-1850]), because what they assert is which engine calls a validated restart does and
+    /// does not make.
     private func makeSynchronizer() throws -> SlipstreamSynchronizer {
         mockContainer.mock(type: ZcashRustBackendWelding.self, isSingleton: true) { _ in ZcashRustBackendWeldingMock() }
         mockContainer.mock(type: LightWalletService.self, isSingleton: true) { _ in LightWalletServiceMock() }

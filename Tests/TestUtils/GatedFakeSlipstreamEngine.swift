@@ -6,21 +6,35 @@
 import Foundation
 @testable import ZcashLightClientKit
 
-/// A one-way latch a test opens to release calls suspended on it.
+/// A latch a test opens to release calls suspended on it.
 ///
 /// A closed gate suspends every caller of `wait()`; `open()` resumes all of them and every later
 /// caller passes straight through. That is exactly enough to pin an interleaving: hold the engine
 /// inside `stop()` while the synchronizer's next `start()` runs, then let the stop finish and assert
-/// on the order the two landed in. Reopening is not offered because a gate that could close again
-/// would make a test's timing depend on when the closing happened, which is the property these
-/// tests exist to remove.
+/// on the order the two landed in.
+///
+/// `close()` re-arms the latch. It was deliberately absent at first, because a gate that shuts at an
+/// unknown moment makes a test's outcome depend on WHEN it shut — the property these tests exist to
+/// delete. The [MOB-1850] lifecycle tests need it anyway: a synchronizer must be brought up through
+/// a real `start()` (which snapshots twice) before the interleaving under test can be arranged, so
+/// the gate that will hold the next call has to be open first. The rule that keeps it deterministic
+/// is the caller's: close a gate only while no call is inside it, and then wait on an OBSERVABLE
+/// (`onCall`, or the recorded call log) rather than on elapsed time before assuming a call arrived.
 ///
 /// `NSLock`, not `OSAllocatedUnfairLock`, for the package's iOS 13 / macOS 12 floor — the same
-/// reason `PendingStopSlot` uses one.
+/// reason `LifecycleQueue` uses one.
 final class Gate: @unchecked Sendable {
     private let lock = NSLock()
     private var isOpen = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    /// Re-arms the latch: calls arriving after this suspend until the next `open()`.
+    /// Callers already suspended are unaffected — `close()` never un-resumes anything.
+    func close() {
+        lock.lock()
+        isOpen = false
+        lock.unlock()
+    }
 
     /// Releases everything waiting on the gate, and everything that arrives later.
     func open() {
@@ -66,7 +80,20 @@ actor GatedFakeSlipstreamEngine: SlipstreamEngineControlling {
     /// An entry is appended on ENTRY, before the call's gate: a test holding the engine inside
     /// `stop()` can therefore see that the stop arrived while it is still suspended, which is the
     /// observation most interleaving assertions are built on.
+    ///
+    /// The three pass-owning calls also append a `":done"` entry when they RETURN (`"start:done"`,
+    /// `"stop:done"`, `"reopen:done"`). Entry order alone cannot express "a start was still in
+    /// flight when a teardown began", which is exactly the [MOB-1850] R2 invariant; with both edges
+    /// recorded, the trace answers it directly. The un-gated calls keep a single entry — a
+    /// `snapshot:done` on every poll tick would bury the lifecycle in noise for no gain.
     private(set) var calls: [String] = []
+
+    /// One-shot hooks keyed by call name, fired by `record(_:)` the next time that call arrives and
+    /// then removed. The point is to observe that a call REACHED the engine while it is still held
+    /// by its gate — the moment a test needs in order to arrange the next step of an interleaving —
+    /// without polling. One-shot because the natural payload is an `XCTestExpectation.fulfill()`,
+    /// which fails the test when it runs twice, and `snapshot` arrives on every poll tick.
+    private var callHooks: [String: @Sendable () -> Void] = [:]
 
     /// Whether a handle is notionally open. `open`/`reopen` set it, `close` and a failed `reopen`
     /// clear it, and `snapshot()` answers `nil` while it is false — the real engine's behaviour on a
@@ -97,6 +124,57 @@ actor GatedFakeSlipstreamEngine: SlipstreamEngineControlling {
         }
     }
 
+    /// Names one of the four gates, so a test can shut and reopen it without reaching for the
+    /// property (`engine.snapshotGate.close()` works too; this reads better in a call sequence and
+    /// keeps the enum available for hooks that want to talk about gates generically).
+    enum GateKind {
+        case stop
+        case reopen
+        case start
+        case snapshot
+    }
+
+    private nonisolated func gate(_ kind: GateKind) -> Gate {
+        switch kind {
+        case .stop: return stopGate
+        case .reopen: return reopenGate
+        case .start: return startGate
+        case .snapshot: return snapshotGate
+        }
+    }
+
+    /// Shuts a gate so the NEXT call of that kind suspends inside the engine. Safe only while no
+    /// call is currently inside it — see `Gate`'s note.
+    func closeGate(_ kind: GateKind) {
+        gate(kind).close()
+    }
+
+    /// Opens a gate, releasing whatever is held by it. The actor-isolated twin of
+    /// `engine.startGate.open()`, for symmetry with `closeGate(_:)`.
+    func openGate(_ kind: GateKind) {
+        gate(kind).open()
+    }
+
+    /// Runs `hook` the next time a call named `name` is recorded, then forgets it.
+    ///
+    /// `name` matches either the logged entry or its bare member name, so `onCall("reopen")` fires
+    /// for the `"reopen(host:port)"` the log actually carries.
+    func onCall(_ name: String, _ hook: @escaping @Sendable () -> Void) {
+        callHooks[name] = hook
+    }
+
+    /// The single logging choke point: appends the call and fires a matching one-shot hook. Called
+    /// on ENTRY, before the call's gate, so a test can see that a call arrived while it is still
+    /// being held.
+    private func record(_ name: String) {
+        calls.append(name)
+        var fired = callHooks.removeValue(forKey: name)
+        if fired == nil, let paren = name.firstIndex(of: "(") {
+            fired = callHooks.removeValue(forKey: String(name[name.startIndex..<paren]))
+        }
+        fired?()
+    }
+
     // MARK: - Scripting
 
     func setNextSnapshot(_ snapshot: SlipstreamSnapshot?) {
@@ -114,61 +192,64 @@ actor GatedFakeSlipstreamEngine: SlipstreamEngineControlling {
     // MARK: - SlipstreamEngineControlling
 
     func open(network: ZcashNetwork) throws {
-        calls.append("open")
+        record("open")
         isOpen = true
     }
 
     func setAlternates(_ endpoints: [LightWalletEndpoint]) {
-        calls.append("setAlternates")
+        record("setAlternates")
     }
 
     func start(ufvk: String?, birthday: BlockHeight, torDir: String?) async throws {
-        calls.append("start")
+        record("start")
         await startGate.wait()
         if let startError {
             throw startError
         }
+        record("start:done")
     }
 
     func stop() async {
-        calls.append("stop")
+        record("stop")
         await stopGate.wait()
+        record("stop:done")
     }
 
     func notifyTxChange() {
-        calls.append("notifyTxChange")
+        record("notifyTxChange")
     }
 
     func close() {
-        calls.append("close")
+        record("close")
         isOpen = false
     }
 
     func reopen(server newServer: LightWalletEndpoint, network: ZcashNetwork) async throws {
-        calls.append("reopen(\(newServer.host):\(newServer.port))")
+        record("reopen(\(newServer.host):\(newServer.port))")
         await reopenGate.wait()
         if let reopenError {
             isOpen = false
             throw reopenError
         }
         isOpen = true
+        record("reopen:done")
     }
 
     /// Always `nil` — "no balance data yet", which every consumer already falls back from. A test
     /// that needs real balances scripts them here.
     func walletSummary(confirmationsPolicy: ConfirmationsPolicy) -> WalletSummary? {
-        calls.append("walletSummary")
+        record("walletSummary")
         return nil
     }
 
     func snapshot() async -> SlipstreamSnapshot? {
-        calls.append("snapshot")
+        record("snapshot")
         await snapshotGate.wait()
         return isOpen ? nextSnapshot : nil
     }
 
     func drainEvents(capacity: Int) -> [SlipstreamEngineEvent] {
-        calls.append("drainEvents")
+        record("drainEvents")
         return []
     }
 }

@@ -53,7 +53,12 @@ extension ZcashTestCase {
 
         container.mock(type: ZcashRustBackendWelding.self, isSingleton: true) { _ in welding }
         container.mock(type: LightWalletService.self, isSingleton: true) { _ in LightWalletServiceMock() }
-        container.mock(type: TransactionRepository.self, isSingleton: true) { _ in TransactionRepositoryMock() }
+        // `wipe()` closes the repository's database connection before deleting the files, and the
+        // generated mock force-unwraps that closure — an un-stubbed call is a crash rather than a
+        // failure, exactly like the welding defaults above.
+        let repository = TransactionRepositoryMock()
+        repository.closeDBConnectionClosure = {}
+        container.mock(type: TransactionRepository.self, isSingleton: true) { _ in repository }
 
         let initializer = Initializer(
             container: container,
@@ -126,6 +131,45 @@ final class RecordedSyncStatuses: @unchecked Sendable {
 
     func contains(_ status: InternalSyncStatus) -> Bool {
         all.contains(status)
+    }
+}
+
+/// One `.syncStalled` event, in a form a test can compare. `SynchronizerEvent` is not `Equatable`
+/// (its other cases carry model types that are not), so an assertion about the stall reports a host
+/// received would otherwise have to be written as a `compactMap` with a pattern match at every call
+/// site — and the interesting property is almost always the exact SEQUENCE of reports.
+struct SyncStalledReport: Equatable {
+    let attempt: Int
+    let gaveUp: Bool
+}
+
+/// A thread-safe record of the events a synchronizer published — the `eventStream` counterpart of
+/// `RecordedSyncStatuses`, and for the same reason: a Combine sink fires on whatever thread sent the
+/// value, so appending to a captured local `var` from one is a data race the test invented.
+///
+/// `NSLock` for the package's iOS 13 / macOS 12 floor.
+final class RecordedEvents: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [SynchronizerEvent] = []
+
+    var all: [SynchronizerEvent] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events
+    }
+
+    /// The `.syncStalled` reports, in order — the projection nearly every lifecycle assertion wants.
+    var syncStalledEvents: [SyncStalledReport] {
+        all.compactMap { event in
+            guard case let .syncStalled(attempt, gaveUp) = event else { return nil }
+            return SyncStalledReport(attempt: attempt, gaveUp: gaveUp)
+        }
+    }
+
+    func append(_ event: SynchronizerEvent) {
+        lock.lock()
+        events.append(event)
+        lock.unlock()
     }
 }
 

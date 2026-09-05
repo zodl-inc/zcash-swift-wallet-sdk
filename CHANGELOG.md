@@ -137,6 +137,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- Slipstream lifecycle operations (start, stop, server switch, account import and delete, rewind,
+  wipe, and the stall recovery restart) now run one at a time on a single lifecycle queue, and a
+  poll tick that was suspended while one of them ran no longer emits events or schedules a recovery
+  for a pass that is gone. Previously a stale tick could resurrect a deliberately stopped
+  synchronizer, and a recovery restart could tear down a newer pass or start the engine inside an
+  account mutation's stopped interval.
 - The server benchmark behind `evaluateBestOf` and `evaluateServerSwitch` no longer ranks
   endpoints whose block stream delivers fewer blocks than requested — an empty or truncated
   stream previously recorded a near-zero time and won the ranking outright.
