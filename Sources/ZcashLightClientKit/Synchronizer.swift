@@ -545,6 +545,16 @@ public protocol Synchronizer: AnyObject {
     /// during the whole endpoint change.
     func switchTo(endpoint: LightWalletEndpoint) async throws
 
+    /// [MOB-1850] Rebuilds the engine at `endpoint` — the same server or another one — and starts a
+    /// sync pass regardless of whether one was running. This is the bounded rebuild a host calls when
+    /// the SDK's own stall recovery has given up (`SynchronizerEvent.syncStalled(attempt:gaveUp:
+    /// true)`): a plain `start()` cannot rebuild a handle a failed reopen left behind, and the
+    /// Slipstream `switchTo(endpoint:)` only restarts a pass that was already running and is a
+    /// no-op for the current server.
+    /// - Throws: what `start(retry:)` throws (`synchronizerNotPrepared`, `migrationSyncBlocked`,
+    ///   engine start errors), plus whatever the engine rebuild itself throws.
+    func restartSync(at endpoint: LightWalletEndpoint) async throws
+
     /// Checks whether the given seed is relevant to any of the derived accounts in the wallet.
     ///
     /// - parameter seed: byte array of the seed
@@ -1467,6 +1477,13 @@ private struct GetTreeStateUnimplemented: LocalizedError {
     }
 }
 
+/// Error thrown by the default `Synchronizer.restartSync(at:)` implementation.
+private struct RestartSyncUnimplemented: LocalizedError {
+    var errorDescription: String? {
+        "Synchronizer.restartSync(at:) has no default implementation. Override it in your conformer to rebuild and restart the engine."
+    }
+}
+
 /// Error thrown by the default `Synchronizer.broadcaster` implementation.
 private struct BroadcasterUnimplemented: LocalizedError {
     var errorDescription: String? {
@@ -1560,6 +1577,14 @@ public extension Synchronizer {
     /// this default and report the feature as unavailable.
     func getTreeState(height: UInt64) async throws -> Data {
         throw GetTreeStateUnimplemented()
+    }
+
+    /// Default implementation so adding `restartSync(at:)` to the protocol is not a
+    /// source-breaking change for downstream conformers. Conformers with a real engine to rebuild
+    /// (`SlipstreamSynchronizer`, `SDKSynchronizer`) override this; mocks, stubs and alternate
+    /// transports fall through here and report the capability as unavailable.
+    func restartSync(at endpoint: LightWalletEndpoint) async throws {
+        throw RestartSyncUnimplemented()
     }
 
     /// Default implementation so adding `broadcaster` to the protocol is not a
@@ -1766,9 +1791,7 @@ public extension ClosureSynchronizer {
     /// source-breaking change for downstream conformers. Conformers with broadcast
     /// support override this; mocks, stubs, and alternate transports can fall
     /// through to this default and report the feature as unavailable.
-    var broadcaster: Broadcaster {
-        UnimplementedBroadcaster()
-    }
+    var broadcaster: Broadcaster { UnimplementedBroadcaster() }
 
     /// Default implementation so adding `transactionSubmissionStatus(for:completion:)` to the
     /// protocol is not a source-breaking change for downstream conformers. Conformers that keep
@@ -1777,6 +1800,11 @@ public extension ClosureSynchronizer {
     func transactionSubmissionStatus(for rawID: Data, completion: @escaping (TransactionSubmissionStatus?) -> Void) {
         completion(nil)
     }
+
+    /// Default implementation so adding `restartSync(at:completion:)` to the protocol is not a
+    /// source-breaking change for downstream conformers. Conformers backed by a real engine override
+    /// this; the rest report the capability as unavailable, matching `Synchronizer`'s own default.
+    func restartSync(at endpoint: LightWalletEndpoint, completion: @escaping (Error?) -> Void) { completion(RestartSyncUnimplemented()) }
 }
 
 public extension CombineSynchronizer {
@@ -1784,9 +1812,7 @@ public extension CombineSynchronizer {
     /// source-breaking change for downstream conformers. Conformers with broadcast
     /// support override this; mocks, stubs, and alternate transports can fall
     /// through to this default and report the feature as unavailable.
-    var broadcaster: Broadcaster {
-        UnimplementedBroadcaster()
-    }
+    var broadcaster: Broadcaster { UnimplementedBroadcaster() }
 
     /// Default implementation so adding `transactionSubmissionStatus(for:)` to the protocol is
     /// not a source-breaking change for downstream conformers. Conformers that keep submission
@@ -1794,6 +1820,11 @@ public extension CombineSynchronizer {
     func transactionSubmissionStatus(for rawID: Data) -> SinglePublisher<TransactionSubmissionStatus?, Never> {
         Just(nil).eraseToAnyPublisher()
     }
+
+    /// Default implementation so adding `restartSync(at:)` to the protocol is not a source-breaking
+    /// change for downstream conformers. Conformers backed by a real engine override this; the rest
+    /// report the capability as unavailable, matching `Synchronizer`'s own default.
+    func restartSync(at endpoint: LightWalletEndpoint) -> CompletablePublisher<Error> { Fail(error: RestartSyncUnimplemented()).eraseToAnyPublisher() }
 }
 
 public enum SyncStatus: Equatable {

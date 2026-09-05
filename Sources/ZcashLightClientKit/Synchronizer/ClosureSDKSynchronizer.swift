@@ -292,6 +292,12 @@ extension ClosureSDKSynchronizer: ClosureSynchronizer {
         }
     }
 
+    public func restartSync(at endpoint: LightWalletEndpoint, completion: @escaping (Error?) -> Void) {
+        AsyncToClosureGateway.executeThrowingAction(completion) {
+            try await self.synchronizer.restartSync(at: endpoint)
+        }
+    }
+
     public func refreshExchangeRateUSD() {
         synchronizer.refreshExchangeRateUSD()
     }

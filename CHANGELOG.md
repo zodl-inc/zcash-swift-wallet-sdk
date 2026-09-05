@@ -62,6 +62,20 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to record this; the change is additive and the file stays readable and writable by older SDK
   builds on the same device.
 
+### Recovery
+
+- `Synchronizer.restartSync(at:)` rebuilds the sync engine at the given endpoint — the same server
+  or a different one — and starts a pass regardless of whether one was running. Call it when the
+  SDK's own stall recovery has given up (`SynchronizerEvent.syncStalled(attempt:gaveUp: true)`): a
+  plain `start()` cannot rebuild a handle a failed reopen left behind, and the Slipstream
+  `switchTo(endpoint:)` only restarts a pass that was already running and no-ops on the current
+  server. Throws what `start(retry:)` throws (`synchronizerNotPrepared`, `migrationSyncBlocked`,
+  engine start errors), plus whatever the engine rebuild itself throws. The method has a default
+  implementation that reports the capability as unavailable, so custom `Synchronizer` conformers
+  and test doubles keep compiling unchanged; the same method, with the same default, is on
+  `ClosureSynchronizer` (`restartSync(at:completion:)`) and `CombineSynchronizer` (`restartSync(at:)
+  -> CompletablePublisher<Error>`).
+
 ## Changed
 
 - `Synchronizer` gained a new requirement:

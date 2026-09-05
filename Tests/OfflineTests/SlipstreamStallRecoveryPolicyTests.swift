@@ -274,6 +274,13 @@ final class SlipstreamStallRecoveryPolicyTests: ZcashTestCase {
             [SyncStalledReport(attempt: 1, gaveUp: false), SyncStalledReport(attempt: 1, gaveUp: true)],
             "the restart it announced, then exactly one give-up naming the attempt that failed"
         )
+        // [MOB-1850 hardening] `GatedFakeSlipstreamEngine.start` records "start:done" in a `defer`,
+        // so a scripted `startError` still leaves a complete entry/exit trace -- without it, a
+        // failed start left "start" with no matching "start:done", which makes
+        // `firstTeardownWhileAStartIsInFlight` (used elsewhere in this suite) misread a failed start
+        // as one still in flight forever.
+        let calls = await engine.calls
+        XCTAssertTrue(calls.contains("start:done"), "a failed start still leaves a complete trace: \(calls)")
     }
 
     /// A restart whose generation is already stale abandons at its first guard, emitting nothing
@@ -289,9 +296,18 @@ final class SlipstreamStallRecoveryPolicyTests: ZcashTestCase {
     /// `-1` stands in for "somebody bumped the counter while this restart was waiting for its turn":
     /// the generation only ever climbs from 0, so no synchronizer can hold it and the test needs to
     /// win no race to be sure the guard is the thing it exercises.
+    ///
+    /// [MOB-1850 hardening] The synchronizer is put into `.disconnected` (a PREPARED status) before
+    /// the stale call, unlike the version of this test that shipped with the lifecycle queue. Left at
+    /// its initial `.unprepared`, the guard's `isPrepared` clause would ALSO fail on its own -- two
+    /// independent reasons to abandon, of which only one (the stale `passGeneration`) is what this
+    /// test claims to pin. A mutation that broke the generation comparison specifically would have
+    /// passed unnoticed, because `isPrepared` alone still fails the guard. With the synchronizer
+    /// prepared, the stale generation is the ONLY thing left that can make the guard abandon.
     func testRestartWithAStaleGenerationAbandonsSilently() async throws {
         let engine = GatedFakeSlipstreamEngine()
         let synchronizer = try makeSlipstreamSynchronizer(engine: engine)
+        await synchronizer.setInternalSyncStatusForTesting(.disconnected)
         let events = RecordedEvents()
         let subscription = synchronizer.eventStream.sink { events.append($0) }
         defer { subscription.cancel() }
@@ -314,7 +330,7 @@ final class SlipstreamStallRecoveryPolicyTests: ZcashTestCase {
         XCTAssertTrue(calls.isEmpty, "and made no engine call whatsoever: \(calls)")
         XCTAssertEqual(
             synchronizer.latestState.internalSyncStatus,
-            .unprepared,
+            .disconnected,
             "and it started nothing: the synchronizer is exactly as the guard found it"
         )
     }

@@ -2401,6 +2401,25 @@ class SynchronizerMock: Synchronizer {
         try await switchToEndpointClosure!(endpoint)
     }
 
+    // MARK: - restartSync
+
+    var restartSyncAtThrowableError: Error?
+    var restartSyncAtCallsCount = 0
+    var restartSyncAtCalled: Bool {
+        return restartSyncAtCallsCount > 0
+    }
+    var restartSyncAtReceivedEndpoint: LightWalletEndpoint?
+    var restartSyncAtClosure: ((LightWalletEndpoint) async throws -> Void)?
+
+    func restartSync(at endpoint: LightWalletEndpoint) async throws {
+        if let error = restartSyncAtThrowableError {
+            throw error
+        }
+        restartSyncAtCallsCount += 1
+        restartSyncAtReceivedEndpoint = endpoint
+        try await restartSyncAtClosure!(endpoint)
+    }
+
     // MARK: - isSeedRelevantToAnyDerivedAccount
 
     var isSeedRelevantToAnyDerivedAccountSeedThrowableError: Error?

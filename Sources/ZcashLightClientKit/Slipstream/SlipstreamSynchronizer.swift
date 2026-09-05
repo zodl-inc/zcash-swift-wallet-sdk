@@ -1098,6 +1098,13 @@ public actor SlipstreamSynchronizer: Synchronizer {
         stallRestartAttempts
     }
 
+    /// [MOB-1850] Test seam: `currentEndpoint` is private, so a test asserting `restartSync(at:)`
+    /// recorded the right endpoint (or reusing the current one to rebuild a nil handle) needs a way
+    /// to read it back.
+    func currentEndpointForTesting() -> LightWalletEndpoint {
+        currentEndpoint
+    }
+
     /// [MOB-1850] Ends a recovery restart that could not complete, and tells the host so.
     ///
     /// Both failure exits of `runStallRecovery` land here, and both are terminal in the
@@ -1380,6 +1387,14 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // the restart below, leaving nothing running once the recovery abandons on the generation
         // this turn has just retired. See `passIntendedRunning`.
         let wasRunning = passIntendedRunning
+        // [MOB-1850 hardening] Without this, `isRunning` stayed `true` and the poll loop stayed
+        // alive across the stopped interval below: a tick spawned fresh by that still-alive loop
+        // captures `passGeneration` at the top of its OWN call, so the `passGeneration += 1` above
+        // does not retire it, and `isRunning` was the only guard left standing between it and
+        // publishing state for an engine that is mid-import. `startImpl` (below, when `wasRunning`)
+        // restores both.
+        stopPolling()
+        isRunning = false
         await engine.stop()
 
         let uuid: AccountUUID
@@ -1444,6 +1459,12 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // scan ranges — a deep-birthday import's restore does NOT grind on after its account
         // is gone. `wasRunning` mirrors importAccount's restart contract, intent included.
         let wasRunning = passIntendedRunning
+        // [MOB-1850 hardening] See the identical comment in `importAccountOnLifecycleQueue`: without
+        // this, `isRunning` and the poll loop both survive the stopped interval below, and a tick the
+        // still-alive loop spawns fresh can publish state for the engine mid-delete. `startImpl`
+        // (below, when `wasRunning`) restores both.
+        stopPolling()
+        isRunning = false
         await engine.stop()
         try await initializer.rustBackend.deleteAccount(accountUUID)
         // `delete_account` removes the account's transactions — bump `tx_set_version`
@@ -1850,6 +1871,12 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // the engine's scope-expansion re-baseline (E-5) makes the re-scan read as a genuine
         // climb. Restart on BOTH outcomes — a failed truncate must not leave the engine dead.
         let wasRunning = passIntendedRunning
+        // [MOB-1850 hardening] See the identical comment in `importAccountOnLifecycleQueue`: without
+        // this, `isRunning` and the poll loop both survive the stopped interval below, and a tick the
+        // still-alive loop spawns fresh can publish state for the engine mid-truncate. `startImpl`
+        // (below, on both outcomes when `wasRunning`) restores both.
+        stopPolling()
+        isRunning = false
         await engine.stop()
 
         do {
@@ -2309,6 +2336,52 @@ public actor SlipstreamSynchronizer: Synchronizer {
         if wasRunning {
             try await startImpl(retry: false, resetRecoveryBudget: true)
         }
+    }
+
+    // ── Bounded rebuild (restartSync) ───────────────────────────────────────────
+
+    /// [MOB-1850] Rebuilds the engine at `endpoint` and starts a pass regardless of whether one was
+    /// running. See `Synchronizer.restartSync(at:)`'s doc for when a host calls this.
+    public func restartSync(at endpoint: LightWalletEndpoint) async throws {
+        try await lifecycle.enqueueThrowing {
+            try await self.restartSyncImpl(at: endpoint)
+        }.value
+    }
+
+    /// The queued body of `restartSync(at:)`. `switchToOnLifecycleQueue`'s sibling: the same
+    /// teardown/reopen/reset shape, but with neither of that operation's two conditions —
+    /// `restartSync` is called precisely because the ordinary paths declined to rebuild: there is no
+    /// same-endpoint no-op (the point is to rebuild a handle a failed reopen may have left closed,
+    /// even at the endpoint already in use), and it starts unconditionally rather than only when
+    /// `wasRunning` (the host calls this after a stall recovery gave up and stopped the pass, so
+    /// nothing IS running by the time this runs).
+    private func restartSyncImpl(at endpoint: LightWalletEndpoint) async throws {
+        guard latestState.internalSyncStatus.isPrepared else {
+            throw ZcashError.synchronizerNotPrepared
+        }
+        // [MOB-1850] Past the guard, so this really is taking the pass over: retire every tick
+        // decided for whatever the engine was doing before (a live pass, or the aftermath of a
+        // recovery that already gave up).
+        passGeneration += 1
+        stopPolling()
+        isRunning = false
+        await engine.stop()
+
+        try await engine.reopen(server: endpoint, network: initializer.network)
+        currentEndpoint = endpoint
+
+        // The new handle's engine-side counters start at zero, so the emission mirrors must too —
+        // same reasoning as `switchToOnLifecycleQueue` and the recovery restart.
+        lastTxSetVersion = 0
+        lastRevealRecovering = false
+        resetStallWatchdog(resetRecoveryBudget: true)
+
+        // `startImpl`, not the public `start()`: this operation is holding the queue, and a queued
+        // call would wait for itself. Unconditional — unlike `switchToOnLifecycleQueue`'s
+        // `if wasRunning`, this is the one lifecycle operation that starts a pass regardless of
+        // whether one was running, which is the whole point of a "restart after nothing is left
+        // running" API.
+        try await startImpl(retry: false, resetRecoveryBudget: true)
     }
 
     /// [v0.7 P1b] Replaces the alternate-server list at runtime — the host calls this

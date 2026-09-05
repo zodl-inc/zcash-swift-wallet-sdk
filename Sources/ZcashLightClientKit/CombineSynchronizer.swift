@@ -186,6 +186,9 @@ public protocol CombineSynchronizer {
     /// Combine counterpart of `Synchronizer.transactionSubmissionStatus(for:)`.
     func transactionSubmissionStatus(for rawID: Data) -> SinglePublisher<TransactionSubmissionStatus?, Never>
 
+    /// Combine counterpart of `Synchronizer.restartSync(at:)`.
+    func restartSync(at endpoint: LightWalletEndpoint) -> CompletablePublisher<Error>
+
     func refreshExchangeRateUSD()
 
     func estimateBirthdayHeight(for date: Date) -> SinglePublisher<BlockHeight, Error>
