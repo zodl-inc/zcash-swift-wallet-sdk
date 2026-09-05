@@ -41,7 +41,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
     public nonisolated var alias: ZcashSynchronizerAlias { initializer.alias }
 
     // ── Sync engine ────────────────────────────────────────────────────────────
-    private let engine: SlipstreamEngine
+    // [MOB-1850] The protocol, not the concrete actor: tests substitute a gated fake so the
+    // lifecycle interleavings this file guards against can be reproduced without an FFI handle.
+    private let engine: any SlipstreamEngineControlling
 
     // ── Shared infrastructure ──────────────────────────────────────────────────
     // `private` reaches the same-file private extension (Swift 4+ file-scope rule).
@@ -331,6 +333,33 @@ public actor SlipstreamSynchronizer: Synchronizer {
     ///     exactly as before. Ignored on Tor passes (probe/failover dial direct,
     ///     which would bypass the circuit).
     public init(initializer: Initializer, alternateEndpoints: [LightWalletEndpoint] = []) {
+        self.init(
+            initializer: initializer,
+            alternateEndpoints: alternateEndpoints,
+            engine: SlipstreamEngine(
+                dbURL: initializer.dataDbURL,
+                server: initializer.endpoint,
+                alternates: alternateEndpoints
+            )
+        )
+    }
+
+    /// [MOB-1850] The injecting initializer, for tests only.
+    ///
+    /// Identical to the public one in every respect but the engine: the public initializer builds a
+    /// real `SlipstreamEngine` and calls straight through to here, so there is one construction path
+    /// and a test's synchronizer is wired exactly like a shipped one. `alternateEndpoints` still
+    /// arrives so the parameter list stays honest about what the engine was given, even though the
+    /// engine itself is now the caller's.
+    ///
+    /// `internal` (not `private`) so `@testable` tests can hand in a gated fake and drive the
+    /// lifecycle deterministically — see `SlipstreamEngineControlling` for why that seam exists.
+    init(
+        initializer: Initializer,
+        alternateEndpoints: [LightWalletEndpoint],
+        engine: any SlipstreamEngineControlling
+    ) {
+        self.engine = engine
         self.initializer = initializer
         self.currentEndpoint = initializer.endpoint
         self.transactionRepository = initializer.transactionRepository
@@ -373,11 +402,6 @@ public actor SlipstreamSynchronizer: Synchronizer {
             submitPlanStore: submitPlanStore,
             multiEndpointSubmitter: initializer.container.resolve(MultiEndpointSubmitter.self),
             statusCheck: {}
-        )
-        self.engine = SlipstreamEngine(
-            dbURL: initializer.dataDbURL,
-            server: initializer.endpoint,
-            alternates: alternateEndpoints
         )
     }
 
@@ -648,7 +672,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // [E-4] Ring hygiene only: the tx signal is the snapshot-carried `txSetVersion`
         // (loss-proof — a cumulative counter can't be evicted the way ring events can);
         // the ring stays drained so overflow warnings never fire for an idle consumer.
-        _ = await engine.drainEvents()
+        // [MOB-1850] The capacity is spelled out because the seam is a protocol now, and a protocol
+        // requirement cannot carry a default. 64 is the value the concrete engine defaults to
+        // (Rust's EVENT_RING_CAP), so the drain is unchanged.
+        _ = await engine.drainEvents(capacity: 64)
 
         // B4: surface silent stalls (state==Syncing, zero counter movement) loudly.
         // [MOB-1850] And act on them: the watchdog reports the fact, the pure policy decides
@@ -1120,7 +1147,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
         visible: WalletSummary?,
         local: [AccountUUID: AccountBalance]?
     ) {
-        let summary = await engine.walletSummary()
+        // [MOB-1850] The policy is spelled out for the same reason the drain capacity is: it is the
+        // concrete engine's own default, restated because a protocol requirement cannot carry one.
+        let summary = await engine.walletSummary(confirmationsPolicy: ConfirmationsPolicy.defaultTransferPolicy())
         let provider = initializer.rustBackend as? LocalBalanceProviding
         let local = try? await provider?.getLocalAccountBalances()
         guard let summary else { return (nil, local) }
