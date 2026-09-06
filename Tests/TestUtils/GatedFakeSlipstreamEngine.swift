@@ -242,12 +242,15 @@ actor GatedFakeSlipstreamEngine: SlipstreamEngineControlling {
     func reopen(server newServer: LightWalletEndpoint, network: ZcashNetwork) async throws {
         record("reopen(\(newServer.host):\(newServer.port))")
         await reopenGate.wait()
+        // [MOB-1850 hardening] `defer`, matching `start()`: a scripted `reopenError` must still
+        // leave a complete "reopen(...)"/"reopen:done" pair, so a trace-based assertion can tell a
+        // reopen that returned (by throwing) from one still in flight.
+        defer { record("reopen:done") }
         if let reopenError {
             isOpen = false
             throw reopenError
         }
         isOpen = true
-        record("reopen:done")
     }
 
     /// Serves the scripted `nextWalletSummary` while the handle is open, `nil` otherwise —

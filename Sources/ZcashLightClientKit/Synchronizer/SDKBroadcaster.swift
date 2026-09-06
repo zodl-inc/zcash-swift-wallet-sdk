@@ -91,10 +91,19 @@ final class SDKBroadcaster: Broadcaster {
             logger.debug("Release for resubmission requested with no endpoints; transactions stay awaiting.")
             return
         }
+        // `recordPlanIfStoreExists`, not `recordPlan`: a release landing after `wipe()` must not
+        // recreate the plan store's database file for a wallet that no longer has one.
+        var releasedCount = 0
         for transaction in transactions {
-            _ = await submitPlanStore.recordPlan(txId: transaction.txId, endpoints: endpoints)
+            guard await submitPlanStore.recordPlanIfStoreExists(txId: transaction.txId, endpoints: endpoints) != nil else {
+                logger.debug(
+                    "Release for resubmission dropped for \(transaction.txId.toHexStringTxId()); the plan store no longer exists."
+                )
+                continue
+            }
+            releasedCount += 1
         }
-        logger.debug("Released \(transactions.count) created transaction(s) to background resubmission.")
+        logger.debug("Released \(releasedCount) created transaction(s) to background resubmission.")
     }
 
     func submit(

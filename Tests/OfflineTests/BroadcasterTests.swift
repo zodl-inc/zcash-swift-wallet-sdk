@@ -442,11 +442,15 @@ final class BroadcasterTests: ZcashTestCase {
             endpointSubmitter: endpointSubmitterMock
         )
         let created = [makeCreatedTransaction(seed: 0xAB), makeCreatedTransaction(seed: 0xCD)]
+        // A release always follows a creation, which already marked these transactions awaiting —
+        // the store row that gives its backing file a reason to exist before this release call.
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        let lifecycle = await store.currentLifecycle()
+        await store.markAwaitingSubmission(txIds: created.map(\.txId), lifecycle: lifecycle)
 
         await synchronizer.broadcaster.releaseForResubmission(transactions: created, to: [endpointA, endpointB])
 
         XCTAssertTrue(endpointSubmitterMock.recordedSubmissions().isEmpty, "Releasing must not itself submit")
-        let store = mockContainer.resolve(SubmitPlanStoring.self)
         for transaction in created {
             let plan = await store.plan(for: transaction.txId)
             XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA, endpointB], acceptedBy: nil))

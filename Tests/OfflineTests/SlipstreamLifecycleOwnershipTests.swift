@@ -479,6 +479,99 @@ final class SlipstreamLifecycleOwnershipTests: ZcashTestCase {
         XCTAssertTrue(restarted, "the mutation's own restart publishes state once it completes")
     }
 
+    // MARK: - A mutation restarts the engine even when the mutation itself fails
+
+    /// `deleteAccount` must not leave the engine dead when the FFI delete itself fails — mirroring
+    /// `importAccountOnLifecycleQueue`'s catch-block restart and `rewindOnLifecycleQueue`'s
+    /// restart-on-both-outcomes, which `deleteAccountOnLifecycleQueue` did not yet share: it
+    /// restarted only after a successful delete, so a failed one left `isRunning` false and the
+    /// engine stopped while the host still saw `.syncing`.
+    func testDeleteAccountRestartsAfterAFailedDelete() async throws {
+        struct DeleteFailure: Error {}
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setNextSnapshot(SlipstreamSnapshot.testSyncing(progressPermille: 100))
+        let welding = ZcashRustBackendWeldingMock()
+        welding.deleteAccountThrowableError = DeleteFailure()
+        let sync = try makeSlipstreamSynchronizer(engine: engine, welding: welding)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+
+        try await sync.start(retry: false)
+
+        do {
+            try await sync.deleteAccount(TestsData.mockedAccountUUID)
+            XCTFail("expected the delete's own FFI failure to propagate")
+        } catch is DeleteFailure {
+            // Expected: a failed delete must still be visible to its own caller.
+        }
+
+        let calls = await engine.calls
+        let lastStop = try XCTUnwrap(calls.lastIndex(of: "stop"), "the failed delete still tore the engine down: \(calls)")
+        let lastStartDone = try XCTUnwrap(calls.lastIndex(of: "start:done"), "a failed delete must not leave the engine dead: \(calls)")
+        XCTAssertGreaterThan(lastStartDone, lastStop, "the restart after the failed delete is the one left running: \(calls)")
+
+        let isRunning = await sync.isRunningForTesting()
+        XCTAssertTrue(isRunning, "the restarted pass leaves the synchronizer running again")
+    }
+
+    /// A restart that fails after a mutation itself SUCCEEDED must not vanish silently: the
+    /// mutation has nothing to throw its own caller, so the state stream is the only channel left —
+    /// exactly the one `reportStallRecoveryStopped(error:)` already uses for a stall recovery's own
+    /// restart failure. `deleteAccount` stands in for `importAccount`/`rewind`, whose success-path
+    /// restarts share the same private `publishStoppedWithError(_:)` helper.
+    func testDeleteAccountsRestartFailureAfterASuccessfulDeletePublishesErrorState() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setNextSnapshot(SlipstreamSnapshot.testSyncing(progressPermille: 100))
+        let welding = ZcashRustBackendWeldingMock()
+        welding.deleteAccountClosure = { _ in }
+        let sync = try makeSlipstreamSynchronizer(engine: engine, welding: welding)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+        let statuses = RecordedSyncStatuses()
+        sync.stateStream.sink { statuses.append($0.internalSyncStatus) }.store(in: &cancellables)
+        let events = RecordedEvents()
+        sync.eventStream.sink { events.append($0) }.store(in: &cancellables)
+
+        try await sync.start(retry: false)
+        // Only the RESTART that follows the (successful) delete should fail — not the delete itself.
+        await engine.setStartError(ZcashError.rustSlipstreamNotOpen)
+
+        try await sync.deleteAccount(TestsData.mockedAccountUUID)
+
+        let publishedError = await waitUntil {
+            statuses.all.contains { if case .error = $0 { return true } else { return false } }
+        }
+        XCTAssertTrue(publishedError, "a restart failure after a successful mutation must reach the state stream: \(statuses.all)")
+        XCTAssertTrue(
+            events.syncStalledEvents.isEmpty,
+            "the once-per-handle give-up credit belongs to stall recovery, not a mutation's own restart: \(events.syncStalledEvents)"
+        )
+    }
+
+    // MARK: - wipe() clears isRunning like every other teardown
+
+    /// `wipe()` must leave `isRunning` false, exactly like `stopImpl` and every account-mutation
+    /// teardown already do. Before this fix, `wipeOnLifecycleQueue` was the one path that left it
+    /// `true`, which `wasRunning` on a subsequent mutation would misread as a pass still owed a
+    /// restart.
+    func testWipeClearsIsRunning() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setNextSnapshot(SlipstreamSnapshot.testSyncing(progressPermille: 100))
+        let sync = try makeSlipstreamSynchronizer(engine: engine)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+
+        try await sync.start(retry: false)
+        let runningBeforeWipe = await sync.isRunningForTesting()
+        XCTAssertTrue(runningBeforeWipe, "the pass is up before the wipe")
+
+        let wiped = XCTestExpectation(description: "wipe completed")
+        sync.wipe()
+            .sink(receiveCompletion: { _ in wiped.fulfill() }, receiveValue: { _ in })
+            .store(in: &cancellables)
+        await fulfillment(of: [wiped], timeout: 5)
+
+        let runningAfterWipe = await sync.isRunningForTesting()
+        XCTAssertFalse(runningAfterWipe, "wipe must clear isRunning like every other teardown")
+    }
+
     // MARK: - The failure half of a recovery
 
     /// A reopen that fails ends the recovery, and the give-up is reported exactly once.

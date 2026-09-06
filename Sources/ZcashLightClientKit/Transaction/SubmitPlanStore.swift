@@ -56,6 +56,14 @@ protocol SubmitPlanStoring {
     /// `markAccepted(txId:host:lifecycle:)` call to prove it still belongs to this epoch.
     @discardableResult
     func recordPlan(txId: Data, endpoints: [LightWalletEndpoint]) async -> SubmitPlanLifecycle
+    /// `recordPlan`, but a no-op — returning `nil` without touching the file system — when the
+    /// store's backing database file does not exist. For a release-for-resubmission call, which
+    /// unlike `recordPlan` must never recreate a store `wipe()` has already deleted: any
+    /// transaction that was legitimately created already has a row from `markAwaitingSubmission`,
+    /// which guarantees the file exists by the time a release for it could arrive, so this can only
+    /// ever refuse a release that landed after a wipe.
+    @discardableResult
+    func recordPlanIfStoreExists(txId: Data, endpoints: [LightWalletEndpoint]) async -> SubmitPlanLifecycle?
     /// Records that `host` (`host:port`) took the transaction into its mempool.
     /// Creates the row when the transaction has no plan yet, so a transaction
     /// accepted through a path that never recorded one is still reportable.
@@ -161,6 +169,19 @@ actor SubmitPlanStore: SubmitPlanStoring {
             logger.warn("SubmitPlanStore failed to record submit plan: \(error.localizedDescription)")
         }
         return currentLifecycle()
+    }
+
+    /// `recordPlan`, but refuses to touch the file system when the database file is gone.
+    ///
+    /// `connection()` creates the directory and the SQLite file as a side effect of opening it, so
+    /// an ordinary `recordPlan` call reaching a wiped wallet would recreate `submit_plans.db` for a
+    /// wallet that no longer has one. Checking `FileManager` directly, before `connection()` ever
+    /// runs, is what makes the refusal possible: by the time this is called for a release racing a
+    /// `wipe()`, the file that release's earlier `markAwaitingSubmission` created is already gone.
+    @discardableResult
+    func recordPlanIfStoreExists(txId: Data, endpoints: [LightWalletEndpoint]) -> SubmitPlanLifecycle? {
+        guard FileManager.default.fileExists(atPath: databaseURL.path) else { return nil }
+        return recordPlan(txId: txId, endpoints: endpoints)
     }
 
     func markAccepted(txId: Data, host: String, lifecycle: SubmitPlanLifecycle) {

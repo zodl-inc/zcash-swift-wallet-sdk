@@ -55,4 +55,42 @@ final class SubmitPlanStoreWipeRaceTests: ZcashTestCase {
         let stalePlan = await store.plan(for: txId)
         XCTAssertNil(stalePlan, "old metadata must not enter the new lifecycle")
     }
+
+    // MARK: - A release for resubmission landing after wipe() must not recreate the store
+
+    /// A host's release-for-resubmission call for a transaction created before a `wipe()` must not
+    /// recreate `submit_plans.db`: unlike `recordPlan`, `recordPlanIfStoreExists` checks the file
+    /// before ever reaching `connection()`, so a release racing a wipe finds the file already gone
+    /// and drops the write instead of resurrecting the deleted store.
+    func testReleaseForResubmissionAfterWipeDoesNotRecreateTheStore() async throws {
+        let store = makeStore()
+        _ = await store.recordPlan(txId: txId, endpoints: [endpointA])
+        await store.wipe()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: databaseURL.path))
+
+        let lifecycle = await store.recordPlanIfStoreExists(txId: txId, endpoints: [endpointA])
+
+        XCTAssertNil(lifecycle, "a release landing after wipe must report nothing recorded")
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: databaseURL.path),
+            "a release landing after wipe must not recreate the deleted store"
+        )
+        let plan = await store.plan(for: txId)
+        XCTAssertNil(plan)
+    }
+
+    /// The ordinary case: a transaction the host already created (so the store has its `.awaiting`
+    /// row, and therefore its backing file) is released for resubmission normally.
+    func testReleaseForResubmissionRecordsPlanWhenStoreExists() async throws {
+        let store = makeStore()
+        let initialLifecycle = await store.currentLifecycle()
+        await store.markAwaitingSubmission(txIds: [txId], lifecycle: initialLifecycle)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: databaseURL.path), "the awaiting mark already created the file")
+
+        let lifecycle = await store.recordPlanIfStoreExists(txId: txId, endpoints: [endpointA])
+
+        XCTAssertNotNil(lifecycle, "an existing store records the release normally")
+        let plan = await store.plan(for: txId)
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA], acceptedBy: nil))
+    }
 }

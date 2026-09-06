@@ -365,6 +365,10 @@ final class SubmitPlanStoringMock: SubmitPlanStoring {
     private(set) var clearCallsCount = 0
     private(set) var wipeCallsCount = 0
     private var lifecycleGeneration = 0
+    /// Mirrors the real store's backing database file: `wipe()` deletes it, and any write that
+    /// would reach the real store's `connection()` recreates it. `recordPlanIfStoreExists` is the
+    /// one write that checks this instead of unconditionally recreating it.
+    private var storeFileExists = true
     /// When set, `plan(for:)` suspends on this gate after computing its result — reflecting the
     /// store's state at the moment of the call — but before returning it to the caller. Lets a
     /// test pin a plan read in flight across a `wipe()`, to prove a caller must capture its
@@ -400,6 +404,7 @@ final class SubmitPlanStoringMock: SubmitPlanStoring {
         // Mirrors the real store: a write carrying a token from before the most recent `wipe()`
         // is dropped instead of resurrecting a plan the caller already asked to clear.
         guard lifecycle.generation == lifecycleGeneration else { return }
+        storeFileExists = true
         for txId in txIds where plans[txId] == nil {
             plans[txId] = StoredSubmitPlan.awaiting
         }
@@ -408,6 +413,7 @@ final class SubmitPlanStoringMock: SubmitPlanStoring {
     @discardableResult
     func recordPlan(txId: Data, endpoints: [LightWalletEndpoint]) async -> SubmitPlanLifecycle {
         guard !endpoints.isEmpty else { return await currentLifecycle() }
+        storeFileExists = true
         // Acceptance survives a re-recorded plan, as it does in the real store: a host that
         // submits the same transaction again replaces the endpoint list, not the fact that a
         // server already took the transaction.
@@ -419,10 +425,19 @@ final class SubmitPlanStoringMock: SubmitPlanStoring {
         return await currentLifecycle()
     }
 
+    /// `recordPlan`, but a no-op returning `nil` when `storeFileExists` is `false` — the in-memory
+    /// stand-in for the real store's file-existence guard against recreating a wiped database.
+    @discardableResult
+    func recordPlanIfStoreExists(txId: Data, endpoints: [LightWalletEndpoint]) async -> SubmitPlanLifecycle? {
+        guard storeFileExists else { return nil }
+        return await recordPlan(txId: txId, endpoints: endpoints)
+    }
+
     func markAccepted(txId: Data, host: String, lifecycle: SubmitPlanLifecycle) async {
         // Mirrors the real store: a write carrying a token from before the most recent `wipe()`
         // is dropped instead of resurrecting a plan the caller already asked to clear.
         guard lifecycle.generation == lifecycleGeneration else { return }
+        storeFileExists = true
         switch plans[txId] {
         case .ready(let endpoints, _):
             plans[txId] = StoredSubmitPlan.ready(endpoints, acceptedBy: host)
@@ -475,5 +490,6 @@ final class SubmitPlanStoringMock: SubmitPlanStoring {
         lifecycleGeneration += 1
         plans.removeAll()
         storeUnavailable = false
+        storeFileExists = false
     }
 }
