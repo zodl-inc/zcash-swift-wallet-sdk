@@ -323,8 +323,12 @@ public actor SlipstreamSynchronizer: Synchronizer {
 
     /// True while the [#1591] stale-tip mask is zeroing spendable — surfaced to clients as
     /// `SynchronizerState.isSpendableMasked`, which is the only signal that separates "cannot
-    /// spend" from "not willing to say yet". Written wherever the unified summary is taken, read
-    /// when emitting state; mirrors `currentlyRecovering` above, including its transition logging.
+    /// spend" from "not willing to say yet". [MOB-1852] Written by the poll loop's own tick,
+    /// immediately before it emits, from the SAME flag value that emission's balances carry —
+    /// never as a side effect of `walletBalanceSnapshots()` merely being called. It used to be
+    /// the latter: a standalone caller (`getAccountsBalances()`) overwrote this on every call,
+    /// which could desynchronize it from whatever balances the NEXT tick actually published.
+    /// Mirrors `currentlyRecovering` above, including its transition logging.
     private var currentlySpendableMasked = false {
         didSet {
             // Both edges are logged, so the mask window can be measured straight off the log —
@@ -480,13 +484,17 @@ public actor SlipstreamSynchronizer: Synchronizer {
         currentlyRecovering = snap?.isRecovering == 1
         let summaries = await walletBalanceSnapshots()
         let summary = summaries.visible
+        // [MOB-1852] From this call's OWN tuple, never from `currentlySpendableMasked`: this
+        // emission's balances are `summary?.accountBalances ?? [:]` — freshly computed here, not
+        // carried over from anywhere — so the flag describing them must come from the same place.
+        // `false` alongside the `[:]` fallback: with no summary at all there is nothing to hide.
         stateSubject.send(SlipstreamSynchronizer.initialState(
             snapshot: snap,
             accountsBalances: summary?.accountBalances ?? [:],
             localAccountsBalances: summaries.local ?? [:],
             fullyScannedHeight: summary?.fullyScannedHeight,
             syncSessionID: UUID(),
-            isSpendableMasked: currentlySpendableMasked
+            isSpendableMasked: summaries.isSpendableMasked ?? false
         ))
         return .success
     }
@@ -810,6 +818,17 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // transactions for a wallet that no longer has them.
         guard isCurrent() else { return }
         let summary = summaries.visible
+        // [MOB-1852 / audit R10] Computed once, from the tuple THIS tick just fetched, and reused
+        // by every branch below — never read from `currentlySpendableMasked` directly, which a
+        // concurrent caller (e.g. a standalone `getAccountsBalances()`) could have last written for
+        // balances that have nothing to do with this tick's own emission. `nil` means this tick has
+        // no fresh summary of its own, so the flag falls back to `latestState` in lockstep with the
+        // balances (`summary?.accountBalances ?? latestState.accountsBalances` in each branch
+        // below) — never one without the other. Written back to `currentlySpendableMasked` right
+        // here, before any branch emits, so the APPLIED/LIFTED transition log still fires exactly
+        // once per real transition.
+        let masked = summaries.isSpendableMasked ?? latestState.isSpendableMasked
+        currentlySpendableMasked = masked
 
         // ── State-dispatch: Syncing vs Done vs other ──────────────────────────
         // Progress + spendability come from the snapshot (blessed `progressPermille` +
@@ -847,7 +866,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
                 latestBlockHeight: BlockHeight(snap.chainTip),
                 fullyScannedHeight: summary?.fullyScannedHeight ?? latestState.fullyScannedHeight,
                 isRecovering: recovering,
-                isSpendableMasked: currentlySpendableMasked
+                isSpendableMasked: masked
             ))
             // Fall through to foundTransactions emission below (still needed on Done).
         } else if snap.state == 1 {
@@ -866,7 +885,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
                 latestBlockHeight: BlockHeight(snap.chainTip),
                 fullyScannedHeight: summary?.fullyScannedHeight ?? latestState.fullyScannedHeight,
                 isRecovering: recovering,
-                isSpendableMasked: currentlySpendableMasked
+                isSpendableMasked: masked
             ))
             // [v2.1 Phase 2] The F2 boundary refresh lives in the ENGINE now: the unified
             // summary refreshes itself (in a background thread) when ranges_completed moves,
@@ -892,7 +911,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
                 latestBlockHeight: BlockHeight(snap.chainTip),
                 fullyScannedHeight: fullyScannedHeight,
                 isRecovering: recovering,
-                isSpendableMasked: currentlySpendableMasked
+                isSpendableMasked: masked
             ))
         }
 
@@ -910,10 +929,19 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // applied in `droppingUnreconciled`), which changes the VISIBLE list with no
         // engine write. Version moved or filter flipped → re-fetch + publish. Replaces
         // the counter-watch + SyncDone-fallback + count-dedup strategy (R6).
+        // [Task 2 review, Minor 2b] The repository read happens BEFORE the mirrors advance and
+        // before the re-check, not after: advancing `lastTxSetVersion`/`lastRevealRecovering` and
+        // only then awaiting the repository (the old order) left a window in which a wipe landing
+        // inside that await both retired the version bump AND still let the fetch complete and
+        // publish — an announcement of transactions for a wallet whose files were, by then, gone.
+        // Reading first and re-validating with `isCurrent()` after means a wipe in that window is
+        // caught before either the mirrors move or anything is emitted; the version comparison
+        // below still alone decides whether this tick has anything to report.
         if snap.txSetVersion != lastTxSetVersion || recovering != lastRevealRecovering {
+            let txs = await droppingUnreconciled(await enhanceWithState((try? await transactionRepository.find(offset: 0, limit: 50, kind: .all)) ?? []))
+            guard isCurrent() else { return }
             lastTxSetVersion = snap.txSetVersion
             lastRevealRecovering = recovering
-            let txs = await droppingUnreconciled(await enhanceWithState((try? await transactionRepository.find(offset: 0, limit: 50, kind: .all)) ?? []))
             eventSubject.send(.foundTransactions(txs, nil))
         }
     }
@@ -1247,6 +1275,14 @@ public actor SlipstreamSynchronizer: Synchronizer {
         return secondsSinceLastCheck >= resubmissionCheckInterval
     }
 
+    /// [MOB-1852] The result of one `walletBalanceSnapshots()` call — see that function's doc for
+    /// what `nil` means on each member.
+    private struct WalletBalanceSnapshots {
+        let visible: WalletSummary?
+        let local: [AccountUUID: AccountBalance]?
+        let isSpendableMasked: Bool?
+    }
+
     /// [v2.1 Phase 2] THE summary source for the slipstream path: the engine's unified
     /// phase-resolving summary (`zcashlc_slipstream_wallet_summary`, ENGINE_API_V2.md §0.5) —
     /// correct at EVERY phase (recovering ⇒ per-account Σ-reconciled balances, never over-shows;
@@ -1262,23 +1298,31 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// The visible summary is engine-owned and recovery-safe. The local snapshot always comes
     /// directly from the shared wallet database and is display-only; it remains available while
     /// the engine handle is closed during server replacement.
-    private func walletBalanceSnapshots() async -> (
-        visible: WalletSummary?,
-        local: [AccountUUID: AccountBalance]?
-    ) {
+    ///
+    /// [MOB-1852 / audit R10] No side effects: `isSpendableMasked` is returned rather than written
+    /// to `currentlySpendableMasked` directly, so the flag this call computed can never be read by
+    /// anyone other than the caller that asked for it, and can never be overwritten mid-air by an
+    /// unrelated concurrent call before ITS caller gets to read it. `nil` means no visible summary
+    /// was obtained (the engine mid-close, say); every caller then carries its own previous
+    /// balances AND their mask flag forward together, never one without the other.
+    ///
+    /// A named result type rather than a tuple — SwiftLint's `large_tuple` caps tuples at 2
+    /// members — but every call site's `.visible` / `.local` / `.isSpendableMasked` member access
+    /// reads identically either way.
+    private func walletBalanceSnapshots() async -> WalletBalanceSnapshots {
         // [MOB-1850] The policy is spelled out for the same reason the drain capacity is: it is the
         // concrete engine's own default, restated because a protocol requirement cannot carry one.
         let summary = await engine.walletSummary(confirmationsPolicy: ConfirmationsPolicy.defaultTransferPolicy())
         let provider = initializer.rustBackend as? LocalBalanceProviding
         let local = try? await provider?.getLocalAccountBalances()
-        guard let summary else { return (nil, local) }
+        guard let summary else {
+            return WalletBalanceSnapshots(visible: nil, local: local, isSpendableMasked: nil)
+        }
         let snap = await engine.snapshot()
         if snap?.isRecovering != 1 && snap?.tipFresh != 1 {
-            currentlySpendableMasked = true
-            return (summary.withSpendableMasked(), local)
+            return WalletBalanceSnapshots(visible: summary.withSpendableMasked(), local: local, isSpendableMasked: true)
         }
-        currentlySpendableMasked = false
-        return (summary, local)
+        return WalletBalanceSnapshots(visible: summary, local: local, isSpendableMasked: false)
     }
 
     // ── Accounts / Balances ────────────────────────────────────────────────────

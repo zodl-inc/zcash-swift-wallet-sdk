@@ -102,6 +102,11 @@ actor GatedFakeSlipstreamEngine: SlipstreamEngineControlling {
 
     /// What `snapshot()` returns while the handle is open.
     var nextSnapshot: SlipstreamSnapshot?
+    /// [MOB-1852] What `walletSummary(confirmationsPolicy:)` returns while the handle is open. `nil`
+    /// by default — "no balance data yet" — which every consumer already falls back from; a test
+    /// that needs real balances (e.g. to exercise the [#1591] mask) scripts one via
+    /// `setNextWalletSummary(_:)`.
+    var nextWalletSummary: WalletSummary?
     /// When set, `reopen` throws it and leaves the handle closed.
     var reopenError: Error?
     /// When set, `start` throws it once its gate has been passed.
@@ -181,6 +186,10 @@ actor GatedFakeSlipstreamEngine: SlipstreamEngineControlling {
         nextSnapshot = snapshot
     }
 
+    func setNextWalletSummary(_ summary: WalletSummary?) {
+        nextWalletSummary = summary
+    }
+
     func setReopenError(_ error: Error?) {
         reopenError = error
     }
@@ -240,11 +249,13 @@ actor GatedFakeSlipstreamEngine: SlipstreamEngineControlling {
         record("reopen:done")
     }
 
-    /// Always `nil` — "no balance data yet", which every consumer already falls back from. A test
-    /// that needs real balances scripts them here.
+    /// Serves the scripted `nextWalletSummary` while the handle is open, `nil` otherwise —
+    /// mirroring `snapshot()`'s own `isOpen` gate. Defaults to `nil` ("no balance data yet"), which
+    /// every consumer already falls back from; a test that needs real balances scripts them via
+    /// `setNextWalletSummary(_:)`.
     func walletSummary(confirmationsPolicy: ConfirmationsPolicy) -> WalletSummary? {
         record("walletSummary")
-        return nil
+        return isOpen ? nextWalletSummary : nil
     }
 
     func snapshot() async -> SlipstreamSnapshot? {

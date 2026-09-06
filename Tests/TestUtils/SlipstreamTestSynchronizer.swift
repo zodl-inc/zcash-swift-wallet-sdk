@@ -192,6 +192,7 @@ extension SlipstreamSnapshot {
         spendableHint: UInt8 = 0,
         rangesCompleted: UInt64 = 0,
         stalledSeconds: UInt32 = 0,
+        tipFresh: UInt8 = 1,
         txSetVersion: UInt64 = 0
     ) -> SlipstreamSnapshot {
         SlipstreamSnapshot(
@@ -207,7 +208,7 @@ extension SlipstreamSnapshot {
             isRecovering: 0,
             progressPermille: progressPermille,
             stalledSeconds: stalledSeconds,
-            tipFresh: 1,
+            tipFresh: tipFresh,
             txSetVersion: txSetVersion
         )
     }
