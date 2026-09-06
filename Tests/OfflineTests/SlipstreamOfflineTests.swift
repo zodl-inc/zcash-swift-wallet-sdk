@@ -197,7 +197,7 @@ class SlipstreamOfflineTests: ZcashTestCase {
         await store.markAwaitingSubmission(txIds: [awaitingTxId])
         await store.recordPlan(txId: submittedTxId, endpoints: [endpoint])
         await store.recordPlan(txId: acceptedTxId, endpoints: [endpoint])
-        await store.markAccepted(txId: acceptedTxId, host: "a.example.com:443")
+        await store.markAccepted(txId: acceptedTxId, host: "a.example.com:443", lifecycle: await store.currentLifecycle())
 
         let awaiting = await sync.transactionSubmissionStatus(for: awaitingTxId)
         XCTAssertEqual(awaiting, TransactionSubmissionStatus.awaiting)

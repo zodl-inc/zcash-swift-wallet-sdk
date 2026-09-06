@@ -119,7 +119,7 @@ final class TxResubmissionActionTests: ZcashTestCase {
         let candidate = makeOverview(rawID: rawID)
         let action = setupAction(candidates: [candidate])
         await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA])
-        await submitPlanStore.markAccepted(txId: rawID, host: "x.example.com:1")
+        await submitPlanStore.markAccepted(txId: rawID, host: "x.example.com:1", lifecycle: await submitPlanStore.currentLifecycle())
         transactionRepository.findRawIDClosure = { _ in candidate }
 
         _ = try await action.run(with: makeContext()) { _ in }

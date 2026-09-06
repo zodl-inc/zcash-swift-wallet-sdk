@@ -65,8 +65,10 @@ final class SDKBroadcaster: Broadcaster {
         logger.debug("Transaction \(txId) submitting to \(endpoints.count) endpoint(s): \(endpointList).")
 
         // Record before any network attempt so a cancelled or timed-out race
-        // still leaves the intended retry plan behind.
-        await submitPlanStore.recordPlan(txId: transaction.txId, endpoints: endpoints)
+        // still leaves the intended retry plan behind. The returned token is
+        // carried through the network race so a `wipe()` that lands while it
+        // is in flight leaves the eventual `markAccepted` call provably stale.
+        let lifecycle = await submitPlanStore.recordPlan(txId: transaction.txId, endpoints: endpoints)
 
         let outcome = await multiEndpointSubmitter.submit(transaction: transaction, to: endpoints, timing: timing)
         logger.debug("Transaction \(txId) submission \(outcome.logDescription).")
@@ -75,7 +77,7 @@ final class SDKBroadcaster: Broadcaster {
         // server" apart from "still trying" while the transaction waits to be
         // mined. Retrying continues either way — a mempool is not a commitment.
         if case .accepted(by: let endpoint) = outcome {
-            await submitPlanStore.markAccepted(txId: transaction.txId, host: "\(endpoint.host):\(endpoint.port)")
+            await submitPlanStore.markAccepted(txId: transaction.txId, host: "\(endpoint.host):\(endpoint.port)", lifecycle: lifecycle)
         }
 
         return outcome

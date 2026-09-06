@@ -173,6 +173,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SynchronizerState.isSpendableMasked` now always describes the balances carried in the same
   emission: a poll that falls back to the previous balances carries their mask flag, and a
   standalone `getAccountsBalances()` read no longer changes the flag the next emission reports.
+- A server acceptance that arrives for a submission started before `wipe()` no longer recreates
+  the deleted submit-plan store; the store tracks its lifecycle and ignores writes from a previous
+  one.
 
 # 4.1.0 - 2026-09-01
 

@@ -43,7 +43,7 @@ final class SubmitPlanStoreAcceptedTests: ZcashTestCase {
         let txId = Data(repeating: 0x22, count: 32)
         await store.recordPlan(txId: txId, endpoints: [endpointA, endpointB])
 
-        await store.markAccepted(txId: txId, host: "b.example.com:9067")
+        await store.markAccepted(txId: txId, host: "b.example.com:9067", lifecycle: await store.currentLifecycle())
 
         let plan = await store.plan(for: txId)
         XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA, endpointB], acceptedBy: "b.example.com:9067"))
@@ -53,7 +53,7 @@ final class SubmitPlanStoreAcceptedTests: ZcashTestCase {
         let store = makeStore()
         let txId = Data(repeating: 0x23, count: 32)
 
-        await store.markAccepted(txId: txId, host: "a.example.com:443")
+        await store.markAccepted(txId: txId, host: "a.example.com:443", lifecycle: await store.currentLifecycle())
 
         let plan = await store.plan(for: txId)
         XCTAssertEqual(plan, StoredSubmitPlan.ready([], acceptedBy: "a.example.com:443"))
@@ -63,9 +63,9 @@ final class SubmitPlanStoreAcceptedTests: ZcashTestCase {
         let store = makeStore()
         let txId = Data(repeating: 0x24, count: 32)
         await store.recordPlan(txId: txId, endpoints: [endpointA])
-        await store.markAccepted(txId: txId, host: "a.example.com:443")
+        await store.markAccepted(txId: txId, host: "a.example.com:443", lifecycle: await store.currentLifecycle())
 
-        await store.markAccepted(txId: txId, host: "b.example.com:9067")
+        await store.markAccepted(txId: txId, host: "b.example.com:9067", lifecycle: await store.currentLifecycle())
 
         // The last server to accept wins; the plan endpoints are untouched.
         let plan = await store.plan(for: txId)
@@ -76,7 +76,7 @@ final class SubmitPlanStoreAcceptedTests: ZcashTestCase {
         let store = makeStore()
         let txId = Data(repeating: 0x25, count: 32)
         await store.recordPlan(txId: txId, endpoints: [endpointA])
-        await store.markAccepted(txId: txId, host: "a.example.com:443")
+        await store.markAccepted(txId: txId, host: "a.example.com:443", lifecycle: await store.currentLifecycle())
 
         // A host that calls `broadcaster.submit` again for a transaction
         // already accepted re-records its plan; that must not clear the
@@ -98,7 +98,7 @@ final class SubmitPlanStoreAcceptedTests: ZcashTestCase {
         let double = SubmitPlanStoringMock()
         let txId = Data(repeating: 0x27, count: 32)
         await double.recordPlan(txId: txId, endpoints: [endpointA])
-        await double.markAccepted(txId: txId, host: "a.example.com:443")
+        await double.markAccepted(txId: txId, host: "a.example.com:443", lifecycle: await double.currentLifecycle())
 
         await double.recordPlan(txId: txId, endpoints: [endpointB])
 
@@ -134,7 +134,7 @@ final class SubmitPlanStoreAcceptedTests: ZcashTestCase {
         try makeLegacyDatabase(txId: txId, endpoints: [endpointA])
 
         let store = makeStore()
-        await store.markAccepted(txId: txId, host: "a.example.com:443")
+        await store.markAccepted(txId: txId, host: "a.example.com:443", lifecycle: await store.currentLifecycle())
 
         let plan = await store.plan(for: txId)
         XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA], acceptedBy: "a.example.com:443"))
@@ -153,7 +153,7 @@ final class SubmitPlanStoreAcceptedTests: ZcashTestCase {
         let plan = await secondStore.plan(for: txId)
         XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA], acceptedBy: nil))
 
-        await secondStore.markAccepted(txId: txId, host: "a.example.com:443")
+        await secondStore.markAccepted(txId: txId, host: "a.example.com:443", lifecycle: await secondStore.currentLifecycle())
         let accepted = await secondStore.plan(for: txId)
         XCTAssertEqual(accepted, StoredSubmitPlan.ready([endpointA], acceptedBy: "a.example.com:443"))
     }

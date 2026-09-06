@@ -40,13 +40,26 @@ extension StoredSubmitPlan {
     }
 }
 
+/// A token identifying one epoch of the submit-plan store's lifetime. `wipe()` retires the
+/// current token and starts a new one, so a write still carrying a retired token (an acceptance
+/// for a submission that began before the wipe) can be recognized as stale instead of being
+/// applied to — and thereby recreating — the store the caller already asked to delete.
+struct SubmitPlanLifecycle: Equatable, Sendable {
+    let generation: Int
+}
+
 protocol SubmitPlanStoring {
     func markAwaitingSubmission(txIds: [Data]) async
-    func recordPlan(txId: Data, endpoints: [LightWalletEndpoint]) async
+    /// Records the plan and returns the store's current lifecycle token, for a later
+    /// `markAccepted(txId:host:lifecycle:)` call to prove it still belongs to this epoch.
+    @discardableResult
+    func recordPlan(txId: Data, endpoints: [LightWalletEndpoint]) async -> SubmitPlanLifecycle
     /// Records that `host` (`host:port`) took the transaction into its mempool.
     /// Creates the row when the transaction has no plan yet, so a transaction
     /// accepted through a path that never recorded one is still reportable.
-    func markAccepted(txId: Data, host: String) async
+    /// Dropped — logged, not thrown — when `lifecycle` belongs to an epoch the store has since
+    /// wiped: see `currentLifecycle()`.
+    func markAccepted(txId: Data, host: String, lifecycle: SubmitPlanLifecycle) async
     /// `nil` means the store was read successfully and has no row — a legacy
     /// transaction unknown to this store. Read failures return
     /// `.storeUnavailable`, never `nil`.
@@ -57,6 +70,11 @@ protocol SubmitPlanStoring {
     /// Deletes the backing database file and resets the store so it can start
     /// fresh. Part of `Synchronizer.wipe()`.
     func wipe() async
+    /// The store's current lifecycle token. A caller that cannot keep the token `recordPlan`
+    /// returned (because it re-reads the plan after some other async work, rather than holding
+    /// onto the token from when it recorded the plan) fetches a fresh one here immediately before
+    /// the work whose result will flow into `markAccepted`.
+    func currentLifecycle() async -> SubmitPlanLifecycle
 }
 
 /// SQLite-backed store for per-transaction submit plans.
@@ -72,6 +90,7 @@ actor SubmitPlanStore: SubmitPlanStoring {
 
     private var cachedConnection: Connection?
     private var connectionFailed = false
+    private var lifecycleGeneration = 0
 
     private static let tableName = "tx_submit_plans"
     private static let acceptedHostColumnName = "accepted_host"
@@ -109,9 +128,10 @@ actor SubmitPlanStore: SubmitPlanStoring {
         }
     }
 
-    func recordPlan(txId: Data, endpoints: [LightWalletEndpoint]) {
-        guard !endpoints.isEmpty else { return }
-        guard let connection = connection() else { return }
+    @discardableResult
+    func recordPlan(txId: Data, endpoints: [LightWalletEndpoint]) -> SubmitPlanLifecycle {
+        guard !endpoints.isEmpty else { return currentLifecycle() }
+        guard let connection = connection() else { return currentLifecycle() }
         do {
             let storedEndpoints = endpoints.map { StoredEndpoint(endpoint: $0) }
             let encoded = try JSONEncoder().encode(storedEndpoints)
@@ -130,9 +150,18 @@ actor SubmitPlanStore: SubmitPlanStoring {
         } catch {
             logger.warn("SubmitPlanStore failed to record submit plan: \(error.localizedDescription)")
         }
+        return currentLifecycle()
     }
 
-    func markAccepted(txId: Data, host: String) {
+    func markAccepted(txId: Data, host: String, lifecycle: SubmitPlanLifecycle) {
+        // [R11] A wipe that landed while this acceptance's submission was still in flight retired
+        // this token. Applying the write now would reopen `connection()` and recreate the database
+        // file the wipe just deleted — for a submission the caller already asked to forget. Log and
+        // drop instead of throwing: this is an ordinary, expected race, not a failure.
+        guard lifecycle.generation == lifecycleGeneration else {
+            logger.info("SubmitPlanStore ignored an acceptance from a previous wallet lifecycle.")
+            return
+        }
         guard let connection = connection() else { return }
         do {
             // Insert-then-update rather than an upsert: a replacing insert would
@@ -223,6 +252,10 @@ actor SubmitPlanStore: SubmitPlanStoring {
     }
 
     func wipe() {
+        // Retire the current lifecycle first, before anything else: any `markAccepted` call
+        // already holding a token from this epoch — a foreground submission whose network race is
+        // still in flight — must see the mismatch, however soon after this line it arrives.
+        lifecycleGeneration += 1
         // Drop the connection first so the file handle is closed, then remove
         // the file itself: row deletion alone would leave transaction ids and
         // endpoints recoverable from SQLite free pages after a wallet wipe.
@@ -234,6 +267,10 @@ actor SubmitPlanStore: SubmitPlanStoring {
         } catch {
             logger.warn("SubmitPlanStore failed to delete its database file: \(error)")
         }
+    }
+
+    func currentLifecycle() -> SubmitPlanLifecycle {
+        SubmitPlanLifecycle(generation: lifecycleGeneration)
     }
 
     private static let schemaVersion: Int64 = 1
