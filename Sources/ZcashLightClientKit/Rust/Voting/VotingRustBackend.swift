@@ -1507,6 +1507,32 @@ extension VotingRustBackend {
     }
 }
 
+// MARK: - Proving cancellation (audit R9, MOB-1860)
+
+/// A `Bool` set once from a `withTaskCancellationHandler`'s `onCancel`, and read once by the
+/// detached proving closure in `buildAndProveDelegation` before it calls into the FFI entry point
+/// (or the test double standing in for it) — see that method's doc comment for the cancellation
+/// story this closes.
+///
+/// `NSLock`, not `OSAllocatedUnfairLock`, for the package's iOS 13 / macOS 12 floor, the same reason
+/// `Gate` and `LifecycleQueue` use one.
+private final class ProvingCancellationFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flagged = false
+
+    func markCancelled() {
+        lock.lock()
+        flagged = true
+        lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return flagged
+    }
+}
+
 // MARK: - Delegation workflow
 
 extension VotingRustBackend {
@@ -1993,6 +2019,18 @@ extension VotingRustBackend {
     /// this backend can deadlock.
     ///
     /// Holds the interactive proving QoS boost while the proof itself runs.
+    ///
+    /// Cancellation (audit R9, MOB-1860): a caller that cancels while the PIR
+    /// servers are still being probed — or in the brief window between
+    /// resolution finishing and the detached proving call being scheduled —
+    /// never reaches the FFI at all. `PirSnapshotResolver.resolve` and this
+    /// method both check for cancellation before that point and throw
+    /// `CancellationError` instead of starting the proof. Once the FFI has
+    /// actually been entered, though, nothing here can interrupt it: the
+    /// underlying `zcashlc_voting_build_and_prove_delegation` call is
+    /// synchronous and non-cooperative, and runs to completion regardless of
+    /// later cancellation. That limitation is inherent to the FFI boundary, not
+    /// something this method closes.
     public func buildAndProveDelegation(
         _ params: VotingDelegationProofParams,
         pirEndpoints: [String],
@@ -2000,6 +2038,51 @@ extension VotingRustBackend {
         pirLayout: VotingPirLayout = .unknown,
         pirResolver: PirSnapshotResolver = PirSnapshotResolver(),
         progress: (@Sendable (Double) -> Void)? = nil
+    ) async throws -> VotingDelegationProofResult {
+        try await buildAndProveDelegation(
+            params,
+            pirEndpoints: pirEndpoints,
+            expectedSnapshotHeight: expectedSnapshotHeight,
+            pirLayout: pirLayout,
+            pirResolver: pirResolver,
+            progress: progress,
+            // A closure literal, not the bare `syncBuildAndProveDelegation` method reference: a
+            // bound instance-method value is not inferred `@Sendable` even though `self` is
+            // `@unchecked Sendable`, which would otherwise warn on every call.
+            proveEntry: { [self] proveParams, url, layout, proveProgress in
+                try syncBuildAndProveDelegation(
+                    proveParams,
+                    pirServerUrl: url,
+                    pirLayout: layout,
+                    progress: proveProgress
+                )
+            }
+        )
+    }
+
+    /// Test seam for the method above (audit R9, MOB-1860). `proveEntry` stands
+    /// in for the FFI entry point (`syncBuildAndProveDelegation` in production)
+    /// so a test can observe whether it was reached — and control what it
+    /// returns or throws — without paying for the real, potentially
+    /// minutes-long proof.
+    ///
+    /// `proveEntry` has no default value: Swift does not allow a method's
+    /// default argument to reference another instance member, so the public
+    /// overload above supplies `syncBuildAndProveDelegation` explicitly on
+    /// every call instead of defaulting to it here.
+    func buildAndProveDelegation(
+        _ params: VotingDelegationProofParams,
+        pirEndpoints: [String],
+        expectedSnapshotHeight: UInt64,
+        pirLayout: VotingPirLayout = .unknown,
+        pirResolver: PirSnapshotResolver = PirSnapshotResolver(),
+        progress: (@Sendable (Double) -> Void)? = nil,
+        proveEntry: @escaping @Sendable (
+            VotingDelegationProofParams,
+            String,
+            VotingPirLayout,
+            (@Sendable (Double) -> Void)?
+        ) throws -> VotingDelegationProofResult
     ) async throws -> VotingDelegationProofResult {
         try requireOpenDatabase()
 
@@ -2014,19 +2097,33 @@ extension VotingRustBackend {
             expectedSnapshotHeight: BlockHeight(expectedSnapshotHeight)
         )
 
+        // `resolve` above already refuses to return a match once cancelled, but a cancellation
+        // that lands in the instant between `resolve` returning and this check still needs to be
+        // caught here, before the detached proving call below can be scheduled at all.
+        try Task.checkCancellation()
+
+        let cancellationFlag = ProvingCancellationFlag()
+
         // The proving FFI can run for minutes; detach so we do not block the
         // caller's executor for the full duration. `VotingRustBackend` is
         // `@unchecked Sendable`, the lock keeps `withHandle` correct, and
         // `notes`/byte arrays cross the boundary by value.
-        return try await Self.withInteractiveProvingBoost {
-            try await Task.detached(priority: .userInitiated) { [self] in
-                try syncBuildAndProveDelegation(
-                    params,
-                    pirServerUrl: pirServerUrl,
-                    pirLayout: pirLayout,
-                    progress: progress
-                )
-            }.value
+        //
+        // `withTaskCancellationHandler` closes the remaining race: a cancellation that lands after
+        // the check above but before the detached closure runs sets `cancellationFlag`, which the
+        // closure consults before calling `proveEntry`. Once `proveEntry` has been entered, nothing
+        // here can interrupt it — see this method's doc comment for why.
+        return try await withTaskCancellationHandler {
+            try await Self.withInteractiveProvingBoost {
+                try await Task.detached(priority: .userInitiated) {
+                    if cancellationFlag.isCancelled {
+                        throw CancellationError()
+                    }
+                    return try proveEntry(params, pirServerUrl, pirLayout, progress)
+                }.value
+            }
+        } onCancel: {
+            cancellationFlag.markCancelled()
         }
     }
 

@@ -176,6 +176,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A server acceptance that arrives for a submission started before `wipe()` no longer recreates
   the deleted submit-plan store; the store tracks its lifecycle and ignores writes from a previous
   one.
+- Cancelling a delegation proof while the PIR servers are still being probed no longer lets the
+  proof start afterwards: the resolver and the proving call now check for cancellation before
+  entering the FFI.
 
 # 4.1.0 - 2026-09-01
 
