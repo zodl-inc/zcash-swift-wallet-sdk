@@ -7,7 +7,7 @@ import XCTest
 @testable import TestUtils
 @testable import ZcashLightClientKit
 
-/// [R11] A server acceptance for a submission that started before `wipe()` must not recreate the
+/// A server acceptance for a submission that started before `wipe()` must not recreate the
 /// deleted submit-plan store. `wipe()` retires the store's current lifecycle token before it
 /// touches the connection or the file, so a `markAccepted` call still carrying the retired token —
 /// a foreground submission's network race that was in flight when the wipe landed — is recognized

@@ -83,6 +83,20 @@ final class SDKBroadcaster: Broadcaster {
         return outcome
     }
 
+    func releaseForResubmission(
+        transactions: [CreatedTransaction],
+        to endpoints: [LightWalletEndpoint]
+    ) async {
+        guard !endpoints.isEmpty else {
+            logger.debug("Release for resubmission requested with no endpoints; transactions stay awaiting.")
+            return
+        }
+        for transaction in transactions {
+            _ = await submitPlanStore.recordPlan(txId: transaction.txId, endpoints: endpoints)
+        }
+        logger.debug("Released \(transactions.count) created transaction(s) to background resubmission.")
+    }
+
     func submit(
         transactions: [CreatedTransaction],
         to endpoints: [LightWalletEndpoint],
@@ -121,6 +135,12 @@ final class SDKBroadcaster: Broadcaster {
         recordingPlans: Bool
     ) async throws -> [CreatedTransaction] {
         try statusCheck()
+
+        // Captured before the (potentially slow) sapling-parameter download and proving work so a
+        // `wipe()` that lands mid-flight leaves the eventual `markAwaitingSubmission` call provably
+        // stale instead of reopening — and thereby recreating — the database `wipe()` just deleted.
+        let lifecycle = await submitPlanStore.currentLifecycle()
+
         try await downloadSaplingParamsIfNeeded()
 
         let createdTransactions = try await transactionEncoder.createProposedTransactions(
@@ -132,7 +152,8 @@ final class SDKBroadcaster: Broadcaster {
         return await finishCreation(
             createdTransactions: createdTransactions,
             overviews: overviews,
-            recordingPlans: recordingPlans
+            recordingPlans: recordingPlans,
+            lifecycle: lifecycle
         )
     }
 
@@ -142,6 +163,13 @@ final class SDKBroadcaster: Broadcaster {
         recordingPlans: Bool
     ) async throws -> [CreatedTransaction] {
         try statusCheck()
+
+        // Captured before the (potentially slow) sapling-parameter download and PCZT extraction so
+        // a `wipe()` that lands mid-flight leaves the eventual `markAwaitingSubmission` call
+        // provably stale instead of reopening — and thereby recreating — the database `wipe()` just
+        // deleted.
+        let lifecycle = await submitPlanStore.currentLifecycle()
+
         try await downloadSaplingParamsIfNeeded()
 
         let txId = try await initializer.rustBackend.extractAndStoreTxFromPCZT(
@@ -159,7 +187,8 @@ final class SDKBroadcaster: Broadcaster {
         return await finishCreation(
             createdTransactions: [createdTransaction],
             overviews: overviews,
-            recordingPlans: recordingPlans
+            recordingPlans: recordingPlans,
+            lifecycle: lifecycle
         )
     }
 
@@ -197,12 +226,13 @@ final class SDKBroadcaster: Broadcaster {
     private func finishCreation(
         createdTransactions: [CreatedTransaction],
         overviews: [ZcashTransaction.Overview],
-        recordingPlans: Bool
+        recordingPlans: Bool,
+        lifecycle: SubmitPlanLifecycle
     ) async -> [CreatedTransaction] {
         let txIdList = createdTransactions.map { $0.txId.toHexStringTxId() }.joined(separator: ", ")
         if recordingPlans {
             logger.debug("Created \(createdTransactions.count) transaction(s) awaiting submission by the app: \(txIdList).")
-            await submitPlanStore.markAwaitingSubmission(txIds: createdTransactions.map(\.txId))
+            await submitPlanStore.markAwaitingSubmission(txIds: createdTransactions.map(\.txId), lifecycle: lifecycle)
         } else {
             logger.debug("Created \(createdTransactions.count) transaction(s) for immediate submission: \(txIdList).")
         }

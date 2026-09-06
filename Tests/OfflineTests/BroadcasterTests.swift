@@ -316,7 +316,7 @@ final class BroadcasterTests: ZcashTestCase {
         XCTAssertEqual(plan, StoredSubmitPlan.ready([acceptingService.endpoint], acceptedBy: "\(acceptingService.endpoint.host):\(acceptingService.endpoint.port)"))
     }
 
-    // MARK: - Wipe race: a late acceptance for a submission started before wipe() [R11]
+    // MARK: - Wipe race: a late acceptance for a submission started before wipe()
 
     /// A `wipe()` that lands while a foreground `submit` is still racing its network call must win:
     /// the acceptance that eventually arrives belongs to a submission the caller already asked to
@@ -426,6 +426,91 @@ final class BroadcasterTests: ZcashTestCase {
             freshPlan,
             StoredSubmitPlan.ready([freshEndpoint], acceptedBy: "\(freshEndpoint.host):\(freshEndpoint.port)")
         )
+    }
+
+    // MARK: - Release for resubmission
+
+    /// A host that created transactions but could not hand them to a server itself releases them
+    /// to the SDK's background resubmission: each transaction's plan moves straight to `.ready`
+    /// with the given endpoints, and no network attempt is made.
+    func testReleaseForResubmissionRecordsPlansWithoutSubmitting() async throws {
+        let endpointA = LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
+        let endpointB = LightWalletEndpoint(address: "b.example.com", port: 9067, secure: false)
+        let endpointSubmitterMock = EndpointSubmitterMock()
+        let synchronizer = try makeSynchronizer(
+            transactionEncoder: StubTransactionEncoder(createdTransactions: []),
+            endpointSubmitter: endpointSubmitterMock
+        )
+        let created = [makeCreatedTransaction(seed: 0xAB), makeCreatedTransaction(seed: 0xCD)]
+
+        await synchronizer.broadcaster.releaseForResubmission(transactions: created, to: [endpointA, endpointB])
+
+        XCTAssertTrue(endpointSubmitterMock.recordedSubmissions().isEmpty, "Releasing must not itself submit")
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        for transaction in created {
+            let plan = await store.plan(for: transaction.txId)
+            XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA, endpointB], acceptedBy: nil))
+        }
+    }
+
+    /// An empty endpoint list records nothing: a transaction already marked `.awaiting` by
+    /// creation stays that way, so it remains excluded from background resubmission until the
+    /// host releases it with real endpoints.
+    func testReleaseForResubmissionWithEmptyEndpointsLeavesTransactionAwaiting() async throws {
+        let rawID = Data(repeating: 0xEF, count: 32)
+        let rawTransaction = Data([0x01, 0x02])
+        let overviews = [makeTransaction(raw: rawTransaction, rawID: rawID)]
+        let transactionEncoder = StubTransactionEncoder(createdTransactions: overviews)
+        let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder)
+        await synchronizer.updateStatus(.stopped)
+
+        let created = try await synchronizer.broadcaster.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        let planBefore = await store.plan(for: rawID)
+        XCTAssertEqual(planBefore, StoredSubmitPlan.awaiting)
+
+        await synchronizer.broadcaster.releaseForResubmission(transactions: created, to: [])
+
+        let planAfter = await store.plan(for: rawID)
+        XCTAssertEqual(planAfter, StoredSubmitPlan.awaiting, "An empty endpoint list must record nothing; the transaction stays awaiting")
+    }
+
+    // MARK: - Wipe race: a stale awaiting-mark for a transaction created before wipe()
+
+    /// A `wipe()` that lands while a transaction is still being created (proving, PCZT
+    /// extraction) must not have the eventual `markAwaitingSubmission` call recreate the deleted
+    /// submit-plan store: the lifecycle token is captured before creation starts, so by the time
+    /// `finishCreation` writes the awaiting mark, a wipe that landed meanwhile makes the token
+    /// provably stale — mirroring the existing guard on a late `submit` acceptance.
+    func testCreationDropsAwaitingMarkWhenWipedDuringCreation() async throws {
+        let rawID = Data(repeating: 0xFA, count: 32)
+        let rawTransaction = Data([0x01, 0x02, 0x03])
+        let overviews = [makeTransaction(raw: rawTransaction, rawID: rawID)]
+        let transactionEncoder = StubTransactionEncoder(createdTransactions: overviews)
+        let synchronizer = try makeSynchronizer(transactionEncoder: transactionEncoder)
+        await synchronizer.updateStatus(.stopped)
+
+        let store = mockContainer.resolve(SubmitPlanStoring.self)
+        let plansDatabaseURL = submitPlanDatabaseURL(for: synchronizer)
+        transactionEncoder.onCreateProposedTransactions = {
+            await store.wipe()
+        }
+
+        let created = try await synchronizer.broadcaster.createProposedTransactions(
+            proposal: Proposal.testOnlyFakeProposal(totalFee: 10),
+            spendingKey: TestsData(networkType: .testnet).spendingKey
+        )
+        XCTAssertEqual(created.map(\.txId), [rawID])
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: plansDatabaseURL.path),
+            "a mark-awaiting call for a transaction created before wipe() must not recreate the store file"
+        )
+        let plan = await store.plan(for: rawID)
+        XCTAssertNil(plan, "A wipe landing during creation must not be undone by a stale awaiting-mark")
     }
 
     // MARK: - Submission status reported to the host
@@ -715,6 +800,9 @@ private final class StubTransactionEncoder: TransactionEncoder {
     private(set) var receivedCreateArguments: (proposal: Proposal, spendingKey: UnifiedSpendingKey)?
     private(set) var receivedFetchTxIds: [Data]?
     private(set) var submittedTransactions: [EncodedTransaction] = []
+    /// Runs at the start of `createProposedTransactions`, standing in for the (potentially slow)
+    /// proving work it represents — e.g. to land a `wipe()` while a transaction is mid-creation.
+    var onCreateProposedTransactions: (() async -> Void)?
 
     init(
         createdTransactions overviews: [ZcashTransaction.Overview],
@@ -769,6 +857,9 @@ private final class StubTransactionEncoder: TransactionEncoder {
         spendingKey: UnifiedSpendingKey
     ) async throws -> [CreatedTransaction] {
         receivedCreateArguments = (proposal, spendingKey)
+        if let onCreateProposedTransactions {
+            await onCreateProposedTransactions()
+        }
         return createdTransactions
     }
 

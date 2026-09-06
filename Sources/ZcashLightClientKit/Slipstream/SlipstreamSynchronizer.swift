@@ -929,7 +929,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // applied in `droppingUnreconciled`), which changes the VISIBLE list with no
         // engine write. Version moved or filter flipped → re-fetch + publish. Replaces
         // the counter-watch + SyncDone-fallback + count-dedup strategy (R6).
-        // [Task 2 review, Minor 2b] The repository read happens BEFORE the mirrors advance and
+        // The repository read happens BEFORE the mirrors advance and
         // before the re-check, not after: advancing `lastTxSetVersion`/`lastRevealRecovering` and
         // only then awaiting the repository (the old order) left a window in which a wipe landing
         // inside that await both retired the version bump AND still let the fetch complete and

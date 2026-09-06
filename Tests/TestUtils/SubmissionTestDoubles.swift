@@ -365,8 +365,41 @@ final class SubmitPlanStoringMock: SubmitPlanStoring {
     private(set) var clearCallsCount = 0
     private(set) var wipeCallsCount = 0
     private var lifecycleGeneration = 0
+    /// When set, `plan(for:)` suspends on this gate after computing its result — reflecting the
+    /// store's state at the moment of the call — but before returning it to the caller. Lets a
+    /// test pin a plan read in flight across a `wipe()`, to prove a caller must capture its
+    /// lifecycle token before this read rather than merely before whatever it does with the
+    /// result: a token captured after the read could already reflect a wipe that landed while the
+    /// read itself was still in flight, one actor-hop earlier than a caller might expect.
+    var planReadGate: Gate?
+    // `plan(for:)` and `awaitPlanReadStarted()` run on different concurrent tasks (the resubmitter
+    // under test and the test itself), unlike every other member here which this mock's tests only
+    // ever call sequentially from one task. This mock is a plain class, not an actor, so that
+    // genuine cross-task access needs its own synchronization — the same `DispatchQueue.sync`
+    // idiom `EndpointSubmitterMock.awaitSubmissionStarted(to:)` already uses.
+    private let planReadQueue = DispatchQueue(label: "SubmitPlanStoringMock.planRead")
+    private var planReadStarted = false
+    private var planReadContinuations: [CheckedContinuation<Void, Never>] = []
 
-    func markAwaitingSubmission(txIds: [Data]) async {
+    /// Suspends until a `plan(for:)` call has been recorded, mirroring
+    /// `EndpointSubmitterMock.awaitSubmissionStarted(to:)`. A single "has any read started" signal
+    /// is enough — this mock's `planReadGate`-driven tests only ever have one read in flight.
+    func awaitPlanReadStarted() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            planReadQueue.sync {
+                if planReadStarted {
+                    continuation.resume()
+                } else {
+                    planReadContinuations.append(continuation)
+                }
+            }
+        }
+    }
+
+    func markAwaitingSubmission(txIds: [Data], lifecycle: SubmitPlanLifecycle) async {
+        // Mirrors the real store: a write carrying a token from before the most recent `wipe()`
+        // is dropped instead of resurrecting a plan the caller already asked to clear.
+        guard lifecycle.generation == lifecycleGeneration else { return }
         for txId in txIds where plans[txId] == nil {
             plans[txId] = StoredSubmitPlan.awaiting
         }
@@ -404,7 +437,20 @@ final class SubmitPlanStoringMock: SubmitPlanStoring {
 
     func plan(for txId: Data) async -> StoredSubmitPlan? {
         guard !storeUnavailable else { return .storeUnavailable }
-        return plans[txId]
+        let result = plans[txId]
+
+        let waiters: [CheckedContinuation<Void, Never>] = planReadQueue.sync {
+            planReadStarted = true
+            let waiters = planReadContinuations
+            planReadContinuations = []
+            return waiters
+        }
+        waiters.forEach { $0.resume() }
+
+        if let planReadGate {
+            await planReadGate.wait()
+        }
+        return result
     }
 
     func allPlannedTransactionIds() async -> [Data] {
