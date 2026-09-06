@@ -10,12 +10,12 @@ import XCTest
 
 /// [MOB-1850] Who owns the engine, and for how long.
 ///
-/// Two audit findings meet here. **R1**: a poll tick decides things — that the pass has stalled,
+/// Two problems meet here. First, a poll tick decides things — that the pass has stalled,
 /// what state to publish, whether to re-fetch transactions — and then suspends inside an engine
 /// call. By the time it resumes, the pass it decided for may be gone: the app stopped the
 /// synchronizer, a server switch replaced the handle, a wipe deleted the wallet. Acting on a
 /// decision taken for a pass that no longer exists is how a deliberately stopped synchronizer came
-/// back to life. **R2**: the stall recovery tears the engine down and brings it back up, and while
+/// back to life. Second, the stall recovery tears the engine down and brings it back up, and while
 /// it was an unstructured task racing every other lifecycle path, it could tear down a pass a
 /// switch had just started, or start the engine in the middle of an account mutation's stopped
 /// interval — the interval that exists precisely because no pass may run across the mutation.
@@ -34,7 +34,7 @@ final class SlipstreamLifecycleOwnershipTests: ZcashTestCase {
         try await super.tearDown()
     }
 
-    // MARK: - R1: a tick belongs to the pass that scheduled it
+    // MARK: - Stale tick cannot resurrect a stopped sync
 
     /// A tick that observed a stall, then suspended while a deliberate stop ran, must not schedule
     /// a recovery or emit `.syncStalled` when it resumes.
@@ -123,7 +123,7 @@ final class SlipstreamLifecycleOwnershipTests: ZcashTestCase {
         sync.stop()
     }
 
-    // MARK: - R2: a recovery may only act on the pass it was decided for
+    // MARK: - Recovery respects the pass that scheduled it
 
     /// A recovery decided before a server switch must not touch the engine at all once the switch
     /// has taken over.
@@ -479,6 +479,99 @@ final class SlipstreamLifecycleOwnershipTests: ZcashTestCase {
         XCTAssertTrue(restarted, "the mutation's own restart publishes state once it completes")
     }
 
+    // MARK: - A mutation restarts the engine even when the mutation itself fails
+
+    /// `deleteAccount` must not leave the engine dead when the FFI delete itself fails — mirroring
+    /// `importAccountOnLifecycleQueue`'s catch-block restart and `rewindOnLifecycleQueue`'s
+    /// restart-on-both-outcomes, which `deleteAccountOnLifecycleQueue` did not yet share: it
+    /// restarted only after a successful delete, so a failed one left `isRunning` false and the
+    /// engine stopped while the host still saw `.syncing`.
+    func testDeleteAccountRestartsAfterAFailedDelete() async throws {
+        struct DeleteFailure: Error {}
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setNextSnapshot(SlipstreamSnapshot.testSyncing(progressPermille: 100))
+        let welding = ZcashRustBackendWeldingMock()
+        welding.deleteAccountThrowableError = DeleteFailure()
+        let sync = try makeSlipstreamSynchronizer(engine: engine, welding: welding)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+
+        try await sync.start(retry: false)
+
+        do {
+            try await sync.deleteAccount(TestsData.mockedAccountUUID)
+            XCTFail("expected the delete's own FFI failure to propagate")
+        } catch is DeleteFailure {
+            // Expected: a failed delete must still be visible to its own caller.
+        }
+
+        let calls = await engine.calls
+        let lastStop = try XCTUnwrap(calls.lastIndex(of: "stop"), "the failed delete still tore the engine down: \(calls)")
+        let lastStartDone = try XCTUnwrap(calls.lastIndex(of: "start:done"), "a failed delete must not leave the engine dead: \(calls)")
+        XCTAssertGreaterThan(lastStartDone, lastStop, "the restart after the failed delete is the one left running: \(calls)")
+
+        let isRunning = await sync.isRunningForTesting()
+        XCTAssertTrue(isRunning, "the restarted pass leaves the synchronizer running again")
+    }
+
+    /// A restart that fails after a mutation itself SUCCEEDED must not vanish silently: the
+    /// mutation has nothing to throw its own caller, so the state stream is the only channel left —
+    /// exactly the one `reportStallRecoveryStopped(error:)` already uses for a stall recovery's own
+    /// restart failure. `deleteAccount` stands in for `importAccount`/`rewind`, whose success-path
+    /// restarts share the same private `publishStoppedWithError(_:)` helper.
+    func testDeleteAccountsRestartFailureAfterASuccessfulDeletePublishesErrorState() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setNextSnapshot(SlipstreamSnapshot.testSyncing(progressPermille: 100))
+        let welding = ZcashRustBackendWeldingMock()
+        welding.deleteAccountClosure = { _ in }
+        let sync = try makeSlipstreamSynchronizer(engine: engine, welding: welding)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+        let statuses = RecordedSyncStatuses()
+        sync.stateStream.sink { statuses.append($0.internalSyncStatus) }.store(in: &cancellables)
+        let events = RecordedEvents()
+        sync.eventStream.sink { events.append($0) }.store(in: &cancellables)
+
+        try await sync.start(retry: false)
+        // Only the RESTART that follows the (successful) delete should fail — not the delete itself.
+        await engine.setStartError(ZcashError.rustSlipstreamNotOpen)
+
+        try await sync.deleteAccount(TestsData.mockedAccountUUID)
+
+        let publishedError = await waitUntil {
+            statuses.all.contains { if case .error = $0 { return true } else { return false } }
+        }
+        XCTAssertTrue(publishedError, "a restart failure after a successful mutation must reach the state stream: \(statuses.all)")
+        XCTAssertTrue(
+            events.syncStalledEvents.isEmpty,
+            "the once-per-handle give-up credit belongs to stall recovery, not a mutation's own restart: \(events.syncStalledEvents)"
+        )
+    }
+
+    // MARK: - wipe() clears isRunning like every other teardown
+
+    /// `wipe()` must leave `isRunning` false, exactly like `stopImpl` and every account-mutation
+    /// teardown already do. Before this fix, `wipeOnLifecycleQueue` was the one path that left it
+    /// `true`, which `wasRunning` on a subsequent mutation would misread as a pass still owed a
+    /// restart.
+    func testWipeClearsIsRunning() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setNextSnapshot(SlipstreamSnapshot.testSyncing(progressPermille: 100))
+        let sync = try makeSlipstreamSynchronizer(engine: engine)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+
+        try await sync.start(retry: false)
+        let runningBeforeWipe = await sync.isRunningForTesting()
+        XCTAssertTrue(runningBeforeWipe, "the pass is up before the wipe")
+
+        let wiped = XCTestExpectation(description: "wipe completed")
+        sync.wipe()
+            .sink(receiveCompletion: { _ in wiped.fulfill() }, receiveValue: { _ in })
+            .store(in: &cancellables)
+        await fulfillment(of: [wiped], timeout: 5)
+
+        let runningAfterWipe = await sync.isRunningForTesting()
+        XCTAssertFalse(runningAfterWipe, "wipe must clear isRunning like every other teardown")
+    }
+
     // MARK: - The failure half of a recovery
 
     /// A reopen that fails ends the recovery, and the give-up is reported exactly once.
@@ -546,8 +639,9 @@ final class SlipstreamLifecycleOwnershipTests: ZcashTestCase {
     /// The index of the first teardown that began while an engine `start` had been entered but had
     /// not yet returned, or nil when the trace never does that.
     ///
-    /// This is the R2 invariant in one line: a lifecycle operation that stops the engine may only
-    /// run when no other operation is in the middle of bringing it up.
+    /// This is the ordering invariant recovery must respect, in one line: a lifecycle operation
+    /// that stops the engine may only run when no other operation is in the middle of bringing it
+    /// up.
     private static func firstTeardownWhileAStartIsInFlight(_ calls: [String]) -> Int? {
         var startsInFlight = 0
         for (index, call) in calls.enumerated() {

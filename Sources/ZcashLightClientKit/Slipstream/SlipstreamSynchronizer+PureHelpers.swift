@@ -188,7 +188,7 @@ extension SlipstreamSynchronizer {
     }
 }
 
-// MARK: - LifecycleQueue (audit R1/R2, MOB-1850)
+// MARK: - LifecycleQueue (MOB-1850)
 
 /// One FIFO for every pass-owning lifecycle operation of `SlipstreamSynchronizer`: an app-driven
 /// start, a stop teardown, a server switch, an account import or delete, a rewind, a wipe, and the

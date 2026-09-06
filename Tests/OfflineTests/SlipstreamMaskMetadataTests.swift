@@ -8,7 +8,7 @@ import XCTest
 @testable import TestUtils
 @testable import ZcashLightClientKit
 
-/// [MOB-1852 / audit R10] `SynchronizerState.isSpendableMasked` must always describe the balances
+/// [MOB-1852] `SynchronizerState.isSpendableMasked` must always describe the balances
 /// carried in the SAME emission — never a flag some other, unrelated call last happened to compute.
 ///
 /// Before this fix, `walletBalanceSnapshots()` wrote `currentlySpendableMasked` as a side effect of

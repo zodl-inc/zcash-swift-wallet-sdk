@@ -191,6 +191,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A transaction created through `Broadcaster` while a `wipe()` lands mid-creation no longer has
   its "awaiting submission" mark recreate the deleted submit-plan store; like the existing
   acceptance guard, the mark is dropped when it belongs to a lifecycle the store has since wiped.
+- `Synchronizer.deleteAccount(_:)` now restarts sync after a failed deletion too, the same way a
+  failed account import or rewind already do. Previously a deletion that failed before reaching
+  the engine left the synchronizer stopped, with no automatic recovery.
+- A restart that fails after a successful account import, delete, or rewind is now reported on
+  `SynchronizerState.internalSyncStatus` as `.error`, the same way a failed stall-recovery restart
+  already is. Previously the failure was silent: the mutation itself had already succeeded, so
+  nothing was thrown, and the synchronizer was left reporting `.syncing` with no pass running.
+- `Synchronizer.releaseForResubmission(transactions:to:)` no longer recreates the submit-plan
+  store's database file for a wallet that has been wiped: a release that lands after `wipe()` is
+  now dropped instead of reopening the deleted store.
 
 # 4.1.0 - 2026-09-01
 

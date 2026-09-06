@@ -290,7 +290,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
 
     // [v2.1 E-3] The host-side summary cache is GONE: the engine caches the summary itself
     // (E-1) and the warm-start emissions it fed read the truthful-from-open snapshot instead.
-    // [audit SDK-1 + SDK-2 → MOB-1850 R1/R2] Every pass-owning lifecycle operation runs here, one
+    // [MOB-1850] Every pass-owning lifecycle operation runs here, one
     // at a time and in the order it was asked for. It generalises the `PendingStopSlot` it replaces:
     // that slot ordered stops against the next `start()`, which was the one instance of the problem
     // that had been found; this queue orders ALL of them, so a teardown can never interleave with a
@@ -506,7 +506,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// (keyless update — engine calls `ensure_account` only when `ufvk=Some`).
     public func start(retry: Bool = false) async throws {
         // [MOB-1850] On the lifecycle queue, like every other pass-owning operation. A start that
-        // follows a stop therefore runs after that stop's teardown has finished — the [audit SDK-1]
+        // follows a stop therefore runs after that stop's teardown has finished — the stop-before-start
         // ordering contract `pendingStop` used to hold up by hand — and, more importantly, a start
         // cannot land in the middle of a switch, a wipe or an account mutation's stopped interval.
         try await lifecycle.enqueueThrowing {
@@ -818,7 +818,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // transactions for a wallet that no longer has them.
         guard isCurrent() else { return }
         let summary = summaries.visible
-        // [MOB-1852 / audit R10] Computed once, from the tuple THIS tick just fetched, and reused
+        // [MOB-1852] Computed once, from the tuple THIS tick just fetched, and reused
         // by every branch below — never read from `currentlySpendableMasked` directly, which a
         // concurrent caller (e.g. a standalone `getAccountsBalances()`) could have last written for
         // balances that have nothing to do with this tick's own emission. `nil` means this tick has
@@ -1133,6 +1133,11 @@ public actor SlipstreamSynchronizer: Synchronizer {
         currentEndpoint
     }
 
+    /// [MOB-1850] Test seam: `isRunning` as `wasRunning` would sample it from the lifecycle queue.
+    func isRunningForTesting() -> Bool {
+        isRunning
+    }
+
     /// [MOB-1850] Ends a recovery restart that could not complete, and tells the host so.
     ///
     /// Both failure exits of `runStallRecovery` land here, and both are terminal in the
@@ -1153,12 +1158,21 @@ public actor SlipstreamSynchronizer: Synchronizer {
             stallGaveUpReported = true
             eventSubject.send(.syncStalled(attempt: stallRestartAttempts, gaveUp: true))
         }
-        // Mirror it on the state stream, the way `tickPoll` surfaces the engine's own error
-        // state: with no pass running, a host that watches only `stateStream` would otherwise
-        // keep displaying the last `.syncing`. Gated on `isPrepared` for the same reason
-        // `stopImpl` gates its `.stopped` emission — a `wipe` that landed while the restart was
-        // suspended has already published `.unprepared`, and `.error` would forge prepared-ness
-        // back onto a wiped wallet.
+        publishStoppedWithError(error)
+    }
+
+    /// [MOB-1850] Publishes `.error(error)` on the state stream in place of whatever status was last
+    /// showing, for any lifecycle path that stops owning the pass because a restart failed.
+    ///
+    /// Shared by `reportStallRecoveryStopped(error:)` and by the restart that follows a successful
+    /// account import, delete, or rewind: the mutation itself already succeeded, so there is no
+    /// thrown error for its caller to see, and the state stream is the only channel left for a
+    /// restart failure that would otherwise leave the host watching a `.syncing` that nothing is
+    /// producing. Mirrors `tickPoll`'s own error surfacing. Gated on `isPrepared` for the same
+    /// reason `stopImpl` gates its `.stopped` emission — a `wipe` that landed while the caller was
+    /// suspended has already published `.unprepared`, and `.error` would forge prepared-ness back
+    /// onto a wiped wallet.
+    private func publishStoppedWithError(_ error: Error) {
         if latestState.internalSyncStatus.isPrepared {
             stateSubject.send(SynchronizerState(
                 syncSessionID: latestState.syncSessionID,
@@ -1299,7 +1313,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// directly from the shared wallet database and is display-only; it remains available while
     /// the engine handle is closed during server replacement.
     ///
-    /// [MOB-1852 / audit R10] No side effects: `isSpendableMasked` is returned rather than written
+    /// [MOB-1852] No side effects: `isSpendableMasked` is returned rather than written
     /// to `currentlySpendableMasked` directly, so the flag this call computed can never be read by
     /// anyone other than the caller that asked for it, and can never be overwritten mid-air by an
     /// unrelated concurrent call before ITS caller gets to read it. `nil` means no visible summary
@@ -1454,9 +1468,16 @@ public actor SlipstreamSynchronizer: Synchronizer {
                 keySource: request.keySource
             )
         } catch {
-            // A failed import must not leave the engine dead.
+            // A failed import must not leave the engine dead. The import's own error is what the
+            // caller gets; a restart that fails on top of it is reported on the state stream, the
+            // same way the success path below reports it, so the host never keeps seeing
+            // `.syncing` for a pass that is not running.
             if wasRunning {
-                try? await startImpl(retry: false, resetRecoveryBudget: true)
+                do {
+                    try await startImpl(retry: false, resetRecoveryBudget: true)
+                } catch let restartError {
+                    publishStoppedWithError(restartError)
+                }
             }
             throw error
         }
@@ -1468,14 +1489,19 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // re-scan as a genuine 0→100% climb (the `forceCounterProgressUntilDone` host bypass
         // is deleted). One host job remains: RESTART the pass — the follow loop only
         // re-syncs when the server tip advances (`session.rs` `should_resync`), so without a
-        // restart the re-scan would wait for the next block (≤ ~75 s). `try?`: a restart
-        // hiccup must never fail an otherwise-successful import.
+        // restart the re-scan would wait for the next block (≤ ~75 s). A restart hiccup must
+        // never fail an otherwise-successful import, so it is not rethrown here — but it must
+        // not go unreported either, so `publishStoppedWithError` puts it on the state stream.
         initializer.logger.debug(
             "[#1755] importAccount: wasRunning=\(wasRunning) "
             + (wasRunning ? "→ restarting sync pass now to surface the re-scan" : "→ next start() will re-scan")
         )
         if wasRunning {
-            try? await startImpl(retry: false, resetRecoveryBudget: true)
+            do {
+                try await startImpl(retry: false, resetRecoveryBudget: true)
+            } catch {
+                publishStoppedWithError(error)
+            }
         }
 
         return uuid
@@ -1510,12 +1536,30 @@ public actor SlipstreamSynchronizer: Synchronizer {
         stopPolling()
         isRunning = false
         await engine.stop()
-        try await initializer.rustBackend.deleteAccount(accountUUID)
-        // `delete_account` removes the account's transactions — bump `tx_set_version`
-        // (tag-5 poke) so hosts re-fetch and Activity drops the dead rows on the next tick.
-        await engine.notifyTxChange()
-        if wasRunning {
-            try? await startImpl(retry: false, resetRecoveryBudget: true)
+
+        do {
+            try await initializer.rustBackend.deleteAccount(accountUUID)
+            // `delete_account` removes the account's transactions — bump `tx_set_version`
+            // (tag-5 poke) so hosts re-fetch and Activity drops the dead rows on the next tick.
+            await engine.notifyTxChange()
+            if wasRunning {
+                do {
+                    try await startImpl(retry: false, resetRecoveryBudget: true)
+                } catch {
+                    publishStoppedWithError(error)
+                }
+            }
+        } catch {
+            // A failed delete must not leave the engine dead either — mirrors importAccount's
+            // catch-restart and rewind's restart-on-both-outcomes, which this path lacked.
+            if wasRunning {
+                do {
+                    try await startImpl(retry: false, resetRecoveryBudget: true)
+                } catch {
+                    publishStoppedWithError(error)
+                }
+            }
+            throw error
         }
     }
 
@@ -1940,12 +1984,20 @@ public actor SlipstreamSynchronizer: Synchronizer {
             // and the SDK mirrors keep tracking them (mirrors reset only where the handle
             // dies: `wipe()` / `switchTo()`).
             if wasRunning {
-                try? await startImpl(retry: false, resetRecoveryBudget: true)
+                do {
+                    try await startImpl(retry: false, resetRecoveryBudget: true)
+                } catch {
+                    publishStoppedWithError(error)
+                }
             }
             subject.send(completion: .finished)
         } catch {
             if wasRunning {
-                try? await startImpl(retry: false, resetRecoveryBudget: true)
+                do {
+                    try await startImpl(retry: false, resetRecoveryBudget: true)
+                } catch {
+                    publishStoppedWithError(error)
+                }
             }
             subject.send(completion: .failure(error))
         }
@@ -1998,6 +2050,8 @@ public actor SlipstreamSynchronizer: Synchronizer {
         passGeneration += 1
         // 1. Stop polling.
         stopPolling()
+        // [MOB-1850] Every other teardown clears `isRunning` here too; wipe was the one path left standing.
+        isRunning = false
         // 1a. [#1975] Cancel AND JOIN any in-flight resubmission check — it reads and writes the
         //     very database files about to be deleted. Cancel alone is not enough: only the
         //     SUBMIT stage observes cancellation (`SubmitPlanExecutor.submit`), while the prune
