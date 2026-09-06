@@ -67,7 +67,7 @@ final class SlipstreamFakeEngineSmokeTests: ZcashTestCase {
     /// The gates are the reason the seam exists, so this pins that one of them really suspends the
     /// synchronizer at a chosen point and that a test can release it from outside the engine actor.
     ///
-    /// The interleaving it holds open is the one the SDK-1 ordering contract is about: a `stop()`
+    /// The interleaving it holds open is the one the stop-before-start ordering contract is about: a `stop()`
     /// that has reached the engine but not returned must keep the next `start()` waiting, so the
     /// engine can never be told to start a pass and then to abort it.
     func testAClosedStopGateHoldsTheNextStartUntilTheTestOpensIt() async throws {

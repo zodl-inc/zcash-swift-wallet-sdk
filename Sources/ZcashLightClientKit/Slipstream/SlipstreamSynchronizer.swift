@@ -290,7 +290,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
 
     // [v2.1 E-3] The host-side summary cache is GONE: the engine caches the summary itself
     // (E-1) and the warm-start emissions it fed read the truthful-from-open snapshot instead.
-    // [audit SDK-1 + SDK-2 → MOB-1850 R1/R2] Every pass-owning lifecycle operation runs here, one
+    // [MOB-1850] Every pass-owning lifecycle operation runs here, one
     // at a time and in the order it was asked for. It generalises the `PendingStopSlot` it replaces:
     // that slot ordered stops against the next `start()`, which was the one instance of the problem
     // that had been found; this queue orders ALL of them, so a teardown can never interleave with a
@@ -506,7 +506,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// (keyless update — engine calls `ensure_account` only when `ufvk=Some`).
     public func start(retry: Bool = false) async throws {
         // [MOB-1850] On the lifecycle queue, like every other pass-owning operation. A start that
-        // follows a stop therefore runs after that stop's teardown has finished — the [audit SDK-1]
+        // follows a stop therefore runs after that stop's teardown has finished — the stop-before-start
         // ordering contract `pendingStop` used to hold up by hand — and, more importantly, a start
         // cannot land in the middle of a switch, a wipe or an account mutation's stopped interval.
         try await lifecycle.enqueueThrowing {
@@ -818,7 +818,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // transactions for a wallet that no longer has them.
         guard isCurrent() else { return }
         let summary = summaries.visible
-        // [MOB-1852 / audit R10] Computed once, from the tuple THIS tick just fetched, and reused
+        // [MOB-1852] Computed once, from the tuple THIS tick just fetched, and reused
         // by every branch below — never read from `currentlySpendableMasked` directly, which a
         // concurrent caller (e.g. a standalone `getAccountsBalances()`) could have last written for
         // balances that have nothing to do with this tick's own emission. `nil` means this tick has
@@ -1299,7 +1299,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// directly from the shared wallet database and is display-only; it remains available while
     /// the engine handle is closed during server replacement.
     ///
-    /// [MOB-1852 / audit R10] No side effects: `isSpendableMasked` is returned rather than written
+    /// [MOB-1852] No side effects: `isSpendableMasked` is returned rather than written
     /// to `currentlySpendableMasked` directly, so the flag this call computed can never be read by
     /// anyone other than the caller that asked for it, and can never be overwritten mid-air by an
     /// unrelated concurrent call before ITS caller gets to read it. `nil` means no visible summary

@@ -10,12 +10,12 @@ import XCTest
 
 /// [MOB-1850] Who owns the engine, and for how long.
 ///
-/// Two audit findings meet here. **R1**: a poll tick decides things — that the pass has stalled,
+/// Two problems meet here. First, a poll tick decides things — that the pass has stalled,
 /// what state to publish, whether to re-fetch transactions — and then suspends inside an engine
 /// call. By the time it resumes, the pass it decided for may be gone: the app stopped the
 /// synchronizer, a server switch replaced the handle, a wipe deleted the wallet. Acting on a
 /// decision taken for a pass that no longer exists is how a deliberately stopped synchronizer came
-/// back to life. **R2**: the stall recovery tears the engine down and brings it back up, and while
+/// back to life. Second, the stall recovery tears the engine down and brings it back up, and while
 /// it was an unstructured task racing every other lifecycle path, it could tear down a pass a
 /// switch had just started, or start the engine in the middle of an account mutation's stopped
 /// interval — the interval that exists precisely because no pass may run across the mutation.
@@ -34,7 +34,7 @@ final class SlipstreamLifecycleOwnershipTests: ZcashTestCase {
         try await super.tearDown()
     }
 
-    // MARK: - R1: a tick belongs to the pass that scheduled it
+    // MARK: - Stale tick cannot resurrect a stopped sync
 
     /// A tick that observed a stall, then suspended while a deliberate stop ran, must not schedule
     /// a recovery or emit `.syncStalled` when it resumes.
@@ -123,7 +123,7 @@ final class SlipstreamLifecycleOwnershipTests: ZcashTestCase {
         sync.stop()
     }
 
-    // MARK: - R2: a recovery may only act on the pass it was decided for
+    // MARK: - Recovery respects the pass that scheduled it
 
     /// A recovery decided before a server switch must not touch the engine at all once the switch
     /// has taken over.
@@ -546,8 +546,9 @@ final class SlipstreamLifecycleOwnershipTests: ZcashTestCase {
     /// The index of the first teardown that began while an engine `start` had been entered but had
     /// not yet returned, or nil when the trace never does that.
     ///
-    /// This is the R2 invariant in one line: a lifecycle operation that stops the engine may only
-    /// run when no other operation is in the middle of bringing it up.
+    /// This is the ordering invariant recovery must respect, in one line: a lifecycle operation
+    /// that stops the engine may only run when no other operation is in the middle of bringing it
+    /// up.
     private static func firstTeardownWhileAStartIsInFlight(_ calls: [String]) -> Int? {
         var startsInFlight = 0
         for (index, call) in calls.enumerated() {

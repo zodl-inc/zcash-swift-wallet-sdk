@@ -1507,7 +1507,7 @@ extension VotingRustBackend {
     }
 }
 
-// MARK: - Proving cancellation (audit R9, MOB-1860)
+// MARK: - Proving cancellation (MOB-1860)
 
 /// A `Bool` set once from a `withTaskCancellationHandler`'s `onCancel`, and read once by the
 /// detached proving closure in `buildAndProveDelegation` before it calls into the FFI entry point
@@ -2020,7 +2020,7 @@ extension VotingRustBackend {
     ///
     /// Holds the interactive proving QoS boost while the proof itself runs.
     ///
-    /// Cancellation (audit R9, MOB-1860): a caller that cancels while the PIR
+    /// Cancellation (MOB-1860): a caller that cancels while the PIR
     /// servers are still being probed — or in the brief window between
     /// resolution finishing and the detached proving call being scheduled —
     /// never reaches the FFI at all. `PirSnapshotResolver.resolve` and this
@@ -2060,7 +2060,7 @@ extension VotingRustBackend {
         )
     }
 
-    /// Test seam for the method above (audit R9, MOB-1860). `proveEntry` stands
+    /// Test seam for the method above (MOB-1860). `proveEntry` stands
     /// in for the FFI entry point (`syncBuildAndProveDelegation` in production)
     /// so a test can observe whether it was reached — and control what it
     /// returns or throws — without paying for the real, potentially

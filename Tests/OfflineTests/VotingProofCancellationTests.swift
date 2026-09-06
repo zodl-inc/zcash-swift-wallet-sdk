@@ -7,7 +7,7 @@ import XCTest
 @testable import TestUtils
 @testable import ZcashLightClientKit
 
-// [MOB-1860 / audit R9] Regression coverage for a cancelled delegation proof starting anyway.
+// [MOB-1860] Regression coverage for a cancelled delegation proof starting anyway.
 //
 // The failure this closes: a caller cancels `buildAndProveDelegation` while the PIR servers are
 // still being probed (or in the brief window right after resolution finishes), and the proof starts

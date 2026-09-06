@@ -83,9 +83,10 @@ actor GatedFakeSlipstreamEngine: SlipstreamEngineControlling {
     ///
     /// The three pass-owning calls also append a `":done"` entry when they RETURN (`"start:done"`,
     /// `"stop:done"`, `"reopen:done"`). Entry order alone cannot express "a start was still in
-    /// flight when a teardown began", which is exactly the [MOB-1850] R2 invariant; with both edges
-    /// recorded, the trace answers it directly. The un-gated calls keep a single entry — a
-    /// `snapshot:done` on every poll tick would bury the lifecycle in noise for no gain.
+    /// flight when a teardown began", which is exactly the ordering invariant [MOB-1850] depends
+    /// on; with both edges recorded, the trace answers it directly. The un-gated calls keep a
+    /// single entry — a `snapshot:done` on every poll tick would bury the lifecycle in noise for
+    /// no gain.
     private(set) var calls: [String] = []
 
     /// One-shot hooks keyed by call name, fired by `record(_:)` the next time that call arrives and
