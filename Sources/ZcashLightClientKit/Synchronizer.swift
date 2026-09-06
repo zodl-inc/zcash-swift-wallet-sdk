@@ -1553,6 +1553,10 @@ private final class UnimplementedBroadcaster: Broadcaster {
             )
         }
     }
+
+    func releaseForResubmission(transactions: [CreatedTransaction], to endpoints: [LightWalletEndpoint]) async {
+        // No-op: no submit-plan bookkeeping behind this placeholder to release anything to.
+    }
 }
 
 public extension Synchronizer {

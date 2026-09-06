@@ -49,7 +49,9 @@ struct SubmitPlanLifecycle: Equatable, Sendable {
 }
 
 protocol SubmitPlanStoring {
-    func markAwaitingSubmission(txIds: [Data]) async
+    /// Marks `txIds` awaiting submission by the app. Dropped — logged, not thrown — when
+    /// `lifecycle` belongs to an epoch the store has since wiped: see `currentLifecycle()`.
+    func markAwaitingSubmission(txIds: [Data], lifecycle: SubmitPlanLifecycle) async
     /// Records the plan and returns the store's current lifecycle token, for a later
     /// `markAccepted(txId:host:lifecycle:)` call to prove it still belongs to this epoch.
     @discardableResult
@@ -105,7 +107,15 @@ actor SubmitPlanStore: SubmitPlanStoring {
         self.logger = logger
     }
 
-    func markAwaitingSubmission(txIds: [Data]) {
+    func markAwaitingSubmission(txIds: [Data], lifecycle: SubmitPlanLifecycle) {
+        // A wipe that landed while the transaction was still being created (proving, PCZT
+        // extraction) retired this token. Applying the write now would reopen `connection()` and
+        // recreate the database file the wipe just deleted, for a transaction the caller already
+        // asked to forget. Log and drop instead of throwing, mirroring `markAccepted`'s guard.
+        guard lifecycle.generation == lifecycleGeneration else {
+            logger.info("SubmitPlanStore ignored a mark-awaiting-submission call from a previous wallet lifecycle.")
+            return
+        }
         guard let connection = connection() else { return }
         do {
             for txId in txIds {
@@ -154,7 +164,7 @@ actor SubmitPlanStore: SubmitPlanStoring {
     }
 
     func markAccepted(txId: Data, host: String, lifecycle: SubmitPlanLifecycle) {
-        // [R11] A wipe that landed while this acceptance's submission was still in flight retired
+        // A wipe that landed while this acceptance's submission was still in flight retired
         // this token. Applying the write now would reopen `connection()` and recreate the database
         // file the wipe just deleted — for a submission the caller already asked to forget. Log and
         // drop instead of throwing: this is an ordinary, expected race, not a failure.

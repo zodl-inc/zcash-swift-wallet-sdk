@@ -77,6 +77,13 @@ final class TxResubmitter {
 
 private extension TxResubmitter {
     func resubmit(transaction: ZcashTransaction.Overview) async throws {
+        // Captured before `plan(for:)` itself, not merely before the network round trip: the two
+        // are separate awaits into the store's actor, and a `wipe()` can land between them. A
+        // token captured only after `plan(for:)` returns could already reflect the post-wipe
+        // generation while `plan` still holds the pre-wipe `.ready` value that read observed,
+        // making the eventual `markAccepted` below wrongly look current. Capturing first ties the
+        // token to "no wipe happened before this plan was read," which is what the guard needs.
+        let lifecycle = await submitPlanStore.currentLifecycle()
         let plan = await submitPlanStore.plan(for: transaction.rawID)
 
         switch plan {
@@ -92,10 +99,6 @@ private extension TxResubmitter {
             // acceptance means a mempool holds it, not that it will be mined.
             logger.info("TxResubmissionAction trying to resubmit transaction \(transaction.rawID.toHexStringTxId()) via its submit plan.")
             let createdTransaction = try CreatedTransaction(overview: transaction)
-            // Captured before the (potentially slow) network round trip so a `wipe()` that lands
-            // meanwhile leaves this token stale, and the acceptance below provably belongs to the
-            // lifecycle the plan was read from rather than whatever is current when it completes.
-            let lifecycle = await submitPlanStore.currentLifecycle()
             let acceptingEndpoint = try await submitPlanExecutor.submit(transaction: createdTransaction, endpoints: endpoints)
             if let acceptingEndpoint {
                 await submitPlanStore.markAccepted(

@@ -76,6 +76,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ClosureSynchronizer` (`restartSync(at:completion:)`) and `CombineSynchronizer` (`restartSync(at:)
   -> CompletablePublisher<Error>`).
 
+### Resubmission
+
+- `Broadcaster.releaseForResubmission(transactions:to:)` records a submit plan for transactions
+  the app created but could not hand to a server itself, so the SDK's background resubmission
+  broadcasts them on its normal cadence with the same transaction ids. Makes no network attempt
+  of its own; an empty endpoint list records nothing and the transactions stay awaiting. The
+  method has a default implementation that does nothing, so custom `Broadcaster` conformers
+  without submit-plan bookkeeping keep compiling unchanged.
+
 ## Changed
 
 - `Synchronizer` gained a new requirement:
@@ -179,6 +188,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cancelling a delegation proof while the PIR servers are still being probed no longer lets the
   proof start afterwards: the resolver and the proving call now check for cancellation before
   entering the FFI.
+- A transaction created through `Broadcaster` while a `wipe()` lands mid-creation no longer has
+  its "awaiting submission" mark recreate the deleted submit-plan store; like the existing
+  acceptance guard, the mark is dropped when it belongs to a lifecycle the store has since wiped.
 
 # 4.1.0 - 2026-09-01
 

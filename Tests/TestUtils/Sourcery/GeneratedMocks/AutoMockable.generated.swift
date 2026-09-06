@@ -632,6 +632,21 @@ class BroadcasterMock: Broadcaster {
         }
     }
 
+    // MARK: - releaseForResubmission
+
+    var releaseForResubmissionTransactionsToCallsCount = 0
+    var releaseForResubmissionTransactionsToCalled: Bool {
+        return releaseForResubmissionTransactionsToCallsCount > 0
+    }
+    var releaseForResubmissionTransactionsToReceivedArguments: (transactions: [CreatedTransaction], endpoints: [LightWalletEndpoint])?
+    var releaseForResubmissionTransactionsToClosure: (([CreatedTransaction], [LightWalletEndpoint]) async -> Void)?
+
+    func releaseForResubmission(transactions: [CreatedTransaction], to endpoints: [LightWalletEndpoint]) async {
+        releaseForResubmissionTransactionsToCallsCount += 1
+        releaseForResubmissionTransactionsToReceivedArguments = (transactions: transactions, endpoints: endpoints)
+        await releaseForResubmissionTransactionsToClosure!(transactions, endpoints)
+    }
+
 }
 class CompactBlockRepositoryMock: CompactBlockRepository {
 

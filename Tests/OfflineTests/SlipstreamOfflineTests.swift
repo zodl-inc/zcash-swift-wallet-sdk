@@ -194,7 +194,7 @@ class SlipstreamOfflineTests: ZcashTestCase {
         let submittedTxId = Data(repeating: 0x32, count: 32)
         let acceptedTxId = Data(repeating: 0x33, count: 32)
 
-        await store.markAwaitingSubmission(txIds: [awaitingTxId])
+        await store.markAwaitingSubmission(txIds: [awaitingTxId], lifecycle: await store.currentLifecycle())
         await store.recordPlan(txId: submittedTxId, endpoints: [endpoint])
         await store.recordPlan(txId: acceptedTxId, endpoints: [endpoint])
         await store.markAccepted(txId: acceptedTxId, host: "a.example.com:443", lifecycle: await store.currentLifecycle())
