@@ -143,6 +143,12 @@ public struct PirSnapshotResolver: Sendable {
             return collected.map(\.1)
         }
 
+        // [MOB-1860 / R9] A caller that cancelled while endpoints were still being probed must
+        // never receive a match: check here, before filtering, so cancellation always wins over an
+        // outcome that happens to look successful. Without this, a delegation proof could start
+        // from a resolver call whose caller had already given up on it.
+        try Task.checkCancellation()
+
         let matchingOutcomes = outcomes.filter { outcome in
             if case .matching = outcome.status { return true }
             return false
