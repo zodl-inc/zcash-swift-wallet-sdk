@@ -219,12 +219,13 @@ actor SubmitPlanStore: SubmitPlanStoring {
     }
 
     func plan(for txId: Data) -> StoredSubmitPlan? {
-        // A missing file with nothing cached is a store that has never been written to in this
-        // lifecycle — most often one `wipe()` just deleted — and "no row" is the honest answer for
-        // it, not `.storeUnavailable`: unlike the guard just below, this check runs before
-        // `connection()` ever opens (and thereby creates) the file, so a read can never recreate a
-        // wiped store. A present-but-unopenable file still falls through to the existing
-        // `.storeUnavailable` guard.
+        // A store whose creation or open already failed in this lifecycle is unavailable, whatever
+        // the file system says: without this order a creation failure (latched below) would read as
+        // "never written" and send the transaction down the legacy default-endpoint path.
+        guard !connectionFailed else { return .storeUnavailable }
+        // A missing file with nothing cached is a store never written to in this lifecycle — most
+        // often one `wipe()` just deleted — and "no row" is the honest answer; the check runs before
+        // `connection()` could create the file, so a read never recreates a wiped store.
         guard FileManager.default.fileExists(atPath: databaseURL.path) || cachedConnection != nil else { return nil }
         guard let connection = connection() else { return .storeUnavailable }
         do {

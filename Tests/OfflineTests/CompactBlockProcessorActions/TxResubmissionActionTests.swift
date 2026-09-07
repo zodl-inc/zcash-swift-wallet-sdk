@@ -51,7 +51,8 @@ final class TxResubmissionActionTests: ZcashTestCase {
 
     private func setupAction(
         candidates: [ZcashTransaction.Overview],
-        encoderTransactions: [ZcashTransaction.Overview] = []
+        encoderTransactions: [ZcashTransaction.Overview] = [],
+        submitPlanStoreOverride: SubmitPlanStoring? = nil
     ) -> TxResubmissionAction {
         transactionRepository = TransactionRepositoryMock()
         transactionRepository.findForResubmissionUpToClosure = { _ in candidates }
@@ -61,7 +62,9 @@ final class TxResubmissionActionTests: ZcashTestCase {
 
         mockContainer.mock(type: TransactionRepository.self, isSingleton: true) { _ in self.transactionRepository }
         mockContainer.mock(type: TransactionEncoder.self, isSingleton: true) { _ in self.transactionEncoder }
-        mockContainer.mock(type: SubmitPlanStoring.self, isSingleton: true) { _ in self.submitPlanStore }
+        // A real `SubmitPlanStore` can be substituted for the double, for tests that need the
+        // real read/latch behavior `SubmitPlanStoringMock` does not reproduce.
+        mockContainer.mock(type: SubmitPlanStoring.self, isSingleton: true) { _ in submitPlanStoreOverride ?? self.submitPlanStore }
         mockContainer.mock(type: Logger.self, isSingleton: true) { _ in submissionLifecycleLogger() }
         mockContainer.mock(type: SubmitPlanExecutor.self, isSingleton: true) { _ in
             SubmitPlanExecutor(endpointSubmitter: self.endpointSubmitter, logger: submissionLifecycleLogger())
@@ -308,6 +311,45 @@ final class TxResubmissionActionTests: ZcashTestCase {
         XCTAssertTrue(
             transactionEncoder.submittedTransactions.isEmpty,
             "An unreadable plan store must not fall back to the default-endpoint submit"
+        )
+        XCTAssertTrue(endpointSubmitter.recordedSubmissions().isEmpty)
+    }
+
+    /// A submit-plan store whose creation failed must report `.storeUnavailable` to the
+    /// resubmitter, not `nil`: `nil` reads as "legacy transaction unknown to this store" and falls
+    /// through to the default-endpoint submit below, broadcasting through an endpoint the user
+    /// never chose. Uses a real `SubmitPlanStore` (not the double `testStoreUnavailableSkipsResubmission`
+    /// uses above) so the store's actual latch behavior — not just the resubmitter's handling of an
+    /// already-`.storeUnavailable` plan — is under test.
+    func testStoreCreationFailureSkipsResubmissionInsteadOfLegacyBroadcast() async throws {
+        let rawID = Data(repeating: 0x17, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+
+        // A regular FILE where the store's parent directory should be, exactly like
+        // `SubmitPlanStoreTests.testFailedCreationBeforeFileExistsReportsStoreUnavailable`:
+        // creation fails and latches `connectionFailed` before the database file is ever written.
+        let blockedParent = testGeneralStorageDirectory
+            .appendingPathComponent("blocked-parent-\(UUID().uuidString)")
+        try Data([1]).write(to: blockedParent)
+        defer {
+            try? FileManager.default.removeItem(at: blockedParent)
+        }
+        let realStore = SubmitPlanStore(
+            databaseURL: blockedParent.appendingPathComponent("submit_plans.db"),
+            logger: NullLogger()
+        )
+        let action = setupAction(candidates: [candidate], submitPlanStoreOverride: realStore)
+        transactionRepository.findRawIDClosure = { _ in candidate }
+
+        // Mirrors what `finishCreation` does for a transaction created through `Broadcaster`: the
+        // insert fails because the parent directory is blocked, latching `connectionFailed`.
+        await realStore.markAwaitingSubmission(txIds: [rawID], lifecycle: await realStore.currentLifecycle())
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        XCTAssertTrue(
+            transactionEncoder.submittedTransactions.isEmpty,
+            "A submit-plan store whose creation failed must not fall back to the default-endpoint submit"
         )
         XCTAssertTrue(endpointSubmitter.recordedSubmissions().isEmpty)
     }

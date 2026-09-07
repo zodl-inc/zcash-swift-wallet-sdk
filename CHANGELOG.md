@@ -201,6 +201,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A submit-plan release that arrives after `wipe()` no longer recreates the wiped store: reads
   never create the store file, and only a transaction created in the current wallet lifecycle can
   be released to background resubmission.
+- `Synchronizer.transactionSubmissionStatus(for:)` and background resubmission treat a submit-plan
+  store whose creation failed as unavailable again (skipping the transaction) instead of as never
+  written; a previous entry in this section described the read path incorrectly for that case.
 
 # 4.1.0 - 2026-09-01
 
