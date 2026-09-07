@@ -899,8 +899,18 @@ The new case (`ZRUST0155`) is what `SlipstreamSynchronizer.importAccount`, `dele
 fail their publisher with, when the engine could not confirm — within its bounded stop budget —
 that its previous pass and its wallet writer had both stopped before the mutation. The wallet is
 left exactly as it was found: nothing partial is written, nothing is deleted, no second handle is
-opened. If a pass was running, the refusal itself restarts it before the error is reported, so
-retrying the call later is the correct response.
+opened. Where the operation stopped a running pass (`importAccount`, `deleteAccount`,
+`switchTo(endpoint:)`, `rewind(_:)` and `wipe()`), the refusal restarts that pass before the error
+is reported; `restartSync(at:)`, normally called when nothing is running, restarts a pass only if
+one was. The SDK's own stall recovery meets the same refusal when it reopens the engine and reports
+it as `.error(.slipstreamEngineNotQuiescent)` on the state stream alongside
+`syncStalled(attempt:gaveUp: true)`. Retrying is the right response to a writer that is merely
+slow, but the refusal clears only when the engine's own pass actually finishes, never on a timer: a
+pass wedged inside a synchronous step keeps every later attempt refusing until it finishes, which
+may never happen within the current process, and each attempt can take tens of seconds, because the
+stop waits out its pass and writer budgets and the restart that follows a refusal can wait as long
+again. Treat a refusal that persists across a few attempts as one that will not clear, and stop
+retrying.
 
 ```swift
 // Before: the mutation either succeeded or threw a rust/network failure.

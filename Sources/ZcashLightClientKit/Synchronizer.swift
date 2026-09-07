@@ -552,7 +552,8 @@ public protocol Synchronizer: AnyObject {
     /// Slipstream `switchTo(endpoint:)` only restarts a pass that was already running and is a
     /// no-op for the current server. The Slipstream implementation throws `CancellationError`
     /// without touching the engine when the calling task was cancelled before the restart began
-    /// executing; other conformances make no such promise.
+    /// executing; other conformances make no such promise. Even then the call returns only once
+    /// its queued lifecycle operation is reached, so a cancelled call is not necessarily prompt.
     /// - Throws: what `start(retry:)` throws (`synchronizerNotPrepared`, `migrationSyncBlocked`,
     ///   engine start errors), plus whatever the engine rebuild itself throws.
     func restartSync(at endpoint: LightWalletEndpoint) async throws

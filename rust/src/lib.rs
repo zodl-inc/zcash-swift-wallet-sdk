@@ -4933,6 +4933,11 @@ mod tests {
             !settle_engine_passes(&mut slot, &mut unfinished, budget),
             "a stop after a replacement must still see the original unfinished pass"
         );
+        assert_eq!(
+            unfinished.len(),
+            2,
+            "both unfinished passes stay on record after the replacement"
+        );
 
         release_first.release();
         release_second.release();

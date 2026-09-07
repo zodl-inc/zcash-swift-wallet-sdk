@@ -1193,6 +1193,11 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// outage. A restart that itself fails has no caller to throw to (the refusal is what the
     /// caller is about to be told), so it goes on the state stream, exactly as a restart failure
     /// after a SUCCESSFUL mutation does.
+    ///
+    /// The restarted pass runs alongside the writer the engine could not account for. That is
+    /// safe: the operations that would re-queue a rescan over the wallet are exactly the ones
+    /// being refused, so what remains is at most a transient `database is locked` that the wallet
+    /// connections' busy timeout already absorbs.
     private func restartAfterARefusedOperation(wasRunning: Bool) async {
         guard wasRunning else { return }
         do {

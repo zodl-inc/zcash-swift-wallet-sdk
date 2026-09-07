@@ -95,13 +95,17 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and its writer are each given their own budget, and a refused call restarts the pass before
   reporting the failure, so the wait can be noticeably longer than a single budget. The refusal
   persists across repeated stops: an aborted pass that outlived one stop's budget keeps every
-  later stop refusing until that pass has actually finished, not only the most recent one.
-  `SlipstreamEngine.stop()` now returns whether the stop was quiescent. `SDKSynchronizer` is
-  unaffected.
+  later stop refusing until that pass has actually finished, not only the most recent one. The
+  SDK's own stall recovery meets the same refusal when it reopens the engine and reports it as
+  `.error(ZcashError.slipstreamEngineNotQuiescent)` on the state stream together with
+  `SynchronizerEvent.syncStalled(attempt:gaveUp: true)`. `SlipstreamEngine.stop()` now returns
+  whether the stop was quiescent. `SDKSynchronizer` is unaffected.
 - `SlipstreamSynchronizer.restartSync(at:)` now throws `CancellationError` and leaves the engine
   untouched when the calling task was cancelled before the restart began executing (a restart
   already under way completes). Hosts that cancel a restart, for example when the app enters the
   background, no longer get a pass started behind their own stop. `SDKSynchronizer` is unaffected.
+  The call still returns only once its queued lifecycle operation is reached, so a cancelled call
+  is not necessarily prompt to return.
 - `Synchronizer` gained a new requirement:
   `evaluateServerSwitch(current:candidates:fetchThresholdSeconds:nBlocksToFetch:network:)`. Any
   custom `Synchronizer` conformer or test double stops compiling until it implements it — see
