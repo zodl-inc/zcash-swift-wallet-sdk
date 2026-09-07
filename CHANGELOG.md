@@ -87,6 +87,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Changed
 
+- `SlipstreamSynchronizer.importAccount`, `deleteAccount`, `switchTo(endpoint:)` and
+  `restartSync(at:)` now throw `ZcashError.slipstreamEngineNotQuiescent` (`ZRUST0155`), and
+  `rewind(_:)` and `wipe()` now fail their publisher with it, leaving the wallet untouched, when
+  the engine could not confirm within its bounded stop budget that its previous pass and wallet
+  writer had stopped; previously the mutation proceeded on the assumption that they had. The pass
+  and its writer are each given their own budget, and a refused call restarts the pass before
+  reporting the failure, so the wait can be noticeably longer than a single budget.
+  `SlipstreamEngine.stop()` now returns whether the stop was quiescent. `SDKSynchronizer` is
+  unaffected.
 - `Synchronizer` gained a new requirement:
   `evaluateServerSwitch(current:candidates:fetchThresholdSeconds:nBlocksToFetch:network:)`. Any
   custom `Synchronizer` conformer or test double stops compiling until it implements it — see

@@ -570,6 +570,9 @@ enum ZcashErrorDefinition {
     /// These operations require engine-level coordination not yet implemented.
     // sourcery: code="ZRUST0097"
     case rustSlipstreamUnsupported
+    /// The engine could not prove its previous pass and wallet writer had stopped before a wallet mutation; the mutation was refused.
+    // sourcery: code="ZRUST0155"
+    case slipstreamEngineNotQuiescent
 
     // MARK: - Ironwood migration
 

@@ -4835,6 +4835,68 @@ mod tests {
             TEST_ANCHOR_RETENTION_INTERVAL,
         );
     }
+
+    /// [MOB-1850] A wallet writer still holding the gate when the drain's budget runs out is a
+    /// NON-QUIESCENT stop, and the drain must say so. Logging the timeout away and answering
+    /// "quiescent" is what let the host mutate the wallet on top of a live engine writer.
+    #[test]
+    fn drain_reports_a_writer_that_outlives_the_deadline() {
+        let progress = slipstream_core::ProgressArc::default();
+        // The RAII gate is the engine's own way of holding the counter up for the life of a
+        // commit, so the test raises it exactly as the persist lane does.
+        let gate = slipstream_core::events::WalletWriterGate::hold(progress.clone());
+        let quiescent =
+            drain_slipstream_wallet_writers_until(&progress, std::time::Duration::from_millis(50));
+        assert!(
+            !quiescent,
+            "a writer still running at the deadline must be reported, not logged away"
+        );
+        drop(gate);
+        assert!(drain_slipstream_wallet_writers_until(
+            &progress,
+            std::time::Duration::from_millis(50)
+        ));
+    }
+
+    /// [MOB-1850] The join half of the same contract. `abort()` cannot interrupt a task that is
+    /// inside a synchronous stretch, so one that is still there when the budget runs out must be
+    /// reported too — and the same handle must answer `true` once the task really has finished.
+    #[test]
+    fn join_reports_an_aborted_pass_that_outlives_the_deadline() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("a tokio runtime for the test");
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held = release.clone();
+        let running = started.clone();
+        // A task inside a synchronous loop: it reaches no await point, so `abort()` cannot take
+        // effect until the loop itself ends — the shape of the real in-flight wallet write.
+        let task = runtime.spawn(async move {
+            running.store(true, std::sync::atomic::Ordering::SeqCst);
+            while !held.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+        let abort = task.abort_handle();
+        // Abort only once the task is genuinely running: a task aborted before its first poll is
+        // dropped without ever executing, and would report itself finished at once.
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        abort.abort();
+        assert!(
+            !join_aborted_slipstream_task_until(&abort, std::time::Duration::from_millis(50)),
+            "a pass still unwinding at the deadline must be reported, not logged away"
+        );
+
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(join_aborted_slipstream_task_until(
+            &abort,
+            std::time::Duration::from_secs(10)
+        ));
+    }
 }
 
 // ── Slipstream FFI surface ────────────────────────────────────────────────────
@@ -5321,16 +5383,19 @@ pub unsafe extern "C" fn zcashlc_slipstream_start(
         let h = &mut handle.inner;
 
         // Cancel any in-flight task before spawning a new one.
+        // [MOB-1850] The result is deliberately ignored HERE: a start proceeds either way, as it
+        // always has. Only the stop-then-mutate callers act on the flag, and they reach it through
+        // `zcashlc_slipstream_stop`.
         if let Some(task) = h.task.take() {
             task.abort();
-            join_aborted_slipstream_task(&task);
+            let _ = join_aborted_slipstream_task(&task);
         }
         // [B4-16 drain] The aborted pass's write-behind commit may still be running
         // (`spawn_blocking` — uncancellable); wait it out BEFORE spawning the new
         // session, so the new pass's first writes never collide with an orphan
         // ("database is locked" at pass start) and no orphan Scanned-mark can land
         // after this point. Kills the B4-12 orphan-overlap class at the root.
-        drain_slipstream_wallet_writers(&h.progress);
+        let _ = drain_slipstream_wallet_writers(&h.progress);
         *h.state.lock().unwrap_or_else(|p| p.into_inner()) = SyncState::Syncing;
 
         let ufvk_str: Option<String> = if ufvk.is_null() || ufvk_len == 0 {
@@ -5513,10 +5578,15 @@ pub unsafe extern "C" fn zcashlc_slipstream_start(
     unwrap_exc_or(res, false)
 }
 
-/// Stops any in-flight Slipstream sync (non-blocking — task abort is async).
+/// Stops any in-flight Slipstream sync and waits, bounded, for the wallet file to fall quiet.
 ///
-/// Returns `true` immediately. The handle remains live; poll
-/// [`zcashlc_slipstream_snapshot`] to confirm state transitions to idle.
+/// [MOB-1850] Returns whether the stop was QUIESCENT: `true` when the aborted pass finished
+/// unwinding AND no wallet writer was still in flight by the time the ten-second budget ran out,
+/// `false` when either outlived it. A `false` answer does not mean the stop failed — the engine
+/// is Idle either way — it means the wallet file was never proved free of the engine's own
+/// writers, so a caller about to mutate that file (import, delete, truncate) should refuse rather
+/// than write on top of one. The handle remains live; poll [`zcashlc_slipstream_snapshot`] to
+/// confirm state transitions to idle.
 ///
 /// # Safety
 ///
@@ -5535,18 +5605,24 @@ pub unsafe extern "C" fn zcashlc_slipstream_stop(handle: *mut SlipstreamHandle) 
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(std::time::Instant::now());
         let h = &mut handle.inner;
-        if let Some(task) = h.task.take() {
-            task.abort();
-            join_aborted_slipstream_task(&task);
-        }
+        let joined = match h.task.take() {
+            Some(task) => {
+                task.abort();
+                join_aborted_slipstream_task(&task)
+            }
+            None => true,
+        };
         // [B4-16 drain] abort() cannot cancel an in-flight write-behind commit
         // (`spawn_blocking`) — drain it so a returned stop means the wallet file is
         // QUIESCENT: the host's next write (deleteAccount / importAccount / rewind
         // truncate) can no longer interleave with an orphan commit. Swift hops this
         // call off the cooperative pool (the drain is a real, bounded wait).
-        drain_slipstream_wallet_writers(&h.progress);
+        let drained = drain_slipstream_wallet_writers(&h.progress);
         *h.state.lock().unwrap_or_else(|p| p.into_inner()) = SyncState::Idle;
-        Ok(true)
+        // [MOB-1850] The pass is stopped either way — the state goes Idle above regardless. What
+        // the answer reports is whether the wallet file was PROVED quiescent, which is the only
+        // thing a caller about to mutate it can act on.
+        Ok(joined && drained)
     });
     unwrap_exc_or(res, false)
 }
@@ -5558,38 +5634,59 @@ pub unsafe extern "C" fn zcashlc_slipstream_stop(handle: *mut SlipstreamHandle) 
 /// non-transient failure, absorbed by the revival loop) and — worse — landed its
 /// Scanned-mark AFTER the import's force-rescan re-queue, silently shrinking the new
 /// account's scan scope. Called by stop() and start() right after aborting the task.
-/// 10 s cap ≫ the worst observed device commit (a few seconds, A10); on timeout we
-/// proceed with a warning — the busy_timeouts remain the backstop.
+/// 10 s cap ≫ the worst observed device commit (a few seconds, A10). [MOB-1850] A timeout
+/// is REPORTED (`false`) rather than logged away: a caller that is about to mutate the wallet
+/// needs to know the file was never proved quiescent, and can refuse instead of writing on top
+/// of a live writer. The busy_timeouts remain the backstop for the callers that proceed anyway.
 /// [B4-16 drain] `abort()` is ASYNCHRONOUS — the task keeps running until its next await
 /// point, so a synchronous in-flight wallet write (an enhance `decrypt_and_store`, a
 /// chain-tip or subtree-roots update — field evidence: a `deleteAccount` landing in that
 /// window failed its read→write lock upgrade, "error + try again") can land AFTER
 /// `abort()` returns. Wait (bounded) for the task to finish unwinding. Combined with
 /// `drain_slipstream_wallet_writers` (the persist lane's `spawn_blocking` commit — the
-/// engine's ONLY detached writer), a completed stop/start-abort means the wallet file is
-/// FULLY quiescent.
-fn join_aborted_slipstream_task(task: &tokio::task::AbortHandle) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+/// engine's ONLY detached writer), a stop/start-abort that returns `true` means the wallet
+/// file is FULLY quiescent; `false` means it could not be proved so within the budget.
+fn join_aborted_slipstream_task(task: &tokio::task::AbortHandle) -> bool {
+    join_aborted_slipstream_task_until(task, std::time::Duration::from_secs(10))
+}
+
+/// The bounded body of [`join_aborted_slipstream_task`], with the budget as a parameter so a
+/// test can exercise the deadline branch without waiting ten seconds for it.
+fn join_aborted_slipstream_task_until(
+    task: &tokio::task::AbortHandle,
+    budget: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + budget;
     while !task.is_finished() {
         if std::time::Instant::now() >= deadline {
             tracing::warn!(
-                "slipstream stop/start: aborted pass still unwinding after 10 s — proceeding"
+                "slipstream stop/start: aborted pass still unwinding at the deadline — reporting a non-quiescent stop"
             );
-            return;
+            return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    true
 }
 
-fn drain_slipstream_wallet_writers(progress: &slipstream_core::ProgressArc) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+fn drain_slipstream_wallet_writers(progress: &slipstream_core::ProgressArc) -> bool {
+    drain_slipstream_wallet_writers_until(progress, std::time::Duration::from_secs(10))
+}
+
+/// The bounded body of [`drain_slipstream_wallet_writers`], with the budget as a parameter for
+/// the same reason [`join_aborted_slipstream_task_until`] takes one.
+fn drain_slipstream_wallet_writers_until(
+    progress: &slipstream_core::ProgressArc,
+    budget: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + budget;
     let mut waited = false;
     while progress.wallet_writers() > 0 {
         if std::time::Instant::now() >= deadline {
             tracing::warn!(
-                "slipstream stop/start: in-flight wallet commit still running after 10 s — proceeding (busy_timeouts remain the backstop)"
+                "slipstream stop/start: in-flight wallet commit still running at the deadline — reporting a non-quiescent stop"
             );
-            return;
+            return false;
         }
         waited = true;
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -5597,6 +5694,7 @@ fn drain_slipstream_wallet_writers(progress: &slipstream_core::ProgressArc) {
     if waited {
         tracing::info!("slipstream stop/start: drained in-flight wallet commit");
     }
+    true
 }
 
 /// Reads a snapshot of current Slipstream progress atomics (non-blocking, poll-based — D8).

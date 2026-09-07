@@ -113,6 +113,30 @@ actor GatedFakeSlipstreamEngine: SlipstreamEngineControlling {
     /// When set, `start` throws it once its gate has been passed.
     var startError: Error?
 
+    /// [MOB-1850] What `stop()` reports: `true` (the default) is a QUIESCENT stop — the engine
+    /// confirmed its aborted pass and its wallet writer had both finished — and `false` is the
+    /// timeout the real FFI now surfaces, on which every wallet mutation refuses to write.
+    ///
+    /// `nonisolated` and lock-guarded rather than actor-isolated like `reopenError` and
+    /// `startError`, because a stop can arrive from a `nonisolated` teardown at any time and a test
+    /// sets this while the synchronizer is running; the lock is `NSLock` for the package's
+    /// iOS 13 / macOS 12 floor, like `Gate`'s.
+    nonisolated var stopQuiescent: Bool {
+        get {
+            stopQuiescentLock.lock()
+            defer { stopQuiescentLock.unlock() }
+            return stopQuiescentStorage
+        }
+        set {
+            stopQuiescentLock.lock()
+            stopQuiescentStorage = newValue
+            stopQuiescentLock.unlock()
+        }
+    }
+
+    private nonisolated let stopQuiescentLock = NSLock()
+    private nonisolated(unsafe) var stopQuiescentStorage = true
+
     // `nonisolated` is load-bearing, not decoration: an actor's `let` is implicitly nonisolated only
     // inside its own module, and every test that uses these lives in a test target rather than in
     // `TestUtils`. Without it `engine.stopGate.open()` does not compile from a test at all.
@@ -224,10 +248,11 @@ actor GatedFakeSlipstreamEngine: SlipstreamEngineControlling {
         }
     }
 
-    func stop() async {
+    func stop() async -> Bool {
         record("stop")
         await stopGate.wait()
         record("stop:done")
+        return stopQuiescent
     }
 
     func notifyTxChange() {

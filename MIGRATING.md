@@ -871,6 +871,71 @@ Orchard, Ironwood); transparent balance is never selected and must be shielded f
 for by the returned proposal. Any external conformer of these protocols must implement the new
 method.
 
+## `ZcashError` gains `slipstreamEngineNotQuiescent` — some `SlipstreamSynchronizer` mutations can now refuse
+
+`ZcashError` is a public enum, so an exhaustive `switch` over it stops compiling until the new case
+is handled:
+
+```swift
+// Before: exhaustive over ZcashError's existing cases.
+switch error {
+case .rustCreateToAddress(let error):
+    show(error.message)
+// ... the rest of ZcashError's cases
+}
+
+// After: one more case to add.
+switch error {
+case .rustCreateToAddress(let error):
+    show(error.message)
+// ... the rest of ZcashError's cases
+case .slipstreamEngineNotQuiescent:
+    show("Still finishing the previous step — try again in a moment.")
+}
+```
+
+The new case (`ZRUST0155`) is what `SlipstreamSynchronizer.importAccount`, `deleteAccount`,
+`switchTo(endpoint:)` and `restartSync(at:)` now throw, and what `rewind(_:)` and `wipe()` now
+fail their publisher with, when the engine could not confirm — within its bounded stop budget —
+that its previous pass and its wallet writer had both stopped before the mutation. The wallet is
+left exactly as it was found: nothing partial is written, nothing is deleted, no second handle is
+opened. If a pass was running, the refusal itself restarts it before the error is reported, so
+retrying the call later is the correct response.
+
+```swift
+// Before: the mutation either succeeded or threw a rust/network failure.
+try await synchronizer.deleteAccount(accountUUID)
+
+// After: a live writer the engine could not account for is now a distinct, retriable case.
+do {
+    try await synchronizer.deleteAccount(accountUUID)
+} catch ZcashError.slipstreamEngineNotQuiescent {
+    // The account was NOT deleted. Retry later, or surface a "still busy" message.
+} catch {
+    // Existing handling.
+}
+```
+
+`importAccount`, `switchTo(endpoint:)` and `restartSync(at:)` follow the same shape.
+`rewind(_:)` and `wipe()` are Combine APIs, so the same case arrives as a publisher failure rather
+than a thrown error:
+
+```swift
+synchronizer.wipe()
+    .sink(
+        receiveCompletion: { completion in
+            if case .failure(ZcashError.slipstreamEngineNotQuiescent) = completion {
+                // The wallet database was NOT deleted. Retry later.
+            }
+        },
+        receiveValue: { _ in }
+    )
+    .store(in: &cancellables)
+```
+
+`SlipstreamSynchronizer` is the only affected conformer; `SDKSynchronizer` does not use this engine
+and never throws or fails with this case.
+
 # Migrating from previous versions to v2.8.0-rc.1
 
 ## `prepare` now validates the seed against the existing wallet

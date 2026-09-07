@@ -612,6 +612,166 @@ final class SlipstreamLifecycleOwnershipTests: ZcashTestCase {
         XCTAssertEqual(calls.filter { $0 == "start" }.count, 1, "no pass came up after it")
     }
 
+    // MARK: - A non-quiescent stop refuses the operation stacked on top of it
+
+    // The engine's stop drains its own wallet writer, bounded; when that budget runs out the FFI
+    // now REPORTS it instead of logging it away, and every operation that was writing on the
+    // strength of that stop refuses rather than proceeding. `deleteAccount` is the offline
+    // stand-in for `importAccount` here for the reason the suite already relies on elsewhere:
+    // `importAccount` fetches a restore anchor from a server before it reaches the lifecycle
+    // queue, and the two share `importAccountOnLifecycleQueue`'s stop/mutate/restart shape
+    // verbatim.
+
+    /// A refused mutation leaves the wallet exactly as it found it — and leaves the pass running,
+    /// because nothing about the wallet changed to justify stopping it.
+    func testDeleteRefusesToMutateWhenTheStopWasNotQuiescent() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setNextSnapshot(SlipstreamSnapshot.testSyncing(progressPermille: 100))
+        let welding = ZcashRustBackendWeldingMock()
+        welding.deleteAccountClosure = { _ in }
+        let sync = try makeSlipstreamSynchronizer(engine: engine, welding: welding)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+
+        try await sync.start(retry: false)
+        engine.stopQuiescent = false
+
+        do {
+            try await sync.deleteAccount(TestsData.mockedAccountUUID)
+            XCTFail("a non-quiescent stop must refuse the mutation")
+        } catch let error as ZcashError {
+            guard case .slipstreamEngineNotQuiescent = error else {
+                return XCTFail("unexpected error \(error.code)")
+            }
+        }
+
+        XCTAssertFalse(welding.deleteAccountCalled, "the wallet must not be mutated on top of a live writer")
+        let calls = await engine.calls
+        let lastStop = try XCTUnwrap(calls.lastIndex(of: "stop"), "the refusal still tore the pass down: \(calls)")
+        let lastStartDone = try XCTUnwrap(calls.lastIndex(of: "start:done"), "the pass restarts because it was running: \(calls)")
+        XCTAssertGreaterThan(lastStartDone, lastStop, "the restart after the refusal is the one left running: \(calls)")
+        let isRunning = await sync.isRunningForTesting()
+        XCTAssertTrue(isRunning, "a refused mutation leaves the synchronizer running, as it found it")
+    }
+
+    /// The same contract for the truncate: a rewind reports the refusal on its publisher, and the
+    /// chain state is never truncated underneath a writer the engine could not account for.
+    func testRewindRefusesToTruncateWhenTheStopWasNotQuiescent() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setNextSnapshot(SlipstreamSnapshot.testSyncing(progressPermille: 100))
+        let welding = ZcashRustBackendWeldingMock()
+        welding.truncateToChainStateChainStateClosure = { _ in }
+        let sync = try makeSlipstreamSynchronizer(engine: engine, welding: welding)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+
+        try await sync.start(retry: false)
+        engine.stopQuiescent = false
+
+        let failed = XCTestExpectation(description: "rewind reported the refusal")
+        var rewindError: Error?
+        sync.rewind(.birthday)
+            .sink(
+                receiveCompletion: { completion in
+                    if case let .failure(error) = completion {
+                        rewindError = error
+                    }
+                    failed.fulfill()
+                },
+                receiveValue: { _ in }
+            )
+            .store(in: &cancellables)
+        await fulfillment(of: [failed], timeout: 5)
+
+        guard case .slipstreamEngineNotQuiescent = try XCTUnwrap(rewindError as? ZcashError) else {
+            return XCTFail("a non-quiescent stop must refuse the truncate")
+        }
+        XCTAssertFalse(
+            welding.truncateToChainStateChainStateCalled,
+            "the chain state must not be truncated on top of a live writer"
+        )
+        let isRunning = await sync.isRunningForTesting()
+        XCTAssertTrue(isRunning, "a refused rewind leaves the synchronizer running, as it found it")
+    }
+
+    /// A wipe deletes the files every other operation reads, so it is the one that must refuse most
+    /// firmly: the handle is not freed and nothing is removed.
+    func testWipeRefusesWhenTheStopWasNotQuiescent() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setNextSnapshot(SlipstreamSnapshot.testSyncing(progressPermille: 100))
+        let sync = try makeSlipstreamSynchronizer(engine: engine)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+
+        try await sync.start(retry: false)
+        engine.stopQuiescent = false
+
+        let finished = XCTestExpectation(description: "wipe reported the refusal")
+        var wipeError: Error?
+        sync.wipe()
+            .sink(
+                receiveCompletion: { completion in
+                    if case let .failure(error) = completion {
+                        wipeError = error
+                    }
+                    finished.fulfill()
+                },
+                receiveValue: { _ in }
+            )
+            .store(in: &cancellables)
+        await fulfillment(of: [finished], timeout: 5)
+
+        guard case .slipstreamEngineNotQuiescent = try XCTUnwrap(wipeError as? ZcashError) else {
+            return XCTFail("a non-quiescent stop must refuse the wipe")
+        }
+        let calls = await engine.calls
+        XCTAssertFalse(calls.contains("close"), "the handle must not be freed under a live writer: \(calls)")
+        XCTAssertNotEqual(sync.latestState.internalSyncStatus, .unprepared, "the wallet was left intact")
+        let isRunning = await sync.isRunningForTesting()
+        XCTAssertTrue(isRunning, "a refused wipe leaves the synchronizer running, as it found it")
+    }
+
+    /// The reopen half of the same rule: a switch that cannot prove the old pass is gone must not
+    /// hand the wallet to a second engine handle.
+    func testSwitchToRefusesToReopenWhenTheStopWasNotQuiescent() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setNextSnapshot(SlipstreamSnapshot.testSyncing(progressPermille: 100))
+        let sync = try makeSlipstreamSynchronizer(engine: engine)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+
+        try await sync.start(retry: false)
+        engine.stopQuiescent = false
+
+        do {
+            try await sync.switchTo(endpoint: LightWalletEndpoint(address: "other.example.com", port: 443, secure: true))
+            XCTFail("a non-quiescent stop must refuse the reopen")
+        } catch let error as ZcashError {
+            guard case .slipstreamEngineNotQuiescent = error else {
+                return XCTFail("unexpected error \(error.code)")
+            }
+        }
+
+        let calls = await engine.calls
+        XCTAssertFalse(
+            calls.contains { $0.hasPrefix("reopen(") },
+            "a second handle must not be opened onto a wallet the first one may still be writing: \(calls)"
+        )
+    }
+
+    /// The control: a quiescent stop is the ordinary case, and it must still mutate. Without this
+    /// the three refusals above would pass just as well against an operation that refused always.
+    func testAQuiescentStopStillMutates() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setNextSnapshot(SlipstreamSnapshot.testSyncing(progressPermille: 100))
+        let welding = ZcashRustBackendWeldingMock()
+        welding.deleteAccountClosure = { _ in }
+        let sync = try makeSlipstreamSynchronizer(engine: engine, welding: welding)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+
+        try await sync.start(retry: false)
+
+        try await sync.deleteAccount(TestsData.mockedAccountUUID)
+
+        XCTAssertTrue(welding.deleteAccountCalled, "the default stop is quiescent and the mutation goes through")
+    }
+
     // MARK: - Helpers
 
     /// Shuts the snapshot gate from INSIDE the next `snapshot()` call, so exactly one tick is held

@@ -40,7 +40,7 @@ protocol SlipstreamEngineControlling: Actor {
     func open(network: ZcashNetwork) throws
     func setAlternates(_ endpoints: [LightWalletEndpoint])
     func start(ufvk: String?, birthday: BlockHeight, torDir: String?) async throws
-    func stop() async
+    func stop() async -> Bool
     func notifyTxChange()
     func close()
     func reopen(server newServer: LightWalletEndpoint, network: ZcashNetwork) async throws
