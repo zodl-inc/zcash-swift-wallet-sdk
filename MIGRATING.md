@@ -920,7 +920,8 @@ try await synchronizer.deleteAccount(accountUUID)
 do {
     try await synchronizer.deleteAccount(accountUUID)
 } catch ZcashError.slipstreamEngineNotQuiescent {
-    // The account was NOT deleted. Retry later, or surface a "still busy" message.
+    // The account was NOT deleted. Surface a "still busy" message and retry once or twice; a
+    // refusal that persists will not clear (see above).
 } catch {
     // Existing handling.
 }
@@ -935,7 +936,8 @@ synchronizer.wipe()
     .sink(
         receiveCompletion: { completion in
             if case .failure(ZcashError.slipstreamEngineNotQuiescent) = completion {
-                // The wallet database was NOT deleted. Retry later.
+                // The wallet database was NOT deleted. Retry once or twice; a refusal that
+                // persists will not clear (see above).
             }
         },
         receiveValue: { _ in }

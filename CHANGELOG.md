@@ -92,8 +92,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rewind(_:)` and `wipe()` now fail their publisher with it, leaving the wallet untouched, when
   the engine could not confirm within its bounded stop budget that its previous pass and wallet
   writer had stopped; previously the mutation proceeded on the assumption that they had. The pass
-  and its writer are each given their own budget, and a refused call restarts the pass before
-  reporting the failure, so the wait can be noticeably longer than a single budget. The refusal
+  and its writer are each given their own budget, and a refused call that had stopped a running
+  pass restarts it before reporting the failure, so the wait can be noticeably longer than a
+  single budget. The refusal
   persists across repeated stops: an aborted pass that outlived one stop's budget keeps every
   later stop refusing until that pass has actually finished, not only the most recent one. The
   SDK's own stall recovery meets the same refusal when it reopens the engine and reports it as

@@ -1195,9 +1195,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// after a SUCCESSFUL mutation does.
     ///
     /// The restarted pass runs alongside the writer the engine could not account for. That is
-    /// safe: the operations that would re-queue a rescan over the wallet are exactly the ones
-    /// being refused, so what remains is at most a transient `database is locked` that the wallet
-    /// connections' busy timeout already absorbs.
+    /// safe because the refused mutation never happened: the pass that comes back resumes the same
+    /// durable scan queue over the same wallet it was already sharing with that writer, so nothing
+    /// new races it, and a transient `database is locked` is absorbed by the wallet connections'
+    /// busy timeout.
     private func restartAfterARefusedOperation(wasRunning: Bool) async {
         guard wasRunning else { return }
         do {
