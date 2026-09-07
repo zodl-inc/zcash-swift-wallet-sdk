@@ -210,9 +210,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A submit-plan release that arrives after `wipe()` no longer recreates the wiped store: reads
   never create the store file, and only a transaction created in the current wallet lifecycle can
   be released to background resubmission.
-- `Synchronizer.transactionSubmissionStatus(for:)` and background resubmission treat a submit-plan
-  store whose creation failed as unavailable again (skipping the transaction) instead of as never
-  written; a previous entry in this section described the read path incorrectly for that case.
+- Background resubmission treats a submit-plan store whose creation failed as unavailable again and
+  skips the transaction, instead of reading the missing file as a never-written store and
+  broadcasting through the default endpoint. `transactionSubmissionStatus(for:)` is unaffected: it
+  already reported no status for that case.
 - A stop that follows a stop which had already given up waiting for an aborted pass now still
   reports non-quiescence until that pass has actually finished, so `importAccount`,
   `deleteAccount`, `rewind`, `wipe`, `switchTo` and `restartSync(at:)` keep refusing until the
