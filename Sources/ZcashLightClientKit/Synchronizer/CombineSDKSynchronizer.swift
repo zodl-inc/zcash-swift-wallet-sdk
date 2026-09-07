@@ -273,6 +273,12 @@ extension CombineSDKSynchronizer: CombineSynchronizer {
         }
     }
 
+    public func getLocalAccountBalances() -> SinglePublisher<[AccountUUID: AccountBalance]?, Error> {
+        AsyncToCombineGateway.executeThrowingAction() {
+            try await self.synchronizer.getLocalAccountBalances()
+        }
+    }
+
     public func refreshExchangeRateUSD() {
         synchronizer.refreshExchangeRateUSD()
     }

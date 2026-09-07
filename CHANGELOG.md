@@ -4,6 +4,75 @@ All notable changes to this library will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+# Unreleased
+
+# 4.2.0 - 2026-09-03
+
+## Added
+
+### Balances
+
+- `Synchronizer.getLocalAccountBalances()` and `SynchronizerState.localAccountsBalances` expose
+  the last account balances stored in the wallet database without chain-tip freshness masking.
+  Wallet apps can keep a stale balance visible while they replace networking. Synchronizers that
+  do not support durable snapshots return `nil`. Existing balance APIs keep their masking behavior.
+
+## Changed
+
+- `Synchronizer` gained a new requirement:
+  `evaluateServerSwitch(current:candidates:fetchThresholdSeconds:nBlocksToFetch:network:)`. Any
+  custom `Synchronizer` conformer or test double stops compiling until it implements it — see
+  `MIGRATING.md` for a drop-in stub. The method benchmarks the candidates (always including the
+  current endpoint, appending it when the caller's list omits it) and returns the endpoint worth
+  switching to, or `nil` to stay. A switch requires beating the current server's score on both an
+  absolute and a relative gate; the gates are bypassed only when the current server fails the
+  benchmark twice in a row. On `SDKSynchronizer` the block-fetch phase is bounded to the three
+  fastest candidates by latency plus the current server — never the whole list — so network cost
+  does not grow with the number of candidates. A call whose surrounding task is cancelled returns
+  `nil`.
+- Proposal and transaction-creation failures now report WHY they failed, and from WHERE
+  (MOB-1201). Previously every such failure surfaced as `ZcashError.rustCreateToAddress`, whose
+  `errorDescription` printed only the static sentence "Error from rust layer when calling
+  ZcashRustBackend.createToAddress" — the rust error string was carried in the associated value and
+  never rendered, so a user's error report named no cause and did not even say whether the failure
+  happened while BUILDING a proposal or while signing an already-confirmed one.
+
+  The rust layer now classifies these failures instead of flattening them into a string, and each
+  call site throws its own code: `rustProposeTransfer` (`ZRUST0151`), `rustProposeTransferFromURI`
+  (`ZRUST0057`), `rustProposeSendMaxTransfer` (`ZRUST0129`),
+  `rustProposeOrchardToIronwoodMigration` (`ZRUST0152`), and `rustCreateToAddress` (`ZRUST0002`),
+  which now covers only the signing step. Two conditions a wallet should render itself rather than
+  show as an error get dedicated cases: `rustProposalScanRequired` (`ZRUST0153`) and
+  `rustProposalInsufficientFunds(available:required:)` (`ZRUST0154`), the latter carrying both
+  amounts as `Zatoshi`.
+
+  BREAKING: the associated value of `rustCreateToAddress`, `rustProposeTransferFromURI`, and
+  `rustProposeSendMaxTransfer` changes from `String` to the new `RedactedRustError`, which carries
+  a `RustErrorKind` to switch on alongside the message. `ZcashError` also gains a `detail` property,
+  and `errorDescription` appends it when present. See MIGRATING.md.
+
+  The rendered detail is redacted at the rust boundary: it never contains an amount, address, note
+  identifier or txid, so it is safe to submit in a support ticket. `RedactedRustError` is the
+  certificate of that — `detail` renders a payload only when it has that type, so the raw strings
+  still carried by other `rust*` cases cannot reach a report. The unredacted text is logged on the
+  device at `debug!` level.
+
+## Fixed
+
+- The server benchmark behind `evaluateBestOf` and `evaluateServerSwitch` no longer ranks
+  endpoints whose block stream delivers fewer blocks than requested — an empty or truncated
+  stream previously recorded a near-zero time and won the ranking outright.
+- The server benchmark closes its per-endpoint gRPC connections when evaluation finishes instead
+  of leaving teardown to object lifetime, and stops opening new connections once its surrounding
+  task is cancelled.
+- Server-benchmark timings use a monotonic clock, so a wall-clock adjustment mid-measurement can
+  no longer produce negative or nonsense scores.
+- `SlipstreamSynchronizer`'s server benchmark (`evaluateBestOf`, `evaluateServerSwitch`) now
+  applies the same health checks as `SDKSynchronizer`: a consensus-branch-id check and a
+  synced-height check rule out servers on the wrong fork or far behind the chain tip, and
+  regtest chain names are accepted on the regtest network. Previously a stalled server that
+  answered `getInfo` quickly could rank first.
+
 # 4.1.0 - 2026-09-01
 
 ## Added

@@ -236,6 +236,11 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
 
     // MARK: - Inert defaults
 
+    func testLocalAccountBalancesDefaultReturnsNil() async throws {
+        let balances = try await synchronizer.getLocalAccountBalances()
+        XCTAssertNil(balances)
+    }
+
     /// `nil` is the correct session-start answer for the inert default too: no host-level
     /// conformer means no crank has ever run.
     func testNextMigrationWakeDefaultReturnsNil() async {
@@ -394,6 +399,14 @@ private final class NonMigratingSynchronizer: Synchronizer {
         kServers: Int,
         network: NetworkType
     ) async -> [LightWalletEndpoint] { Self.unused() }
+
+    func evaluateServerSwitch(
+        current: LightWalletEndpoint,
+        candidates: [LightWalletEndpoint],
+        fetchThresholdSeconds: Double,
+        nBlocksToFetch: UInt64,
+        network: NetworkType
+    ) async -> LightWalletEndpoint? { Self.unused() }
 
     func estimateBirthdayHeight(for date: Date) -> BlockHeight { Self.unused() }
     func estimateTimestamp(for height: BlockHeight) -> TimeInterval? { Self.unused() }

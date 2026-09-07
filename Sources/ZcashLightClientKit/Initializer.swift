@@ -51,6 +51,15 @@ public struct LightWalletEndpoint {
 // under strict concurrency need this conformance spelled out.
 extension LightWalletEndpoint: Equatable, Sendable {}
 
+extension LightWalletEndpoint {
+    /// Whether `self` and `other` name the same server: host, port and TLS flag must all match.
+    /// This is the single endpoint identity used by server switching — the same rule
+    /// `SlipstreamSynchronizer.switchTo` applies when deciding that a switch is a no-op.
+    func isSameServer(as other: LightWalletEndpoint) -> Bool {
+        host == other.host && port == other.port && secure == other.secure
+    }
+}
+
 /// This contains URLs from which can the SDK fetch files that contain sapling parameters.
 /// Use `SaplingParamsSourceURL.default` when initilizing the SDK.
 public struct SaplingParamsSourceURL {

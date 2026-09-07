@@ -319,10 +319,12 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // still come from the unified summary (recovery-safe at every phase, D-1/E-1).
         let snap = await engine.snapshot()
         currentlyRecovering = snap?.isRecovering == 1
-        let summary = await unifiedWalletSummary()
+        let summaries = await walletBalanceSnapshots()
+        let summary = summaries.visible
         stateSubject.send(SlipstreamSynchronizer.initialState(
             snapshot: snap,
             accountsBalances: summary?.accountBalances ?? [:],
+            localAccountsBalances: summaries.local ?? [:],
             fullyScannedHeight: summary?.fullyScannedHeight,
             syncSessionID: UUID()
         ))
@@ -380,6 +382,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
         stateSubject.send(SynchronizerState(
             syncSessionID: UUID(),
             accountsBalances: latestState.accountsBalances,
+            localAccountsBalances: latestState.localAccountsBalances,
             internalSyncStatus: .syncing(
                 Float(snap?.progressPermille ?? 0) / 1000,
                 (snap?.spendableHint ?? 0) != 0
@@ -426,6 +429,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
             stateSubject.send(SynchronizerState(
                 syncSessionID: latestState.syncSessionID,
                 accountsBalances: latestState.accountsBalances,
+                localAccountsBalances: latestState.localAccountsBalances,
                 internalSyncStatus: .stopped,
                 latestBlockHeight: latestState.latestBlockHeight
             ))
@@ -453,6 +457,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
         stateSubject.send(SynchronizerState(
             syncSessionID: latestState.syncSessionID,
             accountsBalances: latestState.accountsBalances,
+            localAccountsBalances: latestState.localAccountsBalances,
             internalSyncStatus: status,
             latestBlockHeight: latestState.latestBlockHeight
         ))
@@ -511,7 +516,8 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // [E-3] A plain local: the host-side summary CACHE is gone with the warm-start
         // machinery it fed (the engine serves its own cache; a nil here only means
         // "engine mid-close", and every consumer falls back to `latestState`).
-        let summary = await unifiedWalletSummary()
+        let summaries = await walletBalanceSnapshots()
+        let summary = summaries.visible
 
         // ── State-dispatch: Syncing vs Done vs other ──────────────────────────
         // Progress + spendability come from the snapshot (blessed `progressPermille` +
@@ -544,6 +550,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
             stateSubject.send(SynchronizerState(
                 syncSessionID: latestState.syncSessionID,
                 accountsBalances: summary?.accountBalances ?? latestState.accountsBalances,
+                localAccountsBalances: summaries.local ?? latestState.localAccountsBalances,
                 internalSyncStatus: .synced,
                 latestBlockHeight: BlockHeight(snap.chainTip),
                 fullyScannedHeight: summary?.fullyScannedHeight ?? latestState.fullyScannedHeight,
@@ -561,6 +568,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
             stateSubject.send(SynchronizerState(
                 syncSessionID: latestState.syncSessionID,
                 accountsBalances: summary?.accountBalances ?? latestState.accountsBalances,
+                localAccountsBalances: summaries.local ?? latestState.localAccountsBalances,
                 internalSyncStatus: .syncing(surfacedProgress, spendable),
                 latestBlockHeight: BlockHeight(snap.chainTip),
                 fullyScannedHeight: summary?.fullyScannedHeight ?? latestState.fullyScannedHeight,
@@ -585,6 +593,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
             stateSubject.send(SynchronizerState(
                 syncSessionID: latestState.syncSessionID,
                 accountsBalances: balances,
+                localAccountsBalances: summaries.local ?? latestState.localAccountsBalances,
                 internalSyncStatus: newStatus,
                 latestBlockHeight: BlockHeight(snap.chainTip),
                 fullyScannedHeight: fullyScannedHeight,
@@ -726,14 +735,22 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// (E-2); only the 3-line transform stays host-side (the C `AccountBalance` cannot express
     /// the awaiting-resolution shift). Recovery balances are never masked — parity with the
     /// old path, where the recovery display bypassed the legacy summary's mask entirely.
-    /// A nil snapshot (engine mid-close) masks conservatively: never over-show spendable.
-    private func unifiedWalletSummary() async -> WalletSummary? {
-        guard let summary = await engine.walletSummary() else { return nil }
+    /// The visible summary is engine-owned and recovery-safe. The local snapshot always comes
+    /// directly from the shared wallet database and is display-only; it remains available while
+    /// the engine handle is closed during server replacement.
+    private func walletBalanceSnapshots() async -> (
+        visible: WalletSummary?,
+        local: [AccountUUID: AccountBalance]?
+    ) {
+        let summary = await engine.walletSummary()
+        let provider = initializer.rustBackend as? LocalBalanceProviding
+        let local = try? await provider?.getLocalAccountBalances()
+        guard let summary else { return (nil, local) }
         let snap = await engine.snapshot()
         if snap?.isRecovering != 1 && snap?.tipFresh != 1 {
-            return summary.withSpendableMasked()
+            return (summary.withSpendableMasked(), local)
         }
-        return summary
+        return (summary, local)
     }
 
     // ── Accounts / Balances ────────────────────────────────────────────────────
@@ -742,8 +759,14 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // [v2.1 Phase 2] ONE call, correct at every phase: the engine resolves recovery
         // (Σ-reconciled view values) vs normal (upstream passthrough) inside the unified
         // summary FFI and rations the expensive walk itself — no host-side branching.
-        let summary = await unifiedWalletSummary()
-        return summary?.accountBalances ?? [:]
+        let summaries = await walletBalanceSnapshots()
+        return summaries.visible?.accountBalances ?? [:]
+    }
+
+    public func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance]? {
+        guard latestState.internalSyncStatus.isPrepared else { return nil }
+        guard let provider = initializer.rustBackend as? LocalBalanceProviding else { return nil }
+        return try await provider.getLocalAccountBalances()
     }
 
     public func listAccounts() async throws -> [Account] {
@@ -957,24 +980,15 @@ public actor SlipstreamSynchronizer: Synchronizer {
         // Parity with `start()`'s guard above and with `SDKSynchronizer.proposefulfillingPaymentURI`'s
         // `throwIfUnprepared()`: the encoder path below never touches the engine handle, so
         // without this check an unprepared call would fall straight through to the rust
-        // backend instead of failing with the documented `synchronizerNotPrepared`. Placed before
-        // the `do` block (rather than as its first statement, where `SDKSynchronizer` puts its own
-        // copy) so the guard's throw bypasses the `rustCreateToAddress` remapping below -- it is
-        // not a rust error to remap, and the two placements are externally identical since neither
-        // catch clause matches `synchronizerNotPrepared`.
+        // backend instead of failing with the documented `synchronizerNotPrepared`.
         guard latestState.internalSyncStatus.isPrepared else {
             throw ZcashError.synchronizerNotPrepared
         }
-        do {
-            return try await transactionEncoder.proposeFulfillingPaymentFromURI(
-                uri,
-                accountUUID: accountUUID
-            )
-        } catch ZcashError.rustCreateToAddress(let error) {
-            throw ZcashError.rustProposeTransferFromURI(error)
-        } catch {
-            throw error
-        }
+
+        return try await transactionEncoder.proposeFulfillingPaymentFromURI(
+            uri,
+            accountUUID: accountUUID
+        )
     }
 
     public func createProposedTransactions(
@@ -1624,11 +1638,9 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// 6. Store `endpoint` in `currentEndpoint`.
     /// 7. If the engine was running before the switch, restart via `start(retry: false)`.
     public func switchTo(endpoint: LightWalletEndpoint) async throws {
-        // F2: No-op on identical endpoint — avoids an unnecessary restart.
-        // Compare host, port and TLS flag (all three must match to be the same server).
-        if endpoint.host == currentEndpoint.host
-            && endpoint.port == currentEndpoint.port
-            && endpoint.secure == currentEndpoint.secure {
+        // F2: No-op on identical endpoint — avoids an unnecessary restart. Same-server rule:
+        // host, port and TLS flag must all match (`isSameServer`).
+        if endpoint.isSameServer(as: currentEndpoint) {
             initializer.logger.debug(
                 "switchTo: endpoint unchanged (\(endpoint.host):\(endpoint.port)) — no-op",
                 file: #file, function: #function, line: #line
@@ -1697,32 +1709,90 @@ public actor SlipstreamSynchronizer: Synchronizer {
         kServers: Int = 3,
         network: NetworkType = .mainnet
     ) async -> [LightWalletEndpoint] {
-        // Delegate to ephemeral gRPC connections — same pattern as SDKSynchronizer.
-        // TODO: [#1755] Hook into Tor when torEnabled; for now direct mode is used.
-        var results: [(LightWalletEndpoint, TimeInterval)] = []
-        await withTaskGroup(of: (LightWalletEndpoint, TimeInterval)?.self) { group in
+        let measured = await measureEndpoints(endpoints: endpoints, network: network)
+        return measured
+            .prefix(kServers)
+            .map { $0.endpoint }
+    }
+
+    /// Slipstream benchmarks by a single `getInfo` round trip per candidate —
+    /// `fetchThresholdSeconds` and `nBlocksToFetch` are accepted for protocol conformance but
+    /// unused, because this conformer has no block-fetch phase.
+    public func evaluateServerSwitch(
+        current: LightWalletEndpoint,
+        candidates: [LightWalletEndpoint],
+        fetchThresholdSeconds _: Double,
+        nBlocksToFetch _: UInt64,
+        network: NetworkType
+    ) async -> LightWalletEndpoint? {
+        await ServerSwitchDecision.evaluate(
+            current: current,
+            candidates: candidates,
+            thresholds: .roundTrip,
+            logger: initializer.logger
+        ) { endpoints in
+            await self.measureEndpoints(endpoints: endpoints, network: network)
+        }
+    }
+
+    /// Ranks `endpoints` by `getInfo` round-trip time, ascending (best first), applying the
+    /// same health checks as `SDKSynchronizer`'s benchmark: chain name, consensus branch id,
+    /// and the loose synced-height check — all skipped for custom networks, mirroring
+    /// `ValidateServerAction`. Delegates to ephemeral gRPC connections.
+    // TODO: [#1755] Hook into Tor when torEnabled; for now direct mode is used.
+    private func measureEndpoints(
+        endpoints: [LightWalletEndpoint],
+        network: NetworkType
+    ) async -> [ServerSwitchDecision.MeasuredEndpoint] {
+        var results: [ServerSwitchDecision.MeasuredEndpoint] = []
+
+        await withTaskGroup(of: (LightWalletEndpoint, TimeInterval, LightWalletdInfo)?.self) { group in
             for endpoint in endpoints {
                 group.addTask {
                     let service = LightWalletGRPCService(endpoint: endpoint)
-                    let start = Date().timeIntervalSince1970
+                    let start = DispatchTime.now()
                     let info = try? await service.getInfo(mode: .direct)
-                    let elapsed = Date().timeIntervalSince1970 - start
-                    guard let info,
-                        (info.chainName == "main" && network == .mainnet) ||
-                        (info.chainName == "test" && network == .testnet) else {
-                        return nil
-                    }
-                    return (endpoint, elapsed)
+                    let elapsed = DispatchTime.now().secondsSince(start)
+                    await service.closeConnections()
+                    guard let info else { return nil }
+                    return (endpoint, elapsed, info)
                 }
             }
+
+            let isCustomNetwork = initializer.network.customActivationHeights != nil
+
             for await result in group {
-                if let result { results.append(result) }
+                guard let (endpoint, elapsed, info) = result, elapsed > 0 else { continue }
+
+                if !isCustomNetwork {
+                    guard (info.chainName == "main" && network == .mainnet)
+                        || (info.chainName == "test" && network == .testnet)
+                        || (info.chainName == "regtest" && network == .regtest) else {
+                        continue
+                    }
+
+                    guard
+                        let localBranchID = try? initializer.rustBackend.consensusBranchIdFor(
+                            height: Int32(info.blockHeight)
+                        ),
+                        let remoteBranchID = ConsensusBranchID.fromString(info.consensusBranchID),
+                        remoteBranchID == localBranchID
+                    else {
+                        continue
+                    }
+                }
+
+                // Rule out servers that are syncing, stuck, or probably on the wrong fork.
+                // Deliberately loose — `info.estimatedHeight` may be quite inaccurate.
+                guard info.blockHeight + ZcashSDK.syncedThresholdBlocks >= info.estimatedHeight else {
+                    continue
+                }
+
+                results.append(ServerSwitchDecision.MeasuredEndpoint(endpoint: endpoint, score: elapsed))
             }
         }
-        return results
-            .sorted { $0.1 < $1.1 }
-            .prefix(kServers)
-            .map { $0.0 }
+
+        return results.sorted { $0.score < $1.score }
     }
 
     // ── Birthday / timestamp ──────────────────────────────────────────────────

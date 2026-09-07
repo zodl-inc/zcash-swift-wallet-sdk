@@ -37,6 +37,9 @@ public struct SynchronizerState: Equatable {
     public var syncSessionID: UUID
     /// account balance known to this synchronizer given the data that has processed locally
     public var accountsBalances: [AccountUUID: AccountBalance]
+    /// Last account balances persisted in the wallet database, without network-freshness masking.
+    /// These values can be stale and are intended for display continuity while networking changes.
+    public var localAccountsBalances: [AccountUUID: AccountBalance]
     /// status of the whole sync process
     var internalSyncStatus: InternalSyncStatus
     public var syncStatus: SyncStatus
@@ -63,6 +66,7 @@ public struct SynchronizerState: Equatable {
         SynchronizerState(
             syncSessionID: .nullID,
             accountsBalances: [:],
+            localAccountsBalances: [:],
             internalSyncStatus: .unprepared,
             latestBlockHeight: .zero,
             fullyScannedHeight: .zero
@@ -72,6 +76,7 @@ public struct SynchronizerState: Equatable {
     init(
         syncSessionID: UUID,
         accountsBalances: [AccountUUID: AccountBalance],
+        localAccountsBalances: [AccountUUID: AccountBalance],
         internalSyncStatus: InternalSyncStatus,
         latestBlockHeight: BlockHeight,
         fullyScannedHeight: BlockHeight = .zero,
@@ -79,6 +84,7 @@ public struct SynchronizerState: Equatable {
     ) {
         self.syncSessionID = syncSessionID
         self.accountsBalances = accountsBalances
+        self.localAccountsBalances = localAccountsBalances
         self.internalSyncStatus = internalSyncStatus
         self.latestBlockHeight = latestBlockHeight
         self.fullyScannedHeight = fullyScannedHeight
@@ -227,9 +233,11 @@ public protocol Synchronizer: AnyObject {
     /// selected and must be shielded first — see `proposeShielding`.
     ///
     /// When the account has no spendable balance, or its balance cannot cover the fee, this method throws
-    /// `ZcashError.rustProposeSendMaxTransfer` (`ZRUST0129`). There is currently no dedicated typed error for
-    /// the nothing-to-send case, so a caller that wants to special-case an empty wallet should check the
-    /// spendable balance before calling this method.
+    /// `ZcashError.rustProposalInsufficientFunds(available:required:)` (`ZRUST0154`) where the rust layer
+    /// reports that condition, carrying both amounts; a wallet still catching up throws
+    /// `ZcashError.rustProposalScanRequired` (`ZRUST0153`). Anything else the rust layer returns surfaces as
+    /// `ZcashError.rustProposeSendMaxTransfer` (`ZRUST0129`), whose `RedactedRustError` payload names the
+    /// condition without carrying an amount or an address.
     ///
     /// - Parameter accountUUID: the account from which to spend funds.
     /// - Parameter recipient: the recipient's address.
@@ -414,6 +422,16 @@ public protocol Synchronizer: AnyObject {
     /// - Returns: `[AccountUUID: AccountBalance]`, struct that holds Sapling and unshielded balances per account
     func getAccountsBalances() async throws -> [AccountUUID: AccountBalance]
 
+    /// Returns the account balances currently persisted in the wallet database without applying
+    /// network-freshness masking.
+    ///
+    /// These values can be stale until synchronization refreshes the chain tip. They are intended
+    /// for preserving an already-known balance while networking is being initialized or replaced,
+    /// not as the sole authorization for constructing a transaction. Returns `nil` before the
+    /// synchronizer is prepared, after it is wiped, or when an alternate implementation does not
+    /// support durable snapshots.
+    func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance]?
+
     /// Fetches the latest ZEC-USD exchange rate and updates `exchangeRateUSDSubject`.
     func refreshExchangeRateUSD()
 
@@ -512,6 +530,36 @@ public protocol Synchronizer: AnyObject {
         kServers: Int,
         network: NetworkType
     ) async -> [LightWalletEndpoint]
+
+    /// Benchmarks the candidate endpoints and decides whether switching away from `current`
+    /// is worth the synchronizer teardown. Hysteresis: the winner must beat the current
+    /// server's score by a meaningful margin (absolute AND relative) unless the current
+    /// server failed the benchmark twice in a row.
+    ///
+    /// The current server is always benchmarked, whether or not it appears in `candidates`,
+    /// and a missing score is confirmed by one re-probe before it is treated as unhealthy —
+    /// a single transient failure never forces a switch. Endpoint identity is host, port and
+    /// the TLS flag. A call whose surrounding task is cancelled returns nil (stay).
+    ///
+    /// How candidates are scored depends on the conformer: `SDKSynchronizer` runs the same
+    /// pipeline as `evaluateBestOf` (latency and health checks on every candidate, then the
+    /// block-fetch phase for the fastest few plus the current server, honoring
+    /// `fetchThresholdSeconds` and `nBlocksToFetch`), while `SlipstreamSynchronizer` ranks by
+    /// a single `getInfo` round trip and does not use the two fetch parameters.
+    /// - Parameters:
+    ///    - current: The endpoint the wallet uses right now (identified by host, port and TLS flag).
+    ///    - candidates: Endpoints to benchmark alongside `current`.
+    ///    - fetchThresholdSeconds: Per-endpoint cap for the block-fetch phase, where the conformer has one.
+    ///    - nBlocksToFetch: Number of blocks to stream in the fetch phase, where the conformer has one.
+    ///    - network: The network the candidate servers must serve — mainnet, testnet, or regtest.
+    /// - Returns: The endpoint to switch to, or nil when staying on `current` is the right call.
+    func evaluateServerSwitch(
+        current: LightWalletEndpoint,
+        candidates: [LightWalletEndpoint],
+        fetchThresholdSeconds: Double,
+        nBlocksToFetch: UInt64,
+        network: NetworkType
+    ) async -> LightWalletEndpoint?
 
     /// Takes a given date and finds out the closes checkpoint's height for it.
     /// Each checkpoint has a timestamp stored so it can be used for the calculations.
@@ -1441,6 +1489,12 @@ private final class UnimplementedBroadcaster: Broadcaster {
 }
 
 public extension Synchronizer {
+    /// Alternate synchronizer implementations that do not provide a durable local snapshot remain
+    /// source-compatible and report that the capability is unavailable.
+    func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance]? {
+        nil
+    }
+
     /// Default implementation so adding `getTreeState(height:)` to the protocol is
     /// not a source-breaking change for downstream conformers. Conformers that have
     /// a lightwalletd connection (such as `SDKSynchronizer`) override this;

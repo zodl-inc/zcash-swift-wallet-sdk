@@ -2220,6 +2220,28 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - getLocalAccountBalances
+
+    var getLocalAccountBalancesThrowableError: Error?
+    var getLocalAccountBalancesCallsCount = 0
+    var getLocalAccountBalancesCalled: Bool {
+        return getLocalAccountBalancesCallsCount > 0
+    }
+    var getLocalAccountBalancesReturnValue: [AccountUUID: AccountBalance]?
+    var getLocalAccountBalancesClosure: (() async throws -> [AccountUUID: AccountBalance]?)?
+
+    func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance]? {
+        if let error = getLocalAccountBalancesThrowableError {
+            throw error
+        }
+        getLocalAccountBalancesCallsCount += 1
+        if let closure = getLocalAccountBalancesClosure {
+            return try await closure()
+        } else {
+            return getLocalAccountBalancesReturnValue
+        }
+    }
+
     // MARK: - refreshExchangeRateUSD
 
     var refreshExchangeRateUSDCallsCount = 0
@@ -2420,6 +2442,26 @@ class SynchronizerMock: Synchronizer {
             return await closure(endpoints, fetchThresholdSeconds, nBlocksToFetch, kServers, network)
         } else {
             return evaluateBestOfEndpointsFetchThresholdSecondsNBlocksToFetchKServersNetworkReturnValue
+        }
+    }
+
+    // MARK: - evaluateServerSwitch
+
+    var evaluateServerSwitchCurrentCandidatesFetchThresholdSecondsNBlocksToFetchNetworkCallsCount = 0
+    var evaluateServerSwitchCurrentCandidatesFetchThresholdSecondsNBlocksToFetchNetworkCalled: Bool {
+        return evaluateServerSwitchCurrentCandidatesFetchThresholdSecondsNBlocksToFetchNetworkCallsCount > 0
+    }
+    var evaluateServerSwitchCurrentCandidatesFetchThresholdSecondsNBlocksToFetchNetworkReceivedArguments: (current: LightWalletEndpoint, candidates: [LightWalletEndpoint], fetchThresholdSeconds: Double, nBlocksToFetch: UInt64, network: NetworkType)?
+    var evaluateServerSwitchCurrentCandidatesFetchThresholdSecondsNBlocksToFetchNetworkReturnValue: LightWalletEndpoint?
+    var evaluateServerSwitchCurrentCandidatesFetchThresholdSecondsNBlocksToFetchNetworkClosure: ((LightWalletEndpoint, [LightWalletEndpoint], Double, UInt64, NetworkType) async -> LightWalletEndpoint?)?
+
+    func evaluateServerSwitch(current: LightWalletEndpoint, candidates: [LightWalletEndpoint], fetchThresholdSeconds: Double, nBlocksToFetch: UInt64, network: NetworkType) async -> LightWalletEndpoint? {
+        evaluateServerSwitchCurrentCandidatesFetchThresholdSecondsNBlocksToFetchNetworkCallsCount += 1
+        evaluateServerSwitchCurrentCandidatesFetchThresholdSecondsNBlocksToFetchNetworkReceivedArguments = (current: current, candidates: candidates, fetchThresholdSeconds: fetchThresholdSeconds, nBlocksToFetch: nBlocksToFetch, network: network)
+        if let closure = evaluateServerSwitchCurrentCandidatesFetchThresholdSecondsNBlocksToFetchNetworkClosure {
+            return await closure(current, candidates, fetchThresholdSeconds, nBlocksToFetch, network)
+        } else {
+            return evaluateServerSwitchCurrentCandidatesFetchThresholdSecondsNBlocksToFetchNetworkReturnValue
         }
     }
 

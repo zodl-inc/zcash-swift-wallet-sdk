@@ -28,6 +28,7 @@ extension SlipstreamSynchronizer {
     static func initialState(
         snapshot: SlipstreamSnapshot?,
         accountsBalances: [AccountUUID: AccountBalance],
+        localAccountsBalances: [AccountUUID: AccountBalance],
         fullyScannedHeight: BlockHeight?,
         syncSessionID: UUID
     ) -> SynchronizerState {
@@ -35,6 +36,7 @@ extension SlipstreamSynchronizer {
             return SynchronizerState(
                 syncSessionID: syncSessionID,
                 accountsBalances: [:],
+                localAccountsBalances: localAccountsBalances,
                 internalSyncStatus: .disconnected,
                 latestBlockHeight: .zero
             )
@@ -42,6 +44,7 @@ extension SlipstreamSynchronizer {
         return SynchronizerState(
             syncSessionID: syncSessionID,
             accountsBalances: accountsBalances,
+            localAccountsBalances: localAccountsBalances,
             internalSyncStatus: .syncing(Float(snap.progressPermille) / 1000, snap.spendableHint != 0),
             latestBlockHeight: BlockHeight(snap.chainTip),
             fullyScannedHeight: fullyScannedHeight ?? .zero,

@@ -503,17 +503,11 @@ public class SDKSynchronizer: Synchronizer {
         _ uri: String,
         accountUUID: AccountUUID
     ) async throws -> Proposal {
-        do {
-            try throwIfUnprepared()
-            return try await transactionEncoder.proposeFulfillingPaymentFromURI(
-                uri,
-                accountUUID: accountUUID
-            )
-        } catch ZcashError.rustCreateToAddress(let error) {
-            throw ZcashError.rustProposeTransferFromURI(error)
-        } catch {
-            throw error
-        }
+        try throwIfUnprepared()
+        return try await transactionEncoder.proposeFulfillingPaymentFromURI(
+            uri,
+            accountUUID: accountUUID
+        )
     }
 
     public func createProposedTransactions(
@@ -682,6 +676,12 @@ public class SDKSynchronizer: Synchronizer {
 
     public func getAccountsBalances() async throws -> [AccountUUID: AccountBalance] {
         try await initializer.rustBackend.getWalletSummary()?.accountBalances ?? [:]
+    }
+
+    public func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance]? {
+        guard latestState.internalSyncStatus.isPrepared else { return nil }
+        guard let provider = initializer.rustBackend as? LocalBalanceProviding else { return nil }
+        return try await provider.getLocalAccountBalances()
     }
 
     /// Fetches the latest ZEC-USD exchange rate.
@@ -860,7 +860,6 @@ public class SDKSynchronizer: Synchronizer {
     ///    - nBlocksToFetch: The number of blocks expected to be downloaded from the stream, with the time compared to `fetchThresholdSeconds`. The default is 100.
     ///    - kServers: The expected number of endpoints in the output. The default is 3.
     ///    - network: Mainnet or testnet. The default is mainnet.
-    // swiftlint:disable:next cyclomatic_complexity
     public func evaluateBestOf(
         endpoints: [LightWalletEndpoint],
         fetchThresholdSeconds: Double = 60.0,
@@ -868,6 +867,56 @@ public class SDKSynchronizer: Synchronizer {
         kServers: Int = 3,
         network: NetworkType = .mainnet
     ) async -> [LightWalletEndpoint] {
+        await evaluateEndpoints(
+            endpoints: endpoints,
+            fetchThresholdSeconds: fetchThresholdSeconds,
+            nBlocksToFetch: nBlocksToFetch,
+            kServers: kServers,
+            network: network
+        ).map { $0.endpoint }
+    }
+
+    /// The block-fetch phase of a switch evaluation is bounded to this many fastest-latency
+    /// candidates (plus the current server, which is always retained) — mirroring
+    /// `evaluateBestOf`'s default `kServers` instead of fetching from the entire list.
+    private static let serverSwitchTopK = 3
+
+    public func evaluateServerSwitch(
+        current: LightWalletEndpoint,
+        candidates: [LightWalletEndpoint],
+        fetchThresholdSeconds: Double,
+        nBlocksToFetch: UInt64,
+        network: NetworkType
+    ) async -> LightWalletEndpoint? {
+        // The driver always measures the current server (appending it when the caller's list
+        // omits it) and re-probes it once before treating a missing score as unhealthy, so a
+        // single transient failure cannot force an ungated switch.
+        await ServerSwitchDecision.evaluate(
+            current: current,
+            candidates: candidates,
+            thresholds: .blockFetch,
+            logger: logger
+        ) { endpoints in
+            await self.evaluateEndpoints(
+                endpoints: endpoints,
+                fetchThresholdSeconds: fetchThresholdSeconds,
+                nBlocksToFetch: nBlocksToFetch,
+                kServers: Self.serverSwitchTopK,
+                network: network,
+                mustInclude: current
+            )
+        }
+    }
+
+    // swiftlint:disable:next cyclomatic_complexity
+    private func evaluateEndpoints(
+        endpoints: [LightWalletEndpoint],
+        fetchThresholdSeconds: Double,
+        nBlocksToFetch: UInt64,
+        kServers: Int,
+        network: NetworkType,
+        mustInclude: LightWalletEndpoint? = nil
+    ) async -> [ServerSwitchDecision.MeasuredEndpoint] {
         struct Service {
             let originalEndpoint: LightWalletEndpoint
             let service: LightWalletGRPCService
@@ -892,7 +941,9 @@ public class SDKSynchronizer: Synchronizer {
             Service(
                 originalEndpoint: $0,
                 service: LightWalletGRPCServiceOverTor(endpoint: $0, tor: torClient),
-                url: "\($0.host):\($0.port)"
+                // The scheme-qualified form so endpoints differing only in the TLS flag —
+                // distinct servers under `isSameServer` — cannot collide on one key.
+                url: $0.urlString
             )
         }
 
@@ -903,19 +954,19 @@ public class SDKSynchronizer: Synchronizer {
         await withTaskGroup(of: CheckResult.self) { group in
             for service in services {
                 group.addTask {
-                    let startTime = Date().timeIntervalSince1970
+                    let startTime = DispatchTime.now()
 
                     // called when performance of servers is evaluated
                     let mode = await sdkFlagsRef.ifTor(ServiceMode.torInGroup("SDKSynchronizer.evaluateBestOf(\(service.originalEndpoint))"))
 
                     let info = try? await service.service.getInfo(mode: mode)
-                    let markTime = Date().timeIntervalSince1970
+                    let markTime = DispatchTime.now()
                     // called when performance of servers is evaluated
                     let latestBlockHeight = try? await service.service.latestBlockHeight(mode: mode)
-                    let endTime = Date().timeIntervalSince1970
+                    let endTime = DispatchTime.now()
 
-                    let getInfoTime = markTime - startTime
-                    let latestBlockHeightTime = endTime - markTime
+                    let getInfoTime = markTime.secondsSince(startTime)
+                    let latestBlockHeightTime = endTime.secondsSince(markTime)
                     let mean = (getInfoTime + latestBlockHeightTime) / 2
 
                     return CheckResult(
@@ -990,12 +1041,30 @@ public class SDKSynchronizer: Synchronizer {
             sortedKOnly.forEach {
                 checkResults[$0.key] = $0.value
             }
+
+            // The switch decision needs the current server's own measurement, so it is
+            // retained past the top-k cut whenever it passed the health checks — losing a
+            // top-k spot by a few milliseconds must never read as "unhealthy".
+            if let mustInclude {
+                let retained = tmpResults.first {
+                    $0.value.service.originalEndpoint.isSameServer(as: mustInclude)
+                }
+                if let retained, checkResults[retained.key] == nil {
+                    checkResults[retained.key] = retained.value
+                }
+            }
         }
 
         // Sequential part
         var blockResults: [String: CheckResult] = [:]
 
         for serviceDict in checkResults {
+            // A cancelled benchmark must stop opening connections; the partial results are
+            // safe because the caller treats an incomplete ranking as "stay".
+            if Task.isCancelled {
+                break
+            }
+
             guard let info = serviceDict.value.info else {
                 continue
             }
@@ -1014,21 +1083,36 @@ public class SDKSynchronizer: Synchronizer {
                     mode: .direct
                 )
 
-                let startTime = Date().timeIntervalSince1970
+                let startTime = DispatchTime.now()
                 var endTime = startTime
+                var blocksReceived: UInt64 = 0
                 for try await _ in stream {
-                    endTime = Date().timeIntervalSince1970
-                    if endTime - startTime >= fetchThresholdSeconds {
+                    blocksReceived += 1
+                    endTime = DispatchTime.now()
+                    if endTime.secondsSince(startTime) >= fetchThresholdSeconds {
                         break
                     }
                 }
 
-                let blockTime = endTime - startTime
+                let blockTime = endTime.secondsSince(startTime)
+                let isCurrentServer = mustInclude.map {
+                    serviceDict.value.service.originalEndpoint.isSameServer(as: $0)
+                } ?? false
 
-                // rule out servers that can't fetch `nBlocksToFetch` blocks under fetchThresholdSeconds
-                if blockTime < fetchThresholdSeconds {
+                // Rule out servers that cannot deliver `nBlocksToFetch` blocks under
+                // `fetchThresholdSeconds` — including streams that end early or empty, whose
+                // near-zero elapsed time would otherwise win the ranking outright. The
+                // current server keeps a censored score past the threshold so the switch
+                // decision stays gated instead of reading a near-miss as "unhealthy".
+                if let score = ServerSwitchDecision.blockFetchScore(
+                    elapsed: blockTime,
+                    blocksReceived: blocksReceived,
+                    requiredBlocks: nBlocksToFetch,
+                    threshold: fetchThresholdSeconds,
+                    retainOverThreshold: isCurrentServer
+                ) {
                     var value = serviceDict.value
-                    value.blockTime = blockTime
+                    value.blockTime = score
 
                     blockResults[serviceDict.key] = value
                 }
@@ -1037,13 +1121,23 @@ public class SDKSynchronizer: Synchronizer {
             }
         }
 
+        // The benchmark owns these connections; close them deterministically instead of
+        // leaving teardown to deinit after the result arrays release. `stop()` is a no-op
+        // for services that never opened a channel.
+        for service in services {
+            await service.service.closeConnections()
+        }
+
         // return what's left
         let sortedServers = blockResults.sorted {
             $0.value.blockTime < $1.value.blockTime
         }
 
         let finalResult = sortedServers.map {
-            $0.value.service.originalEndpoint
+            ServerSwitchDecision.MeasuredEndpoint(
+                endpoint: $0.value.service.originalEndpoint,
+                score: $0.value.blockTime
+            )
         }
 
         return finalResult
@@ -1545,9 +1639,22 @@ public class SDKSynchronizer: Synchronizer {
     // MARK: notify state
 
     private func snapshotState(status: InternalSyncStatus) async -> SynchronizerState {
-        await SynchronizerState(
+        let provider = initializer.rustBackend as? LocalBalanceProviding
+        let summaries = try? await provider?.getWalletSummaryWithLocalBalances()
+        let fallbackSummary: WalletSummary?
+        if summaries == nil {
+            fallbackSummary = try? await initializer.rustBackend.getWalletSummary()
+        } else {
+            fallbackSummary = nil
+        }
+        let visibleBalances = summaries?.summary?.accountBalances
+            ?? fallbackSummary?.accountBalances
+            ?? latestState.accountsBalances
+        let localBalances = summaries?.localBalances ?? latestState.localAccountsBalances
+        return await SynchronizerState(
             syncSessionID: syncSession.value,
-            accountsBalances: (try? await getAccountsBalances()) ?? [:],
+            accountsBalances: visibleBalances,
+            localAccountsBalances: localBalances,
             internalSyncStatus: status,
             latestBlockHeight: latestBlocksDataProvider.latestBlockHeight,
             fullyScannedHeight: latestBlocksDataProvider.fullyScannedHeight

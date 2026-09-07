@@ -81,7 +81,7 @@ extension MaxSpendMode {
     }
 }
 
-struct ZcashRustBackend: ZcashRustBackendWelding {
+struct ZcashRustBackend: ZcashRustBackendWelding, LocalBalanceProviding {
     let confirmationsPolicy: ConfirmationsPolicy = ConfirmationsPolicy.defaultTransferPolicy()
     let shieldingConfirmationsPolicy: ConfirmationsPolicy = ConfirmationsPolicy.defaultShieldingPolicy()
 
@@ -379,7 +379,10 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         )
 
         guard let proposal else {
-            throw ZcashError.rustCreateToAddress(lastErrorMessage(fallback: "`proposeTransfer` failed with unknown error"))
+            throw proposalError(
+                fallback: "`proposeTransfer` failed with unknown error",
+                wrap: ZcashError.rustProposeTransfer
+            )
         }
 
         defer { zcashlc_free_boxed_slice(proposal) }
@@ -410,7 +413,10 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         )
 
         guard let proposal else {
-            throw ZcashError.rustProposeSendMaxTransfer(lastErrorMessage(fallback: "`proposeSendMaxTransfer` failed with unknown error"))
+            throw proposalError(
+                fallback: "`proposeSendMaxTransfer` failed with unknown error",
+                wrap: ZcashError.rustProposeSendMaxTransfer
+            )
         }
 
         defer { zcashlc_free_boxed_slice(proposal) }
@@ -455,8 +461,9 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         )
 
         guard let proposal else {
-            throw ZcashError.rustCreateToAddress(
-                lastErrorMessage(fallback: "`proposeOrchardToIronwoodMigration` failed with unknown error")
+            throw proposalError(
+                fallback: "`proposeOrchardToIronwoodMigration` failed with unknown error",
+                wrap: ZcashError.rustProposeOrchardToIronwoodMigration
             )
         }
 
@@ -484,7 +491,10 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         )
 
         guard let proposal else {
-            throw ZcashError.rustCreateToAddress(lastErrorMessage(fallback: "`proposeTransfer` failed with unknown error"))
+            throw proposalError(
+                fallback: "`proposeTransferFromURI` failed with unknown error",
+                wrap: ZcashError.rustProposeTransferFromURI
+            )
         }
 
         defer { zcashlc_free_boxed_slice(proposal) }
@@ -1205,9 +1215,37 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
     }
 
-    // DB-READ (audited 2026-08-03): get_wallet_summary — verified no INSERT/UPDATE/DELETE/DDL
-    // across its whole body; the sdkFlags await sits after the FFI window.
+    // DB-READ (audited 2026-09-01): delegates to getWalletSummaryWithLocalBalances(), whose
+    // get_wallet_summary FFI read is audited below; performs no direct database access here.
     func getWalletSummary() async throws -> WalletSummary? {
+        try await getWalletSummaryWithLocalBalances().summary
+    }
+
+    // DB-READ (audited 2026-09-01): get_wallet_summary — verified no INSERT/UPDATE/DELETE/DDL;
+    // the sdkFlags await occurs after getUnmaskedWalletSummary() closes its FFI window.
+    func getWalletSummaryWithLocalBalances() async throws -> (
+        summary: WalletSummary?,
+        localBalances: [AccountUUID: AccountBalance]
+    ) {
+        guard let localSummary = try getUnmaskedWalletSummary() else { return (nil, [:]) }
+
+        // Mask spendable `accountBalances` while chainTip hasn't been updated yet ([#1591]).
+        if await !sdkFlags.chainTipUpdated {
+            return (localSummary.withSpendableMasked(), localSummary.accountBalances)
+        }
+
+        return (localSummary, localSummary.accountBalances)
+    }
+
+    // DB-READ (audited 2026-09-01): delegates to getUnmaskedWalletSummary(), whose
+    // get_wallet_summary FFI read is audited below; performs no writes.
+    func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance] {
+        try getUnmaskedWalletSummary()?.accountBalances ?? [:]
+    }
+
+    // DB-READ (audited 2026-09-01): get_wallet_summary — verified no INSERT/UPDATE/DELETE/DDL
+    // across its whole body; the summary pointer is freed before this function returns.
+    private func getUnmaskedWalletSummary() throws -> WalletSummary? {
         let summaryPtr = zcashlc_get_wallet_summary(dbData.0, dbData.1, networkType.networkId, confirmationsPolicy.toBackend())
 
         guard let summaryPtr else {
@@ -1217,14 +1255,7 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         defer { zcashlc_free_wallet_summary(summaryPtr) }
 
         // C → Swift mapping shared with the unified wallet-summary path (WalletSummary+FFI.swift).
-        guard let summary = WalletSummary.fromFFI(summaryPtr) else { return nil }
-
-        // Mask spendable `accountBalances` while chainTip hasn't been updated yet ([#1591]).
-        if await !sdkFlags.chainTipUpdated {
-            return summary.withSpendableMasked()
-        }
-
-        return summary
+        return WalletSummary.fromFFI(summaryPtr)
     }
 
     // DB-READ (audited 2026-08-03): suggest_scan_ranges — single SELECT on scan_queue; no
@@ -1351,7 +1382,10 @@ struct ZcashRustBackend: ZcashRustBackendWelding {
         }
 
         guard let txIdsPtr else {
-            throw ZcashError.rustCreateToAddress(lastErrorMessage(fallback: "`createToAddress` failed with unknown error"))
+            throw proposalError(
+                fallback: "`createToAddress` failed with unknown error",
+                wrap: ZcashError.rustCreateToAddress
+            )
         }
 
         defer { zcashlc_free_txids(txIdsPtr) }
@@ -2750,6 +2784,62 @@ nonisolated func lastErrorMessage(fallback: String) -> String {
         }
     } else {
         return fallback
+    }
+}
+
+/// Takes the last Rust error as a classified, redacted report, clearing it exactly as
+/// `lastErrorMessage(fallback:)` does.
+///
+/// Use this instead of `lastErrorMessage(fallback:)` wherever the resulting `ZcashError` may be
+/// shown to a user or submitted in an error report. The two must not be combined for one
+/// failure: whichever runs first consumes the error.
+nonisolated func lastErrorReport(fallback: String) -> RedactedRustError {
+    guard let report = zcashlc_take_last_error_report() else {
+        return RedactedRustError(kind: .unclassified, message: fallback)
+    }
+
+    defer { zcashlc_free_error_report(report) }
+
+    let kind = RustErrorKind(ffiValue: report.pointee.kind)
+    let message = report.pointee.message.map { String(cString: $0) } ?? fallback
+
+    guard kind == .insufficientFunds, report.pointee.available >= 0, report.pointee.required >= 0 else {
+        return RedactedRustError(kind: kind, message: message)
+    }
+
+    return RedactedRustError(
+        kind: kind,
+        message: message,
+        available: Zatoshi(report.pointee.available),
+        required: Zatoshi(report.pointee.required)
+    )
+}
+
+/// Maps a failed proposal or transaction-creation call to the `ZcashError` the wallet should act
+/// on: a dedicated case for the two conditions a wallet is expected to render itself, and
+/// otherwise the per-call-site case supplied by `wrap`.
+///
+/// `wrap` is what keeps the call sites distinguishable. Before this existed all four of them
+/// threw `rustCreateToAddress`, so a user's error report could not say whether the failure
+/// happened while building the proposal or while signing it after confirmation.
+nonisolated func proposalError(
+    fallback: String,
+    wrap: (RedactedRustError) -> ZcashError
+) -> ZcashError {
+    let report = lastErrorReport(fallback: fallback)
+
+    switch report.kind {
+    case .scanRequired:
+        return .rustProposalScanRequired
+
+    case .insufficientFunds:
+        guard let available = report.available, let required = report.required else {
+            return wrap(report)
+        }
+        return .rustProposalInsufficientFunds(available, required)
+
+    default:
+        return wrap(report)
     }
 }
 

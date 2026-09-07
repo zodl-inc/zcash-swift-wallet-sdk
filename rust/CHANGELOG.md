@@ -8,6 +8,15 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `zcashlc_take_last_error_report`, `zcashlc_free_error_report`, and `FfiErrorReport` expose the
+  most recent error as a classified, redacted report. `kind` is an `ErrorKind` discriminant
+  (`u32`): `0` is unclassified, `1` scan required, `2` insufficient funds; the remaining values are
+  listed in `rust/src/error_report.rs`. `message` never carries an amount, address, note identifier,
+  or txid. `available` and `required` are zatoshis, fee included, and are `-1` unless `kind` is `2`.
+  Taking the report clears the last error exactly as `zcashlc_clear_last_error` does, so a caller
+  reads either the report or the string for one failure, never both. An error raised by a call site
+  that does not classify is reported as kind `0` with a generic message. The pointer is null when
+  there is no error and must be freed with `zcashlc_free_error_report`.
 - `zcashlc_get_transaction`, `zcashlc_free_transaction_data`, and `FfiTransactionData` expose the
   serialized bytes and expiry height available for any wallet-store transaction without depending
   on the transaction-history projection.
@@ -237,6 +246,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `zcashlc_propose_transfer`, `zcashlc_propose_transfer_from_uri`,
+  `zcashlc_propose_send_max_transfer`, and `zcashlc_create_proposed_transactions` classify their
+  failures instead of flattening them into a string. Their last-error text now reads
+  `<call site>: <redacted message>`, with the same redaction guarantee as `FfiErrorReport`, and the
+  unredacted upstream text is logged on the device at `debug!` only. A caller that parsed the old
+  text for a cause should take `zcashlc_take_last_error_report` and switch on `kind` instead.
+  `zcashlc_propose_shielding` is unchanged and still reports a plain string.
 - The `libzcashlc` crate is now licensed under the GNU Affero General Public License, version 3
   only (AGPL-3.0-only) instead of the MIT License. See `COMMERCIAL-LICENSE.md` in the repository
   root for commercial licensing, and `LICENSE-EXCEPTIONS.md` for App Store distribution and

@@ -189,4 +189,47 @@ class ZcashRustBackendTests: XCTestCase {
 
         XCTAssertNoThrow(try ScanProgress(numerator: 3, denominator: 4).progress())
     }
+
+    func testWalletSummaryWithLocalBalancesHandlesUnavailableSummary() async throws {
+        let initResult = try await rustBackend.initDataDb(seed: nil)
+        XCTAssertEqual(initResult, .success)
+        let provider = try XCTUnwrap(rustBackend as? LocalBalanceProviding)
+        let summaries = try await provider.getWalletSummaryWithLocalBalances()
+        let localBalances = try await provider.getLocalAccountBalances()
+
+        XCTAssertNil(summaries.summary)
+        XCTAssertEqual(summaries.localBalances, localBalances)
+        XCTAssertTrue(localBalances.isEmpty)
+    }
+
+    func testFreshnessMaskDoesNotMutateLocalSummary() {
+        let account = AccountUUID(id: [UInt8](repeating: 3, count: 16))
+        let localBalance = AccountBalance(
+            saplingBalance: PoolBalance(
+                spendableValue: Zatoshi(300),
+                changePendingConfirmation: .zero,
+                valuePendingSpendability: .zero
+            ),
+            orchardBalance: .zero,
+            unshielded: Zatoshi(200)
+        )
+        let localSummary = WalletSummary(
+            accountBalances: [account: localBalance],
+            chainTipHeight: 3_000_000,
+            fullyScannedHeight: 2_999_990,
+            recoveryProgress: nil,
+            scanProgress: nil,
+            nextSaplingSubtreeIndex: 0,
+            nextOrchardSubtreeIndex: 0,
+            nextIronwoodSubtreeIndex: 0
+        )
+
+        let visibleSummary = localSummary.withSpendableMasked()
+
+        XCTAssertEqual(localSummary.accountBalances[account]?.saplingBalance.spendableValue, Zatoshi(300))
+        XCTAssertEqual(localSummary.accountBalances[account]?.unshielded, Zatoshi(200))
+        XCTAssertEqual(visibleSummary.accountBalances[account]?.saplingBalance.spendableValue, .zero)
+        XCTAssertEqual(visibleSummary.accountBalances[account]?.unshielded, .zero)
+        XCTAssertNotEqual(visibleSummary.accountBalances, localSummary.accountBalances)
+    }
 }

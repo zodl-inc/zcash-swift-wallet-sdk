@@ -63,9 +63,11 @@ public protocol CombineSynchronizer {
     /// selected and must be shielded first — see `proposeShielding`.
     ///
     /// When the account has no spendable balance, or its balance cannot cover the fee, this method throws
-    /// `ZcashError.rustProposeSendMaxTransfer` (`ZRUST0129`). There is currently no dedicated typed error for
-    /// the nothing-to-send case, so a caller that wants to special-case an empty wallet should check the
-    /// spendable balance before calling this method.
+    /// `ZcashError.rustProposalInsufficientFunds(available:required:)` (`ZRUST0154`) where the rust layer
+    /// reports that condition, carrying both amounts; a wallet still catching up throws
+    /// `ZcashError.rustProposalScanRequired` (`ZRUST0153`). Anything else the rust layer returns surfaces as
+    /// `ZcashError.rustProposeSendMaxTransfer` (`ZRUST0129`), whose `RedactedRustError` payload names the
+    /// condition without carrying an amount or an address.
     ///
     /// - Parameter accountUUID: the account from which to spend funds.
     /// - Parameter recipient: the recipient's address.
@@ -178,6 +180,8 @@ public protocol CombineSynchronizer {
     func latestHeight() -> SinglePublisher<BlockHeight, Error>
 
     func refreshUTXOs(address: TransparentAddress, from height: BlockHeight) -> SinglePublisher<RefreshedUTXOs, Error>
+
+    func getLocalAccountBalances() -> SinglePublisher<[AccountUUID: AccountBalance]?, Error>
 
     func refreshExchangeRateUSD()
 

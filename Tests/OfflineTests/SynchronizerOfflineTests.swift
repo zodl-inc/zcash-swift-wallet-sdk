@@ -483,6 +483,7 @@ class SynchronizerOfflineTests: ZcashTestCase {
         let state = SynchronizerState(
             syncSessionID: .nullID,
             accountsBalances: [:],
+            localAccountsBalances: [:],
             internalSyncStatus: .syncing(0, false),
             latestBlockHeight: 222_222,
             fullyScannedHeight: 100_000
@@ -502,6 +503,7 @@ class SynchronizerOfflineTests: ZcashTestCase {
         let lhs = SynchronizerState(
             syncSessionID: .nullID,
             accountsBalances: [:],
+            localAccountsBalances: [:],
             internalSyncStatus: .syncing(0.5, false),
             latestBlockHeight: 222_222,
             fullyScannedHeight: 100_000
@@ -509,9 +511,35 @@ class SynchronizerOfflineTests: ZcashTestCase {
         let rhs = SynchronizerState(
             syncSessionID: .nullID,
             accountsBalances: [:],
+            localAccountsBalances: [:],
             internalSyncStatus: .syncing(0.5, false),
             latestBlockHeight: 222_222,
             fullyScannedHeight: 120_000
+        )
+
+        XCTAssertNotEqual(lhs, rhs)
+    }
+
+    func testSynchronizerStateEquatableDistinguishesLocalAccountBalances() {
+        let account = AccountUUID(id: [UInt8](repeating: 7, count: 16))
+        let localBalance = AccountBalance(
+            saplingBalance: .zero,
+            orchardBalance: .zero,
+            unshielded: Zatoshi(200)
+        )
+        let lhs = SynchronizerState(
+            syncSessionID: .nullID,
+            accountsBalances: [:],
+            localAccountsBalances: [:],
+            internalSyncStatus: .syncing(0.5, false),
+            latestBlockHeight: 222_222
+        )
+        let rhs = SynchronizerState(
+            syncSessionID: .nullID,
+            accountsBalances: [:],
+            localAccountsBalances: [account: localBalance],
+            internalSyncStatus: .syncing(0.5, false),
+            latestBlockHeight: 222_222
         )
 
         XCTAssertNotEqual(lhs, rhs)
@@ -554,6 +582,7 @@ class SynchronizerOfflineTests: ZcashTestCase {
         SynchronizerState(
             syncSessionID: .nullID,
             accountsBalances: [:],
+            localAccountsBalances: [:],
             internalSyncStatus: internalSyncStatus,
             latestBlockHeight: .zero,
             fullyScannedHeight: .zero

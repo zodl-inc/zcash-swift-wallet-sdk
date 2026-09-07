@@ -280,6 +280,12 @@ extension ClosureSDKSynchronizer: ClosureSynchronizer {
         }
     }
 
+    public func getLocalAccountBalances(_ completion: @escaping (Result<[AccountUUID: AccountBalance]?, Error>) -> Void) {
+        AsyncToClosureGateway.executeThrowingAction(completion) {
+            try await self.synchronizer.getLocalAccountBalances()
+        }
+    }
+
     public func refreshExchangeRateUSD() {
         synchronizer.refreshExchangeRateUSD()
     }
