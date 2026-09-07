@@ -158,6 +158,25 @@ final class SubmitPlanStoreTests: ZcashTestCase {
         XCTAssertTrue(txIds.isEmpty)
     }
 
+    func testFailedCreationBeforeFileExistsReportsStoreUnavailable() async throws {
+        let blockedParent = testGeneralStorageDirectory
+            .appendingPathComponent("blocked-parent-\(UUID().uuidString)")
+        try Data([1]).write(to: blockedParent)          // a regular FILE where the parent directory should be
+        defer {
+            try? FileManager.default.removeItem(at: blockedParent)
+        }
+        let url = blockedParent.appendingPathComponent("submit_plans.db")
+        let store = SubmitPlanStore(databaseURL: url, logger: NullLogger())
+        let txId = Data(repeating: 0x31, count: 32)
+        let lifecycle = await store.currentLifecycle()
+
+        await store.markAwaitingSubmission(txIds: [txId], lifecycle: lifecycle)   // creation fails, latches connectionFailed
+        let plan = await store.plan(for: txId)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertEqual(plan, StoredSubmitPlan.storeUnavailable)
+    }
+
     func testWipeDeletesDatabaseFileAndStoreRestartsFresh() async {
         let txId = Data(repeating: 0x0F, count: 32)
         let store = makeStore()
