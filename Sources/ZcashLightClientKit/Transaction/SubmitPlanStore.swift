@@ -56,14 +56,13 @@ protocol SubmitPlanStoring {
     /// `markAccepted(txId:host:lifecycle:)` call to prove it still belongs to this epoch.
     @discardableResult
     func recordPlan(txId: Data, endpoints: [LightWalletEndpoint]) async -> SubmitPlanLifecycle
-    /// `recordPlan`, but a no-op — returning `nil` without touching the file system — when the
-    /// store's backing database file does not exist. For a release-for-resubmission call, which
-    /// unlike `recordPlan` must never recreate a store `wipe()` has already deleted: any
-    /// transaction that was legitimately created already has a row from `markAwaitingSubmission`,
-    /// which guarantees the file exists by the time a release for it could arrive, so this can only
-    /// ever refuse a release that landed after a wipe.
+    /// Records a plan for a transaction that is currently awaiting submission. The awaiting row is
+    /// written at creation time within the current wallet lifecycle, and `wipe()` deletes every
+    /// row, so "has an awaiting row" is exactly "was created in this lifecycle". Returns `nil`, and
+    /// touches nothing — including the file system — when no such row exists: the case of a
+    /// release that landed after a wipe.
     @discardableResult
-    func recordPlanIfStoreExists(txId: Data, endpoints: [LightWalletEndpoint]) async -> SubmitPlanLifecycle?
+    func recordPlanForAwaitingTransaction(txId: Data, endpoints: [LightWalletEndpoint]) async -> SubmitPlanLifecycle?
     /// Records that `host` (`host:port`) took the transaction into its mempool.
     /// Creates the row when the transaction has no plan yet, so a transaction
     /// accepted through a path that never recorded one is still reportable.
@@ -151,9 +150,7 @@ actor SubmitPlanStore: SubmitPlanStoring {
         guard !endpoints.isEmpty else { return currentLifecycle() }
         guard let connection = connection() else { return currentLifecycle() }
         do {
-            let storedEndpoints = endpoints.map { StoredEndpoint(endpoint: $0) }
-            let encoded = try JSONEncoder().encode(storedEndpoints)
-            let json = String(data: encoded, encoding: .utf8) ?? "[]"
+            let json = try SubmitPlanStore.encodeEndpoints(endpoints)
             // Insert-then-update rather than a replacing upsert, so a plan
             // recorded again for an already-accepted transaction keeps its
             // `accepted_host` instead of reverting to NULL: acceptance
@@ -171,17 +168,27 @@ actor SubmitPlanStore: SubmitPlanStoring {
         return currentLifecycle()
     }
 
-    /// `recordPlan`, but refuses to touch the file system when the database file is gone.
-    ///
-    /// `connection()` creates the directory and the SQLite file as a side effect of opening it, so
-    /// an ordinary `recordPlan` call reaching a wiped wallet would recreate `submit_plans.db` for a
-    /// wallet that no longer has one. Checking `FileManager` directly, before `connection()` ever
-    /// runs, is what makes the refusal possible: by the time this is called for a release racing a
-    /// `wipe()`, the file that release's earlier `markAwaitingSubmission` created is already gone.
+    /// Records a plan for a transaction that already has a row — one `markAwaitingSubmission`
+    /// wrote at creation time within the current wallet lifecycle. `wipe()` deletes every row and
+    /// retires the lifecycle together, so "has a row" is exactly "was created in this lifecycle":
+    /// a release for a transaction created before the most recent `wipe()` finds no row and is
+    /// refused. `existingConnection()` also means this never opens (and thereby never creates)
+    /// the database file for a store `wipe()` has already deleted.
     @discardableResult
-    func recordPlanIfStoreExists(txId: Data, endpoints: [LightWalletEndpoint]) -> SubmitPlanLifecycle? {
-        guard FileManager.default.fileExists(atPath: databaseURL.path) else { return nil }
-        return recordPlan(txId: txId, endpoints: endpoints)
+    func recordPlanForAwaitingTransaction(txId: Data, endpoints: [LightWalletEndpoint]) -> SubmitPlanLifecycle? {
+        guard let connection = existingConnection() else { return nil }
+        do {
+            let row = table.filter(txIdColumn == Blob(bytes: txId.bytes))
+            guard try connection.pluck(row) != nil else { return nil }
+            let json = try SubmitPlanStore.encodeEndpoints(endpoints)
+            try connection.run(row.update(endpointsColumn <- json))
+            return currentLifecycle()
+        } catch {
+            cachedConnection = nil
+            connectionFailed = true
+            logger.warn("SubmitPlanStore failed to release a transaction for resubmission; disabling the store: \(error.localizedDescription)")
+            return nil
+        }
     }
 
     func markAccepted(txId: Data, host: String, lifecycle: SubmitPlanLifecycle) {
@@ -212,6 +219,13 @@ actor SubmitPlanStore: SubmitPlanStoring {
     }
 
     func plan(for txId: Data) -> StoredSubmitPlan? {
+        // A missing file with nothing cached is a store that has never been written to in this
+        // lifecycle — most often one `wipe()` just deleted — and "no row" is the honest answer for
+        // it, not `.storeUnavailable`: unlike the guard just below, this check runs before
+        // `connection()` ever opens (and thereby creates) the file, so a read can never recreate a
+        // wiped store. A present-but-unopenable file still falls through to the existing
+        // `.storeUnavailable` guard.
+        guard FileManager.default.fileExists(atPath: databaseURL.path) || cachedConnection != nil else { return nil }
         guard let connection = connection() else { return .storeUnavailable }
         do {
             let query = table.filter(txIdColumn == Blob(bytes: txId.bytes))
@@ -250,7 +264,7 @@ actor SubmitPlanStore: SubmitPlanStoring {
     }
 
     func allPlannedTransactionIds() -> [Data] {
-        guard let connection = connection() else { return [] }
+        guard let connection = existingConnection() else { return [] }
         do {
             return try connection.prepare(table.select(txIdColumn)).map { row in
                 Data(row[txIdColumn].bytes)
@@ -263,7 +277,7 @@ actor SubmitPlanStore: SubmitPlanStoring {
 
     func deletePlans(txIds: [Data]) {
         guard !txIds.isEmpty else { return }
-        guard let connection = connection() else { return }
+        guard let connection = existingConnection() else { return }
         do {
             for txId in txIds {
                 try connection.run(table.filter(txIdColumn == Blob(bytes: txId.bytes)).delete())
@@ -274,7 +288,7 @@ actor SubmitPlanStore: SubmitPlanStoring {
     }
 
     func clear() {
-        guard let connection = connection() else { return }
+        guard let connection = existingConnection() else { return }
         do {
             try connection.run(table.delete())
         } catch {
@@ -302,6 +316,23 @@ actor SubmitPlanStore: SubmitPlanStoring {
 
     func currentLifecycle() -> SubmitPlanLifecycle {
         SubmitPlanLifecycle(generation: lifecycleGeneration)
+    }
+
+    /// Opens the store only if its file already exists (or is already open). Readers and the
+    /// release path use this instead of `connection()` so a wiped store is never recreated by
+    /// something that has nothing to write into a fresh one.
+    private func existingConnection() -> Connection? {
+        if let cachedConnection { return cachedConnection }
+        guard FileManager.default.fileExists(atPath: databaseURL.path) else { return nil }
+        return connection()
+    }
+
+    /// The JSON encoding `recordPlan` and `recordPlanForAwaitingTransaction` both write into the
+    /// `endpoints` column.
+    private static func encodeEndpoints(_ endpoints: [LightWalletEndpoint]) throws -> String {
+        let storedEndpoints = endpoints.map { StoredEndpoint(endpoint: $0) }
+        let encoded = try JSONEncoder().encode(storedEndpoints)
+        return String(data: encoded, encoding: .utf8) ?? "[]"
     }
 
     private static let schemaVersion: Int64 = 1

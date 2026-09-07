@@ -198,9 +198,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SynchronizerState.internalSyncStatus` as `.error`, the same way a failed stall-recovery restart
   already is. Previously the failure was silent: the mutation itself had already succeeded, so
   nothing was thrown, and the synchronizer was left reporting `.syncing` with no pass running.
-- `Synchronizer.releaseForResubmission(transactions:to:)` no longer recreates the submit-plan
-  store's database file for a wallet that has been wiped: a release that lands after `wipe()` is
-  now dropped instead of reopening the deleted store.
+- A submit-plan release that arrives after `wipe()` no longer recreates the wiped store: reads
+  never create the store file, and only a transaction created in the current wallet lifecycle can
+  be released to background resubmission.
 
 # 4.1.0 - 2026-09-01
 
