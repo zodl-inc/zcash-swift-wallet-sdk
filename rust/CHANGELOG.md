@@ -265,11 +265,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `zcashlc_slipstream_stop` now returns `false` when the aborted pass or an in-flight wallet
-  commit outlived its ten-second deadline; previously it returned `true` regardless.
-- `zcashlc_slipstream_stop` now reports `false` while ANY aborted pass is still unwinding,
-  including passes from earlier stops or starts that had already given up waiting; previously only
-  the most recently started pass was consulted.
+- `zcashlc_slipstream_stop` now returns `false` while any aborted pass is still unwinding or an
+  in-flight wallet commit has not drained within its bounded budget, and a pass that outlived an
+  earlier stop or start stays on record so a later stop keeps reporting `false` until it has
+  actually finished; previously it returned `true` regardless.
 - `zcashlc_propose_transfer`, `zcashlc_propose_transfer_from_uri`,
   `zcashlc_propose_send_max_transfer`, and `zcashlc_create_proposed_transactions` classify their
   failures instead of flattening them into a string. Their last-error text now reads

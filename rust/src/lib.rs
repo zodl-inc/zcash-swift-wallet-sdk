@@ -4858,14 +4858,31 @@ mod tests {
         ));
     }
 
+    /// Releases a `spawn_gated_pass` loop, explicitly via `release()` or implicitly when this
+    /// guard is dropped. A failing assertion panics and unwinds BEFORE a test reaches its explicit
+    /// release, and local variables are dropped in reverse declaration order during unwinding, so a
+    /// guard declared after the runtime is always dropped — and so releases its worker thread —
+    /// before the runtime itself is. Without that, `Runtime::drop` would block forever joining a
+    /// worker still parked in the gated loop, turning a failing assertion into a hang.
+    struct PassRelease(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl PassRelease {
+        fn release(&self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for PassRelease {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     /// Spawns a pass parked in a synchronous loop (no await point, so `abort()` cannot take it
-    /// down) and returns its join handle plus the flag that releases it.
+    /// down) and returns its join handle plus the guard that releases it.
     fn spawn_gated_pass(
         runtime: &tokio::runtime::Runtime,
-    ) -> (
-        tokio::task::JoinHandle<()>,
-        std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) {
+    ) -> (tokio::task::JoinHandle<()>, PassRelease) {
         let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (held, running) = (release.clone(), started.clone());
@@ -4878,7 +4895,7 @@ mod tests {
         while !started.load(std::sync::atomic::Ordering::SeqCst) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        (task, release)
+        (task, PassRelease(release))
     }
 
     /// [MOB-1850] The pass half of the same contract, and the reason a pass has to STAY on record.
@@ -4917,8 +4934,8 @@ mod tests {
             "a stop after a replacement must still see the original unfinished pass"
         );
 
-        release_first.store(true, std::sync::atomic::Ordering::SeqCst);
-        release_second.store(true, std::sync::atomic::Ordering::SeqCst);
+        release_first.release();
+        release_second.release();
         assert!(
             settle_engine_passes(
                 &mut slot,

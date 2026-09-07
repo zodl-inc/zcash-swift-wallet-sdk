@@ -954,7 +954,7 @@ final class SlipstreamLifecycleOwnershipTests: ZcashTestCase {
     }
 
     /// [MOB-1850] The refusal is about the wallet, not about the caller: once the engine can prove
-    /// its pass and its writer are gone, a mutation that was refused twice must go through. A
+    /// its pass and its writer are gone, a mutation that was refused must go through. A
     /// refusal that outlived the condition causing it would be its own outage — the mirror image of
     /// the bug, and the reason the record is CLEARED by the pass finishing rather than by time.
     func testQuiescenceAdmitsTheMutationAfterEarlierRefusals() async throws {

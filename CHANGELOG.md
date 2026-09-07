@@ -93,7 +93,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the engine could not confirm within its bounded stop budget that its previous pass and wallet
   writer had stopped; previously the mutation proceeded on the assumption that they had. The pass
   and its writer are each given their own budget, and a refused call restarts the pass before
-  reporting the failure, so the wait can be noticeably longer than a single budget.
+  reporting the failure, so the wait can be noticeably longer than a single budget. The refusal
+  persists across repeated stops: an aborted pass that outlived one stop's budget keeps every
+  later stop refusing until that pass has actually finished, not only the most recent one.
   `SlipstreamEngine.stop()` now returns whether the stop was quiescent. `SDKSynchronizer` is
   unaffected.
 - `Synchronizer.restartSync(at:)` now throws `CancellationError` and leaves the engine untouched
@@ -218,10 +220,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   skips the transaction, instead of reading the missing file as a never-written store and
   broadcasting through the default endpoint. `transactionSubmissionStatus(for:)` is unaffected: it
   already reported no status for that case.
-- A stop that follows a stop which had already given up waiting for an aborted pass now still
-  reports non-quiescence until that pass has actually finished, so `importAccount`,
-  `deleteAccount`, `rewind`, `wipe`, `switchTo` and `restartSync(at:)` keep refusing until the
-  wallet is quiet.
 
 # 4.1.0 - 2026-09-01
 
