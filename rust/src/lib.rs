@@ -4858,44 +4858,76 @@ mod tests {
         ));
     }
 
-    /// [MOB-1850] The join half of the same contract. `abort()` cannot interrupt a task that is
-    /// inside a synchronous stretch, so one that is still there when the budget runs out must be
-    /// reported too — and the same handle must answer `true` once the task really has finished.
-    #[test]
-    fn join_reports_an_aborted_pass_that_outlives_the_deadline() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .build()
-            .expect("a tokio runtime for the test");
+    /// Spawns a pass parked in a synchronous loop (no await point, so `abort()` cannot take it
+    /// down) and returns its join handle plus the flag that releases it.
+    fn spawn_gated_pass(
+        runtime: &tokio::runtime::Runtime,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
         let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let held = release.clone();
-        let running = started.clone();
-        // A task inside a synchronous loop: it reaches no await point, so `abort()` cannot take
-        // effect until the loop itself ends — the shape of the real in-flight wallet write.
+        let (held, running) = (release.clone(), started.clone());
         let task = runtime.spawn(async move {
             running.store(true, std::sync::atomic::Ordering::SeqCst);
             while !held.load(std::sync::atomic::Ordering::SeqCst) {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         });
-        let abort = task.abort_handle();
-        // Abort only once the task is genuinely running: a task aborted before its first poll is
-        // dropped without ever executing, and would report itself finished at once.
         while !started.load(std::sync::atomic::Ordering::SeqCst) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        abort.abort();
+        (task, release)
+    }
+
+    /// [MOB-1850] The pass half of the same contract, and the reason a pass has to STAY on record.
+    /// `abort()` cannot interrupt a task that is inside a synchronous stretch, so one that is still
+    /// there when the budget runs out must be reported — and it must go on being reported by every
+    /// later stop, because taking the handle out of the slot is not the same as the pass finishing.
+    #[test]
+    fn a_repeated_stop_stays_non_quiescent_while_the_original_pass_is_unfinished() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let budget = std::time::Duration::from_millis(50);
+        let (first, release_first) = spawn_gated_pass(&runtime);
+        let observer = first.abort_handle();
+        let mut slot = Some(first.abort_handle());
+        let mut unfinished: Vec<tokio::task::AbortHandle> = Vec::new();
+
         assert!(
-            !join_aborted_slipstream_task_until(&abort, std::time::Duration::from_millis(50)),
-            "a pass still unwinding at the deadline must be reported, not logged away"
+            !settle_engine_passes(&mut slot, &mut unfinished, budget),
+            "first stop: the pass outlives the budget"
+        );
+        assert!(
+            !settle_engine_passes(&mut slot, &mut unfinished, budget),
+            "second stop must not claim quiescence while the first pass still runs"
+        );
+        assert!(!observer.is_finished());
+
+        // A start-style replacement installs a new pass while the old one is still unfinished.
+        let (second, release_second) = spawn_gated_pass(&runtime);
+        let _ = settle_engine_passes(&mut slot, &mut unfinished, budget);
+        slot = Some(second.abort_handle());
+        assert!(
+            !settle_engine_passes(&mut slot, &mut unfinished, budget),
+            "a stop after a replacement must still see the original unfinished pass"
         );
 
-        release.store(true, std::sync::atomic::Ordering::SeqCst);
-        assert!(join_aborted_slipstream_task_until(
-            &abort,
-            std::time::Duration::from_secs(10)
-        ));
+        release_first.store(true, std::sync::atomic::Ordering::SeqCst);
+        release_second.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            settle_engine_passes(
+                &mut slot,
+                &mut unfinished,
+                std::time::Duration::from_secs(5)
+            ),
+            "quiescence once every pass has actually finished"
+        );
+        assert!(unfinished.is_empty());
     }
 }
 
@@ -4956,6 +4988,12 @@ pub struct SlipstreamHandle {
     /// [API v2.1 E-2] `stop()` timestamp: freshness survives a stop→start hop shorter than
     /// 120 s (the SDK's `SDKFlags.sdkStarted` quick-background parity).
     last_stop_at: std::sync::Mutex<Option<std::time::Instant>>,
+    /// [MOB-1850] Aborted passes that had not finished when a stop or start gave up waiting; a
+    /// later stop reports quiescence only once this is empty. The only handle the engine itself
+    /// keeps is `inner.task`, and the stop that aborts a pass TAKES it — so without this record
+    /// the next stop finds an empty slot and reports a pass quiescent that it never watched
+    /// finish, while that pass is still inside a synchronous wallet write.
+    unfinished_passes: Vec<tokio::task::AbortHandle>,
     /// [v0.7 P1b] Alternate lightwalletd servers for probe-then-commit + wire
     /// failover. Set via [`zcashlc_slipstream_set_alternate_servers`]; each
     /// `start()` merges them into the pass config, deduped against the
@@ -5236,6 +5274,7 @@ pub unsafe extern "C" fn zcashlc_slipstream_open(
             tip_refreshes_at_run_start: std::sync::atomic::AtomicU64::new(0),
             tip_fresh: std::sync::atomic::AtomicBool::new(false),
             last_stop_at: std::sync::Mutex::new(None),
+            unfinished_passes: Vec::new(),
             alternate_servers: std::sync::Mutex::new(Vec::new()),
             post_flip_hold: std::sync::Mutex::new(PostFlipHold::default()),
         })))
@@ -5380,16 +5419,26 @@ pub unsafe extern "C" fn zcashlc_slipstream_start(
                 .store(false, std::sync::atomic::Ordering::Relaxed);
         }
 
-        let h = &mut handle.inner;
-
         // Cancel any in-flight task before spawning a new one.
         // [MOB-1850] The result is deliberately ignored HERE: a start proceeds either way, as it
-        // always has. Only the stop-then-mutate callers act on the flag, and they reach it through
-        // `zcashlc_slipstream_stop`.
-        if let Some(task) = h.task.take() {
-            task.abort();
-            let _ = join_aborted_slipstream_task(&task);
-        }
+        // always has (a same-handle restart is safe). Only the stop-then-mutate callers act on the
+        // flag, and they reach it through `zcashlc_slipstream_stop` — but a pass this start could
+        // not wait out STAYS on record, so the next stop still answers for it. The borrow is split
+        // in its own scope so the rest of the function keeps the plain `&mut handle.inner` it had.
+        let _ = {
+            let SlipstreamHandle {
+                inner,
+                unfinished_passes,
+                ..
+            } = &mut *handle;
+            settle_engine_passes(
+                &mut inner.task,
+                unfinished_passes,
+                std::time::Duration::from_secs(10),
+            )
+        };
+
+        let h = &mut handle.inner;
         // [B4-16 drain] The aborted pass's write-behind commit may still be running
         // (`spawn_blocking` — uncancellable); wait it out BEFORE spawning the new
         // session, so the new pass's first writes never collide with an orphan
@@ -5604,14 +5653,23 @@ pub unsafe extern "C" fn zcashlc_slipstream_stop(handle: *mut SlipstreamHandle) 
             .last_stop_at
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(std::time::Instant::now());
-        let h = &mut handle.inner;
-        let joined = match h.task.take() {
-            Some(task) => {
-                task.abort();
-                join_aborted_slipstream_task(&task)
-            }
-            None => true,
+        // [MOB-1850] Every pass this handle has aborted and not yet watched finish is settled
+        // here, not just the one in the slot: a previous stop that gave up waiting TOOK that
+        // slot's handle, and the pass it gave up on is exactly the writer this stop must not
+        // report away. Split borrow so `unfinished_passes` and `inner` are held at once.
+        let settled = {
+            let SlipstreamHandle {
+                inner,
+                unfinished_passes,
+                ..
+            } = &mut *handle;
+            settle_engine_passes(
+                &mut inner.task,
+                unfinished_passes,
+                std::time::Duration::from_secs(10),
+            )
         };
+        let h = &mut handle.inner;
         // [B4-16 drain] abort() cannot cancel an in-flight write-behind commit
         // (`spawn_blocking`) — drain it so a returned stop means the wallet file is
         // QUIESCENT: the host's next write (deleteAccount / importAccount / rewind
@@ -5622,22 +5680,16 @@ pub unsafe extern "C" fn zcashlc_slipstream_stop(handle: *mut SlipstreamHandle) 
         // [MOB-1850] The pass is stopped either way — the state goes Idle above regardless. What
         // the answer reports is whether the wallet file was PROVED quiescent, which is the only
         // thing a caller about to mutate it can act on.
-        Ok(joined && drained)
+        Ok(settled && drained)
     });
     unwrap_exc_or(res, false)
 }
 
-/// [B4-16 drain] Bounded wait for the engine's in-flight wallet-file writer — the
-/// write-behind lane's deferred commit, a `spawn_blocking` closure `task.abort()` cannot
-/// cancel. Field evidence (2026-07-04): an orphan commit outlived an `importAccount`
-/// restart, collided with the new pass's first writes ("database is locked" →
-/// non-transient failure, absorbed by the revival loop) and — worse — landed its
-/// Scanned-mark AFTER the import's force-rescan re-queue, silently shrinking the new
-/// account's scan scope. Called by stop() and start() right after aborting the task.
-/// 10 s cap ≫ the worst observed device commit (a few seconds, A10). [MOB-1850] A timeout
-/// is REPORTED (`false`) rather than logged away: a caller that is about to mutate the wallet
-/// needs to know the file was never proved quiescent, and can refuse instead of writing on top
-/// of a live writer. The busy_timeouts remain the backstop for the callers that proceed anyway.
+/// Aborts the running pass (if any), keeps every pass that has not finished yet on record, and
+/// waits within `budget` for all of them to finish. Returns whether the engine is quiescent with
+/// respect to its passes. A pass that outlives the budget STAYS on record, so a later stop cannot
+/// claim quiescence merely because the most recent handle has already been taken.
+///
 /// [B4-16 drain] `abort()` is ASYNCHRONOUS — the task keeps running until its next await
 /// point, so a synchronous in-flight wallet write (an enhance `decrypt_and_store`, a
 /// chain-tip or subtree-roots update — field evidence: a `deleteAccount` landing in that
@@ -5646,35 +5698,49 @@ pub unsafe extern "C" fn zcashlc_slipstream_stop(handle: *mut SlipstreamHandle) 
 /// `drain_slipstream_wallet_writers` (the persist lane's `spawn_blocking` commit — the
 /// engine's ONLY detached writer), a stop/start-abort that returns `true` means the wallet
 /// file is FULLY quiescent; `false` means it could not be proved so within the budget.
-fn join_aborted_slipstream_task(task: &tokio::task::AbortHandle) -> bool {
-    join_aborted_slipstream_task_until(task, std::time::Duration::from_secs(10))
-}
-
-/// The bounded body of [`join_aborted_slipstream_task`], with the budget as a parameter so a
-/// test can exercise the deadline branch without waiting ten seconds for it.
-fn join_aborted_slipstream_task_until(
-    task: &tokio::task::AbortHandle,
+fn settle_engine_passes(
+    task_slot: &mut Option<tokio::task::AbortHandle>,
+    unfinished: &mut Vec<tokio::task::AbortHandle>,
     budget: std::time::Duration,
 ) -> bool {
+    if let Some(task) = task_slot.take() {
+        task.abort();
+        unfinished.push(task);
+    }
     let deadline = std::time::Instant::now() + budget;
-    while !task.is_finished() {
+    loop {
+        unfinished.retain(|task| !task.is_finished());
+        if unfinished.is_empty() {
+            return true;
+        }
         if std::time::Instant::now() >= deadline {
             tracing::warn!(
-                "slipstream stop/start: aborted pass still unwinding at the deadline — reporting a non-quiescent stop"
+                "slipstream stop/start: {} aborted pass(es) still unwinding at the deadline — reporting a non-quiescent stop",
+                unfinished.len()
             );
             return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    true
 }
 
+/// [B4-16 drain] Bounded wait for the engine's in-flight wallet-file writer — the
+/// write-behind lane's deferred commit, a `spawn_blocking` closure `task.abort()` cannot
+/// cancel. Field evidence (2026-07-04): an orphan commit outlived an `importAccount`
+/// restart, collided with the new pass's first writes ("database is locked" →
+/// non-transient failure, absorbed by the revival loop) and — worse — landed its
+/// Scanned-mark AFTER the import's force-rescan re-queue, silently shrinking the new
+/// account's scan scope. Called by stop() and start() right after settling the passes.
+/// 10 s cap ≫ the worst observed device commit (a few seconds, A10). [MOB-1850] A timeout
+/// is REPORTED (`false`) rather than logged away: a caller that is about to mutate the wallet
+/// needs to know the file was never proved quiescent, and can refuse instead of writing on top
+/// of a live writer. The busy_timeouts remain the backstop for the callers that proceed anyway.
 fn drain_slipstream_wallet_writers(progress: &slipstream_core::ProgressArc) -> bool {
     drain_slipstream_wallet_writers_until(progress, std::time::Duration::from_secs(10))
 }
 
-/// The bounded body of [`drain_slipstream_wallet_writers`], with the budget as a parameter for
-/// the same reason [`join_aborted_slipstream_task_until`] takes one.
+/// The bounded body of [`drain_slipstream_wallet_writers`], with the budget as a parameter so a
+/// test can exercise the deadline branch without waiting ten seconds for it.
 fn drain_slipstream_wallet_writers_until(
     progress: &slipstream_core::ProgressArc,
     budget: std::time::Duration,

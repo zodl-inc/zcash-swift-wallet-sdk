@@ -653,6 +653,57 @@ final class SlipstreamLifecycleOwnershipTests: ZcashTestCase {
         XCTAssertTrue(isRunning, "a refused mutation leaves the synchronizer running, as it found it")
     }
 
+    /// [MOB-1850] The refusal must not wear off. A stop whose budget ran out gave up waiting for a
+    /// pass, but giving up is not the pass finishing, so the stop AFTER it faces the very same live
+    /// writer and must refuse just as firmly. This is the shape that reached the field: the second
+    /// attempt at a mutation the first attempt had refused went through, and the wallet was mutated
+    /// under a pass that had never stopped writing.
+    func testRepeatedNonQuiescentStopsKeepRefusingTheMutation() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setNextSnapshot(SlipstreamSnapshot.testSyncing(progressPermille: 100))
+        let welding = ZcashRustBackendWeldingMock()
+        welding.deleteAccountClosure = { _ in }
+        let sync = try makeSlipstreamSynchronizer(engine: engine, welding: welding)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+
+        try await sync.start(retry: false)
+        engine.stopQuiescent = false
+
+        for attempt in 1...2 {
+            do {
+                try await sync.deleteAccount(TestsData.mockedAccountUUID)
+                XCTFail("attempt \(attempt): a stop that stayed non-quiescent must refuse the mutation again")
+            } catch let error as ZcashError {
+                guard case .slipstreamEngineNotQuiescent = error else {
+                    return XCTFail("attempt \(attempt): unexpected error \(error.code)")
+                }
+            }
+
+            XCTAssertFalse(
+                welding.deleteAccountCalled,
+                "attempt \(attempt): the wallet must not be mutated on top of a writer that never finished"
+            )
+            let calls = await engine.calls
+            XCTAssertEqual(
+                calls.filter { $0 == "stop" }.count,
+                attempt,
+                "attempt \(attempt): each refused mutation stops the pass exactly once: \(calls)"
+            )
+            let lastStop = try XCTUnwrap(calls.lastIndex(of: "stop"), "attempt \(attempt): \(calls)")
+            let lastStartDone = try XCTUnwrap(
+                calls.lastIndex(of: "start:done"),
+                "attempt \(attempt): a refusal must leave a restarted pass behind it: \(calls)"
+            )
+            XCTAssertGreaterThan(
+                lastStartDone,
+                lastStop,
+                "attempt \(attempt): the restart after the refusal is the one left running: \(calls)"
+            )
+            let isRunning = await sync.isRunningForTesting()
+            XCTAssertTrue(isRunning, "attempt \(attempt): a refused mutation leaves the synchronizer running")
+        }
+    }
+
     /// The same contract for the truncate: a rewind reports the refusal on its publisher, and the
     /// chain state is never truncated underneath a writer the engine could not account for.
     func testRewindRefusesToTruncateWhenTheStopWasNotQuiescent() async throws {
@@ -690,6 +741,51 @@ final class SlipstreamLifecycleOwnershipTests: ZcashTestCase {
         )
         let isRunning = await sync.isRunningForTesting()
         XCTAssertTrue(isRunning, "a refused rewind leaves the synchronizer running, as it found it")
+    }
+
+    /// [MOB-1850] The truncate half of the repeated refusal. A host that meets the refusal usually
+    /// retries, and the retry is the dangerous one: it arrives at a stop that has already given up
+    /// waiting once, and must still be told the writer is unaccounted for.
+    func testRepeatedNonQuiescentStopsKeepRefusingTheRewind() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setNextSnapshot(SlipstreamSnapshot.testSyncing(progressPermille: 100))
+        let welding = ZcashRustBackendWeldingMock()
+        welding.truncateToChainStateChainStateClosure = { _ in }
+        let sync = try makeSlipstreamSynchronizer(engine: engine, welding: welding)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+
+        try await sync.start(retry: false)
+        engine.stopQuiescent = false
+
+        for attempt in 1...2 {
+            let failed = XCTestExpectation(description: "rewind attempt \(attempt) reported the refusal")
+            var rewindError: Error?
+            sync.rewind(.birthday)
+                .sink(
+                    receiveCompletion: { completion in
+                        if case let .failure(error) = completion {
+                            rewindError = error
+                        }
+                        failed.fulfill()
+                    },
+                    receiveValue: { _ in }
+                )
+                .store(in: &cancellables)
+            await fulfillment(of: [failed], timeout: 5)
+
+            guard case .slipstreamEngineNotQuiescent = try XCTUnwrap(rewindError as? ZcashError) else {
+                return XCTFail("attempt \(attempt): a stop that stayed non-quiescent must refuse the truncate again")
+            }
+            XCTAssertFalse(
+                welding.truncateToChainStateChainStateCalled,
+                "attempt \(attempt): the chain state must not be truncated on top of a writer that never finished"
+            )
+            let isRunning = await sync.isRunningForTesting()
+            XCTAssertTrue(isRunning, "attempt \(attempt): a refused rewind leaves the synchronizer running")
+        }
+
+        let calls = await engine.calls
+        XCTAssertEqual(calls.filter { $0 == "stop" }.count, 2, "each refused rewind stopped the pass once: \(calls)")
     }
 
     /// A wipe deletes the files every other operation reads, so it is the one that must refuse most
@@ -770,6 +866,39 @@ final class SlipstreamLifecycleOwnershipTests: ZcashTestCase {
         try await sync.deleteAccount(TestsData.mockedAccountUUID)
 
         XCTAssertTrue(welding.deleteAccountCalled, "the default stop is quiescent and the mutation goes through")
+    }
+
+    /// [MOB-1850] The refusal is about the wallet, not about the caller: once the engine can prove
+    /// its pass and its writer are gone, a mutation that was refused twice must go through. A
+    /// refusal that outlived the condition causing it would be its own outage — the mirror image of
+    /// the bug, and the reason the record is CLEARED by the pass finishing rather than by time.
+    func testQuiescenceAdmitsTheMutationAfterEarlierRefusals() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setNextSnapshot(SlipstreamSnapshot.testSyncing(progressPermille: 100))
+        let welding = ZcashRustBackendWeldingMock()
+        welding.deleteAccountClosure = { _ in }
+        let sync = try makeSlipstreamSynchronizer(engine: engine, welding: welding)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+
+        try await sync.start(retry: false)
+        engine.stopQuiescent = false
+
+        do {
+            try await sync.deleteAccount(TestsData.mockedAccountUUID)
+            XCTFail("the unproved stop must refuse the mutation first")
+        } catch let error as ZcashError {
+            guard case .slipstreamEngineNotQuiescent = error else {
+                return XCTFail("unexpected error \(error.code)")
+            }
+        }
+        XCTAssertFalse(welding.deleteAccountCalled, "nothing was written while the writer was unaccounted for")
+
+        // The writer finished: the engine can now prove what it could not prove before.
+        engine.stopQuiescent = true
+
+        try await sync.deleteAccount(TestsData.mockedAccountUUID)
+
+        XCTAssertTrue(welding.deleteAccountCalled, "a proved-quiescent stop admits the mutation the refusals held back")
     }
 
     // MARK: - Helpers

@@ -213,6 +213,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Synchronizer.transactionSubmissionStatus(for:)` and background resubmission treat a submit-plan
   store whose creation failed as unavailable again (skipping the transaction) instead of as never
   written; a previous entry in this section described the read path incorrectly for that case.
+- A stop that follows a stop which had already given up waiting for an aborted pass now still
+  reports non-quiescence until that pass has actually finished, so `importAccount`,
+  `deleteAccount`, `rewind`, `wipe`, `switchTo` and `restartSync(at:)` keep refusing until the
+  wallet is quiet.
 
 # 4.1.0 - 2026-09-01
 
