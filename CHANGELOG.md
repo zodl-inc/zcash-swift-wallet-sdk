@@ -96,6 +96,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reporting the failure, so the wait can be noticeably longer than a single budget.
   `SlipstreamEngine.stop()` now returns whether the stop was quiescent. `SDKSynchronizer` is
   unaffected.
+- `Synchronizer.restartSync(at:)` now throws `CancellationError` and leaves the engine untouched
+  when the calling task was cancelled before the restart began executing (a restart already under
+  way completes). Hosts that cancel a restart, for example when the app enters the background, no
+  longer get a pass started behind their own stop.
 - `Synchronizer` gained a new requirement:
   `evaluateServerSwitch(current:candidates:fetchThresholdSeconds:nBlocksToFetch:network:)`. Any
   custom `Synchronizer` conformer or test double stops compiling until it implements it — see

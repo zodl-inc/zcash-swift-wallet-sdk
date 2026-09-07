@@ -550,7 +550,8 @@ public protocol Synchronizer: AnyObject {
     /// the SDK's own stall recovery has given up (`SynchronizerEvent.syncStalled(attempt:gaveUp:
     /// true)`): a plain `start()` cannot rebuild a handle a failed reopen left behind, and the
     /// Slipstream `switchTo(endpoint:)` only restarts a pass that was already running and is a
-    /// no-op for the current server.
+    /// no-op for the current server. Throws `CancellationError` without touching the engine when
+    /// the calling task was cancelled before the restart began executing.
     /// - Throws: what `start(retry:)` throws (`synchronizerNotPrepared`, `migrationSyncBlocked`,
     ///   engine start errors), plus whatever the engine rebuild itself throws.
     func restartSync(at endpoint: LightWalletEndpoint) async throws

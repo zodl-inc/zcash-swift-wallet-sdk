@@ -1507,32 +1507,6 @@ extension VotingRustBackend {
     }
 }
 
-// MARK: - Proving cancellation (MOB-1860)
-
-/// A `Bool` set once from a `withTaskCancellationHandler`'s `onCancel`, and read once by the
-/// detached proving closure in `buildAndProveDelegation` before it calls into the FFI entry point
-/// (or the test double standing in for it) — see that method's doc comment for the cancellation
-/// story this closes.
-///
-/// `NSLock`, not `OSAllocatedUnfairLock`, for the package's iOS 13 / macOS 12 floor, the same reason
-/// `Gate` and `LifecycleQueue` use one.
-private final class ProvingCancellationFlag: @unchecked Sendable {
-    private let lock = NSLock()
-    private var flagged = false
-
-    func markCancelled() {
-        lock.lock()
-        flagged = true
-        lock.unlock()
-    }
-
-    var isCancelled: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return flagged
-    }
-}
-
 // MARK: - Delegation workflow
 
 extension VotingRustBackend {
@@ -2102,7 +2076,7 @@ extension VotingRustBackend {
         // caught here, before the detached proving call below can be scheduled at all.
         try Task.checkCancellation()
 
-        let cancellationFlag = ProvingCancellationFlag()
+        let cancellationFlag = CancellationFlag()
 
         // The proving FFI can run for minutes; detach so we do not block the
         // caller's executor for the full duration. `VotingRustBackend` is

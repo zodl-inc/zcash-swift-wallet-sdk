@@ -2521,9 +2521,22 @@ public actor SlipstreamSynchronizer: Synchronizer {
     /// [MOB-1850] Rebuilds the engine at `endpoint` and starts a pass regardless of whether one was
     /// running. See `Synchronizer.restartSync(at:)`'s doc for when a host calls this.
     public func restartSync(at endpoint: LightWalletEndpoint) async throws {
-        try await lifecycle.enqueueThrowing {
-            try await self.restartSyncImpl(at: endpoint)
-        }.value
+        // A caller cancelled while this restart is still queued — the app backgrounding while a
+        // terminal rebuild waits its turn — must not have the restart run behind the stop that
+        // background enqueued: the queued task is unstructured and inherits no cancellation, so the
+        // flag carries the caller's cancellation across the queue boundary. Once the restart has
+        // begun executing it completes; a stop queued behind it then has the final word.
+        let callerCancelled = CancellationFlag()
+        try await withTaskCancellationHandler {
+            try await lifecycle.enqueueThrowing {
+                if callerCancelled.isCancelled {
+                    throw CancellationError()
+                }
+                try await self.restartSyncImpl(at: endpoint)
+            }.value
+        } onCancel: {
+            callerCancelled.markCancelled()
+        }
     }
 
     /// The queued body of `restartSync(at:)`. `switchToOnLifecycleQueue`'s sibling: the same

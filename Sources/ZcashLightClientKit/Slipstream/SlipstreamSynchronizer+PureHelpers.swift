@@ -250,6 +250,34 @@ final class LifecycleQueue: @unchecked Sendable {
     }
 }
 
+// MARK: - CancellationFlag (MOB-1850, MOB-1860)
+
+/// A `Bool` set once from a `withTaskCancellationHandler`'s `onCancel`, and read later by whichever
+/// unstructured or detached work would otherwise miss the calling task's cancellation: an operation
+/// already sitting on `LifecycleQueue` (`SlipstreamSynchronizer.restartSync(at:)`) or a detached
+/// proving closure (`VotingRustBackend.buildAndProveDelegation`). Neither is a child task, so
+/// cancellation does not propagate to either on its own — this flag carries it across the boundary
+/// by hand, checked as the first thing the queued or detached body does.
+///
+/// `NSLock`, not `OSAllocatedUnfairLock`, for the package's iOS 13 / macOS 12 floor, the same reason
+/// `Gate` and `LifecycleQueue` use one.
+final class CancellationFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flagged = false
+
+    func markCancelled() {
+        lock.lock()
+        flagged = true
+        lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return flagged
+    }
+}
+
 // MARK: - withTaskTimeout helper (F1)
 
 /// Races `operation` against a nanosecond timer.  Returns the operation's value if it

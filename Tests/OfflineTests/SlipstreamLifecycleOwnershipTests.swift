@@ -429,6 +429,91 @@ final class SlipstreamLifecycleOwnershipTests: ZcashTestCase {
         )
     }
 
+    // MARK: - restartSync(at:): a caller cancelled while queued retires itself
+
+    /// [MOB-1850] The field failure this closes: the app backgrounds while a terminal-recovery
+    /// `restartSync(at:)` is still queued behind the stop the backgrounding itself triggered.
+    /// `LifecycleQueue`'s tasks are unstructured and inherit no cancellation, so without help the
+    /// restart would be admitted once the stop ahead of it finishes, and would reopen the engine
+    /// and start a pass the app never asked for, behind its own stop.
+    func testARestartWhoseCallerIsCancelledWhileQueuedNeverRunsAndLeavesTheEngineStopped() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setNextSnapshot(SlipstreamSnapshot.testSyncing(progressPermille: 100))
+        let sync = try makeSlipstreamSynchronizer(engine: engine)
+        await sync.setInternalSyncStatusForTesting(.disconnected)
+        try await sync.start(retry: false)
+
+        engine.stopGate.close() // the next stop parks inside the fake
+        sync.stop() // the host's background stop holds the queue
+        let stopped = await waitUntil { await engine.calls.contains("stop") }
+        XCTAssertTrue(stopped, "the deliberate stop reached the engine and is held there")
+
+        let endpoint = await sync.currentEndpointForTesting()
+        let restart = Task { try await sync.restartSync(at: endpoint) }
+        // Bounded, not observable: nothing in `calls` marks a restart that is queued but not yet
+        // admitted, so this waits long enough for it to reach `enqueueThrowing` and suspend behind
+        // the parked stop before it is cancelled.
+        try await Task.sleep(nanoseconds: 50_000_000)
+        restart.cancel()
+        engine.stopGate.open()
+
+        do {
+            try await restart.value
+            XCTFail("a restart whose caller was cancelled before it began must throw")
+        } catch is CancellationError {
+            // expected
+        }
+
+        let calls = await engine.calls
+        let afterStop = calls.drop(while: { $0 != "stop" }).dropFirst()
+        XCTAssertFalse(
+            afterStop.contains(where: { $0.hasPrefix("reopen") }),
+            "the retired restart must not reopen the engine: \(calls)"
+        )
+        XCTAssertFalse(afterStop.contains("start"), "the retired restart must not start a pass: \(calls)")
+        let running = await sync.isRunningForTesting()
+        XCTAssertFalse(running, "a retired restart leaves the synchronizer stopped")
+    }
+
+    /// The mirror image: a restart that has already begun executing — past the point cancellation
+    /// can retire it — completes even though its caller is cancelled too late to matter, and a stop
+    /// queued behind it still gets to run afterward and is the one left standing.
+    func testAStopQueuedBehindARestartThatAlreadyBeganRemainsAuthoritative() async throws {
+        let engine = GatedFakeSlipstreamEngine()
+        await engine.setNextSnapshot(SlipstreamSnapshot.testSyncing(progressPermille: 100))
+        let sync = try makeSlipstreamSynchronizer(engine: engine)
+        await sync.setInternalSyncStatusForTesting(.stopped)
+
+        engine.reopenGate.close() // the restart parks inside reopen once it has begun
+        let endpoint = await sync.currentEndpointForTesting()
+        let restart = Task { try await sync.restartSync(at: endpoint) }
+        let reopening = await waitUntil { await engine.calls.contains(where: { $0.hasPrefix("reopen(") }) }
+        XCTAssertTrue(reopening, "the restart has begun executing and is parked inside reopen")
+
+        // Too late: the restart already passed the point where cancellation would have retired it.
+        restart.cancel()
+        sync.stop()
+        engine.reopenGate.open()
+
+        try await restart.value
+
+        let settled = await waitUntil { await sync.isRunningForTesting() == false }
+        XCTAssertTrue(settled, "the stop queued behind the restart still runs")
+
+        let calls = await engine.calls
+        let lastStart = try XCTUnwrap(calls.lastIndex(of: "start"), "the restart's own start ran: \(calls)")
+        let lastStop = try XCTUnwrap(calls.lastIndex(of: "stop"), "the later stop reached the engine: \(calls)")
+        XCTAssertGreaterThan(
+            lastStop,
+            lastStart,
+            "the stop queued behind the restart is the one left running: \(calls)"
+        )
+        let trace = Self.lifecycleCalls(calls)
+        XCTAssertEqual(trace.last, "stop:done", "the later stop is the final lifecycle event: \(trace)")
+        let running = await sync.isRunningForTesting()
+        XCTAssertFalse(running, "the later stop remains authoritative")
+    }
+
     // MARK: - Account mutations must not leave the poll loop alive across their stopped interval
 
     /// `deleteAccount`'s stopped interval must be genuinely silent. Before this hardening,
