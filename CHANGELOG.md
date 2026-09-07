@@ -6,16 +6,7 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
-# 4.2.0 - 2026-09-03
-
 ## Added
-
-### Balances
-
-- `Synchronizer.getLocalAccountBalances()` and `SynchronizerState.localAccountsBalances` expose
-  the last account balances stored in the wallet database without chain-tip freshness masking.
-  Wallet apps can keep a stale balance visible while they replace networking. Synchronizers that
-  do not support durable snapshots return `nil`. Existing balance APIs keep their masking behavior.
 
 ### Voting
 
@@ -35,6 +26,25 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `VotingRustBackend.hotkey(fromStoredSecret:networkId:)` returns the `VotingHotkey` a persisted
   stored secret describes, so applications no longer need to pass bare secret bytes to SDK calls
   that want the semantic type.
+
+## Changed
+
+- `ZcashTransaction.Overview.ZIP318Kind` (the type of `zip318Kind`) gained the case
+  `canonicalCrossingPayment`: a canonical pool crossing that pays a third party — the same
+  on-chain shape as a migration `transfer`, but not a migration this account made. Such
+  transactions were previously reported as `notClassified`. An exhaustive `switch` over
+  `ZIP318Kind` stops compiling until the new case is handled.
+
+# 4.2.0 - 2026-09-03
+
+## Added
+
+### Balances
+
+- `Synchronizer.getLocalAccountBalances()` and `SynchronizerState.localAccountsBalances` expose
+  the last account balances stored in the wallet database without chain-tip freshness masking.
+  Wallet apps can keep a stale balance visible while they replace networking. Synchronizers that
+  do not support durable snapshots return `nil`. Existing balance APIs keep their masking behavior.
 
 ## Changed
 
@@ -75,11 +85,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   certificate of that — `detail` renders a payload only when it has that type, so the raw strings
   still carried by other `rust*` cases cannot reach a report. The unredacted text is logged on the
   device at `debug!` level.
-- `ZcashTransaction.Overview.ZIP318Kind` (the type of `zip318Kind`) gained the case
-  `canonicalCrossingPayment`: a canonical pool crossing that pays a third party — the same
-  on-chain shape as a migration `transfer`, but not a migration this account made. Such
-  transactions were previously reported as `notClassified`. An exhaustive `switch` over
-  `ZIP318Kind` stops compiling until the new case is handled.
 
 ## Fixed
 
