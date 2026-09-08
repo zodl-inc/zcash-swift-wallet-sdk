@@ -6,6 +6,8 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+# 4.3.0 - 2026-09-08
+
 ## Added
 
 ### Voting
