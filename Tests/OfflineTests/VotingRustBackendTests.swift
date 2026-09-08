@@ -403,7 +403,7 @@ final class VotingRustBackendTests: XCTestCase {
         XCTAssertEqual(try backend.getBundleCount(roundId: roundId), 2)
     }
 
-    func test_restoreRecoveredDelegation_aPrefixReplacesRowsNoDelegationAccepted() throws {
+    func test_restoreRecoveredDelegation_refusesAPackageShorterThanTheRound() throws {
         let (backend, path) = try openedBackend()
         defer { backend.close() }
         let hotkey = try VotingRustBackend.generateHotkey(networkId: roundTripNetworkId)
@@ -415,17 +415,14 @@ final class VotingRustBackendTests: XCTestCase {
             ]),
             .restored
         )
-        // A rebuild the chain refused: rows without an accepted hash.
+        // Rows without a stored hash: a rebuild the chain refused, or a
+        // broadcast whose hash never landed. The guard cannot tell which.
         execute("UPDATE bundles SET delegation_tx_hash = NULL;", on: path)
 
-        XCTAssertEqual(
-            try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [
-                open.bundle(0, rand: 0x2A, hash: 0xAB), open.bundle(1, rand: 0x2B, hash: 0xAC)
-            ]),
-            .restored
-        )
-        XCTAssertEqual(try backend.getBundleCount(roundId: roundId), 2)
-        XCTAssertEqual(try backend.getDelegationTxHash(roundId: roundId, bundleIndex: 0), recoveredHash(0xAB))
+        XCTAssertThrowsError(try restore(backend, roundId: roundId, hotkey: hotkey, bundles: [
+            open.bundle(0, rand: 0x2A, hash: 0xAB), open.bundle(1, rand: 0x2B, hash: 0xAC)
+        ]))
+        XCTAssertEqual(try backend.getBundleCount(roundId: roundId), 3)
     }
 
     func test_restoreRecoveredDelegation_rejectsAWeightBelowOneBallotBeforeTouchingTheDatabase() throws {

@@ -131,10 +131,11 @@ enum Decision {
 /// An error names the guard that refused.
 ///
 /// Rows the wallet could still use stay: cast votes, delivered shares,
-/// Keystone signatures, and any bundle with an accepted hash that the package
-/// does not restore under the same index and hash. Rows without an accepted
-/// hash were never usable and may go, so the package may be a prefix of what
-/// a failed rebuild left behind, or extend a prefix restored earlier.
+/// Keystone signatures, and every bundle row the package does not restore
+/// under the same index and accepted hash. A row without a stored hash is not
+/// proof that nothing was broadcast, since the hash is stored only after the
+/// broadcast returns, so the package must cover every stored row. It may
+/// extend a prefix restored earlier.
 fn decide(rows: &RoundRows, package: &[(u32, [u8; 32], String)]) -> anyhow::Result<Decision> {
     if rows.votes > 0 {
         return Err(anyhow!(
@@ -159,26 +160,26 @@ fn decide(rows: &RoundRows, package: &[(u32, [u8; 32], String)]) -> anyhow::Resu
     }
     let mut identical = rows.bundles.len() == package.len();
     for (index, stored_rand, stored_hash) in &rows.bundles {
-        let offered = package
+        let Some((_, offered_rand, offered_hash)) = package
             .iter()
-            .find(|(offered_index, _, _)| offered_index == index);
-        match (stored_hash, offered) {
-            (Some(_), None) => {
+            .find(|(offered_index, _, _)| offered_index == index)
+        else {
+            return Err(anyhow!(
+                "bundle {index} is not in the package; nothing may be cleared"
+            ));
+        };
+        match stored_hash {
+            Some(hash) if hash != offered_hash => {
                 return Err(anyhow!(
-                    "bundle {index} carries an accepted delegation the package does not restore; nothing may be cleared"
+                    "bundle {index} carries a different accepted delegation; nothing may be cleared"
                 ));
             }
-            (Some(hash), Some((_, offered_rand, offered_hash))) => {
-                if hash != offered_hash {
-                    return Err(anyhow!(
-                        "bundle {index} carries a different accepted delegation; nothing may be cleared"
-                    ));
-                }
+            Some(_) => {
                 if stored_rand.as_deref() != Some(offered_rand.as_slice()) {
                     identical = false;
                 }
             }
-            (None, _) => identical = false,
+            None => identical = false,
         }
     }
     Ok(if identical {
@@ -214,12 +215,12 @@ fn van_commitment(
 ///
 /// Validates the package and the round context, checks that each bundle's
 /// blinding and weight open the commitment it carries for the handle's
-/// hotkey, reads what the round holds, refuses unless every row the package
-/// does not restore is provably useless to the wallet (no votes, no shares,
-/// no Keystone signatures, no bundle with an accepted hash), and only then
-/// runs `clear_round` followed by `import_delegation_capability`. The package
-/// must be contiguous from bundle zero; it may stop short of what a failed
-/// rebuild left behind, or extend a prefix restored earlier.
+/// hotkey, reads what the round holds, refuses unless the round holds no
+/// votes, shares, or Keystone signatures and every bundle row it holds is
+/// restored by the package under its accepted hash, and only then runs
+/// `clear_round` followed by `import_delegation_capability`. The package
+/// must be contiguous from bundle zero and cover every stored row; it may
+/// extend a prefix restored earlier.
 ///
 /// `request_json` is one JSON object: `round_id`, `snapshot_height`, `ea_pk`,
 /// `nc_root`, `nullifier_imt_root` (byte arrays), `vote_chain_id`, `bundles`
@@ -665,15 +666,21 @@ mod tests {
         assert_eq!(decide(&rows, &package).unwrap(), Decision::AlreadyRestored);
     }
 
+    /// A row without a hash may still back a delegation the chain accepted:
+    /// the hash is stored only after the broadcast returns.
     #[test]
-    fn a_prefix_may_replace_rows_no_delegation_accepted() {
+    fn a_package_shorter_than_the_round_is_refused() {
         let rows = stored(&[
             (0, Some(0x3A), None),
             (1, Some(0x3B), None),
             (2, Some(0x3C), None),
         ]);
         let package = offered(&[(0, 0x2A, 0xAB), (1, 0x2B, 0xAC)]);
-        assert_eq!(decide(&rows, &package).unwrap(), Decision::ClearAndImport);
+        let message = decide(&rows, &package).unwrap_err().to_string();
+        assert!(
+            message.contains("bundle 2 is not in the package"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -689,8 +696,7 @@ mod tests {
         let package = offered(&[(0, 0x2A, 0xAB)]);
         let message = decide(&rows, &package).unwrap_err().to_string();
         assert!(
-            message
-                .contains("bundle 1 carries an accepted delegation the package does not restore"),
+            message.contains("bundle 1 is not in the package"),
             "{message}"
         );
     }

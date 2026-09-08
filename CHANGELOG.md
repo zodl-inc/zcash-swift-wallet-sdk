@@ -20,10 +20,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `VotingRustBackend.restoreRecoveredDelegation(_:)`, `RecoveredDelegationRestoreRequest`,
   `RecoveredDelegationBundle` and `RecoveredDelegationRestoreResult` restore a delegation from
   recovered `(bundle_index, total_note_value, van_comm_rand, delegation_tx_hash)` tuples. The
-  call refuses to clear a round that holds votes, shares, Keystone signatures, or an accepted
-  bundle the package does not restore, and reports `.alreadyRestored` without writing when the
-  round already holds the package. The package must be contiguous from bundle zero; it may be
-  a prefix of what a failed rebuild left behind, or extend a prefix restored earlier. Each
+  call refuses to clear a round that holds votes, shares, Keystone signatures, or any bundle
+  the package does not restore, and reports `.alreadyRestored` without writing when the round
+  already holds the package. The package must be contiguous from bundle zero and cover every
+  bundle the round holds; it may extend a prefix restored earlier. Each
   bundle carries `van`, the commitment the recovered row held; the call refuses a bundle whose
   blinding and weight do not open it before clearing anything. The request takes a
   `VotingHotkey`; its secret is unwrapped only at the FFI boundary, and the recovered blinding
