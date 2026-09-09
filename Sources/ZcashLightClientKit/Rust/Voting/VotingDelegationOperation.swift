@@ -222,8 +222,7 @@ extension VotingRustBackend {
             pirEndpoints: pirEndpoints,
             expectedSnapshotHeight: expectedSnapshotHeight,
             layout: layout,
-            pirResolver: PirSnapshotResolver(),
-            proveEntry: nil
+            execution: VotingDelegationExecution(pirResolver: PirSnapshotResolver(), proveEntry: nil)
         )
     }
 
@@ -232,8 +231,7 @@ extension VotingRustBackend {
         pirEndpoints: [URL],
         expectedSnapshotHeight: BlockHeight,
         layout: VotingPirLayout,
-        pirResolver: PirSnapshotResolver,
-        proveEntry: VotingDelegationProveEntry?
+        execution: VotingDelegationExecution
     ) async throws -> VotingDelegationOperation {
         try Task.checkCancellation()
         guard expectedSnapshotHeight >= 0 else {
@@ -280,21 +278,25 @@ extension VotingRustBackend {
                     }
                     let result = try await self.resolveAndProveDelegation(
                         params,
-                        pirEndpoints: pirEndpoints.map(\.absoluteString),
-                        expectedSnapshotHeight: UInt64(expectedSnapshotHeight),
-                        pirLayout: layout,
-                        pirResolver: pirResolver,
-                        progress: { operation.report($0) },
-                        operation: operation,
-                        proveEntry: proveEntry ?? { [self] params, url, layout, progress in
-                            try self.syncBuildAndProveDelegation(
-                                params,
-                                pirServerUrl: url,
-                                pirLayout: layout,
-                                progress: progress,
-                                expectedScope: scope
+                        context: VotingDelegationProvingContext(
+                            endpoints: pirEndpoints.map(\.absoluteString),
+                            snapshotHeight: UInt64(expectedSnapshotHeight),
+                            layout: layout,
+                            execution: VotingDelegationExecution(
+                                pirResolver: execution.pirResolver,
+                                proveEntry: execution.proveEntry ?? { [self] params, url, layout, progress in
+                                    try self.syncBuildAndProveDelegation(
+                                        params,
+                                        pirServerUrl: url,
+                                        pirLayout: layout,
+                                        progress: progress,
+                                        expectedScope: scope
+                                    )
+                                }
                             )
-                        }
+                        ),
+                        progress: { operation.report($0) },
+                        operation: operation
                     )
                     await queue.release(ticket)
                     return result
@@ -410,6 +412,7 @@ final class VotingDelegationRegistry: @unchecked Sendable {
             if let existing, !existing.canRetry { return existing }
             let operation = make()
             lock.lock()
+            if let existing { retired.append(existing) }
             entries[key] = operation
             lock.unlock()
             return operation
@@ -498,3 +501,15 @@ typealias VotingDelegationProveEntry =
     @Sendable (
         VotingDelegationProofParams, String, VotingPirLayout, (@Sendable (Double) -> Void)?
     ) throws -> VotingDelegationProofResult
+
+struct VotingDelegationExecution: Sendable {
+    let pirResolver: PirSnapshotResolver
+    let proveEntry: VotingDelegationProveEntry?
+}
+
+struct VotingDelegationProvingContext: Sendable {
+    let endpoints: [String]
+    let snapshotHeight: UInt64
+    let layout: VotingPirLayout
+    let execution: VotingDelegationExecution
+}

@@ -9,6 +9,7 @@ use zcash_voting as voting;
 use zcash_voting::backend::{
     orchard,
     pasta_curves::{group::ff::PrimeField, pallas},
+    zcash_keys::keys::UnifiedFullViewingKey,
 };
 use zcash_voting::storage::queries;
 
@@ -87,6 +88,18 @@ fn read_completed_proof(
         "delegation requires one to five notes"
     );
     let conn = handle.db.conn();
+    // The native compatibility query accepts legacy position-only rows. Durable reuse
+    // needs the complete identity; retain the owned connection and fail closed if absent.
+    let has_note_identity: bool = conn.query_row(
+        "SELECT note_identity_hashes_blob IS NOT NULL FROM bundles
+         WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = ?3",
+        rusqlite::params![request.round_id, wallet, request.bundle_index],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        has_note_identity,
+        "stored delegation lacks full note identity"
+    );
     queries::require_bundle_notes(
         &conn,
         &request.round_id,
@@ -94,6 +107,17 @@ fn read_completed_proof(
         request.bundle_index,
         &notes,
     )?;
+    for note in &notes {
+        let ufvk = UnifiedFullViewingKey::decode(&handle.network, &note.ufvk_str)
+            .map_err(|_| anyhow!("invalid persisted note viewing key"))?;
+        let orchard_fvk = ufvk
+            .orchard()
+            .ok_or_else(|| anyhow!("persisted note viewing key has no Orchard component"))?;
+        anyhow::ensure!(
+            orchard_fvk.to_bytes().as_slice() == request.fvk,
+            "full viewing key does not match persisted note identity"
+        );
+    }
     let fields = queries::load_delegation_submission_data(
         &conn,
         &request.round_id,
@@ -217,6 +241,7 @@ mod tests {
         db: *mut VotingDatabaseHandle,
         secret: Vec<u8>,
         fvk: Vec<u8>,
+        ufvk: String,
     }
 
     impl Drop for Fixture {
@@ -230,16 +255,36 @@ mod tests {
             let db = test_helpers::open_memory_db();
             test_helpers::insert_round_and_bundle(db, ROUND);
             let secret = test_helpers::valid_stored_secret();
-            let spending_key = orchard::keys::SpendingKey::from_bytes([1; 32]).unwrap();
-            let fvk = orchard::keys::FullViewingKey::from(&spending_key)
-                .to_bytes()
-                .to_vec();
+            let spending_key = voting::backend::zcash_keys::keys::UnifiedSpendingKey::from_seed(
+                &voting::Network::Mainnet,
+                &[1; 32],
+                zip32::AccountId::try_from(0).unwrap(),
+            )
+            .unwrap();
+            let viewing_key = spending_key.to_unified_full_viewing_key();
+            let orchard_fvk = viewing_key.orchard().unwrap();
+            let fvk = orchard_fvk.to_bytes().to_vec();
+            let ufvk = viewing_key.encode(&voting::Network::Mainnet);
             let hotkey =
                 voting::VotingHotkey::from_stored_secret(&secret, voting::Network::Mainnet)
                     .unwrap();
             let van = van_commitment(&hotkey, ROUND, 13_000_000, &[0; 32]).unwrap();
+            let fixture = Self {
+                db,
+                secret,
+                fvk,
+                ufvk,
+            };
             let handle = unsafe { &*db };
             let conn = handle.db.conn();
+            conn.execute("DELETE FROM bundles", []).unwrap();
+            let notes: Vec<voting::NoteInfo> = fixture
+                .request()
+                .notes
+                .into_iter()
+                .map(Into::into)
+                .collect();
+            queries::insert_bundle_notes(&conn, ROUND, "wallet", 0, &notes).unwrap();
             let mut effects = vec![0; voting::tx1::TX1_EFFECTS_LEN];
             effects[0] = voting::tx1::TX1_EFFECTS_VERSION;
             queries::store_delegation_data(
@@ -265,9 +310,7 @@ mod tests {
             )
             .unwrap();
             if completed {
-                let ak = orchard::keys::SpendValidatingKey::from(
-                    orchard::keys::FullViewingKey::from(&spending_key),
-                );
+                let ak = orchard::keys::SpendValidatingKey::from(orchard_fvk.clone());
                 let rk: [u8; 32] = (&ak.randomize(&pallas::Scalar::from(0))).into();
                 queries::store_proof(&conn, ROUND, "wallet", 0, &[1, 2, 3]).unwrap();
                 queries::store_proof_result_fields(
@@ -283,7 +326,7 @@ mod tests {
                 .unwrap();
             }
             drop(conn);
-            Self { db, secret, fvk }
+            fixture
         }
 
         fn request(&self) -> ProofReadbackRequest {
@@ -300,7 +343,7 @@ mod tests {
                         rho: vec![3; 32],
                         rseed: vec![4; 32],
                         scope: 0,
-                        ufvk_str: String::new(),
+                        ufvk_str: self.ufvk.clone(),
                     })
                     .collect(),
                 fvk: self.fvk.clone(),
@@ -372,6 +415,41 @@ mod tests {
         let mut changed = fixture.request();
         changed.pczt_sighash[0] ^= 1;
         assert!(fixture.read(changed).is_err(), "changed PCZT");
+    }
+
+    #[test]
+    fn durable_reuse_rejects_changed_fvk_components_with_the_same_spend_key() {
+        let fixture = Fixture::new(true);
+        let other = orchard::keys::SpendingKey::from_bytes([2; 32]).unwrap();
+        let other_fvk = orchard::keys::FullViewingKey::from(&other).to_bytes();
+        for range in [32..64, 64..96] {
+            let mut changed = fixture.request();
+            changed.fvk[range.clone()].copy_from_slice(&other_fvk[range]);
+            let bytes: [u8; 96] = changed.fvk.clone().try_into().unwrap();
+            assert!(orchard::keys::FullViewingKey::from_bytes(&bytes).is_some());
+            assert!(fixture.read(changed).is_err(), "changed full viewing key");
+        }
+    }
+
+    #[test]
+    fn legacy_completed_bundle_without_full_note_identity_fails_closed() {
+        let fixture = Fixture::new(true);
+        let handle = unsafe { &*fixture.db };
+        handle
+            .db
+            .conn()
+            .execute("UPDATE bundles SET note_identity_hashes_blob = NULL", [])
+            .unwrap();
+        let mut changed = fixture.request();
+        changed.notes[0].value += 1;
+        assert!(
+            fixture.read(changed).is_err(),
+            "unchanged positions cannot bind changed notes"
+        );
+        assert!(
+            fixture.read(fixture.request()).is_err(),
+            "unverifiable reuse must not become a cache miss"
+        );
     }
 
     #[test]

@@ -57,12 +57,14 @@ final class VotingDelegationOperationTests: XCTestCase {
             pirEndpoints: [endpoint],
             expectedSnapshotHeight: 100,
             layout: layout,
-            pirResolver: PirSnapshotResolver(probe: MatchingProbe()),
-            proveEntry: { _, _, _, _ in
-                XCTAssertEqual(Task.currentPriority, .utility)
-                XCTAssertEqual(VotingRustBackend.interactiveProvingBoostCount(), 0)
-                return fixture
-            }
+            execution: VotingDelegationExecution(
+                pirResolver: PirSnapshotResolver(probe: MatchingProbe()),
+                proveEntry: { _, _, _, _ in
+                    XCTAssertEqual(Task.currentPriority, .utility)
+                    XCTAssertEqual(VotingRustBackend.interactiveProvingBoostCount(), 0)
+                    return fixture
+                }
+            )
         )
         let result = try await operation.result(intent: .speculative)
         XCTAssertEqual(result.proof, [7, 7, 7, 7])
@@ -206,8 +208,10 @@ final class VotingDelegationOperationTests: XCTestCase {
             pirEndpoints: [endpoint],
             expectedSnapshotHeight: 100,
             layout: layout,
-            pirResolver: PirSnapshotResolver(probe: GatedProbe(entered: probeEntered, release: release)),
-            proveEntry: proof.prove
+            execution: VotingDelegationExecution(
+                pirResolver: PirSnapshotResolver(probe: GatedProbe(entered: probeEntered, release: release)),
+                proveEntry: proof.prove
+            )
         )
         let task = Task { try await operation.result(intent: .speculative) }
         await fulfillment(of: [probeEntered], timeout: 5)
@@ -276,8 +280,10 @@ final class VotingDelegationOperationTests: XCTestCase {
             pirEndpoints: [endpoint],
             expectedSnapshotHeight: 100,
             layout: layout,
-            pirResolver: PirSnapshotResolver(probe: MatchingProbe()),
-            proveEntry: { _, _, _, _ in throw VotingRustBackendError.invalidData("fixture failure") }
+            execution: VotingDelegationExecution(
+                pirResolver: PirSnapshotResolver(probe: MatchingProbe()),
+                proveEntry: { _, _, _, _ in throw VotingRustBackendError.invalidData("fixture failure") }
+            )
         )
         do {
             _ = try await failed.result(intent: .interactive)
@@ -291,8 +297,10 @@ final class VotingDelegationOperationTests: XCTestCase {
             pirEndpoints: [endpoint],
             expectedSnapshotHeight: 100,
             layout: layout,
-            pirResolver: PirSnapshotResolver(probe: MatchingProbe()),
-            proveEntry: { _, _, _, _ in fixture }
+            execution: VotingDelegationExecution(
+                pirResolver: PirSnapshotResolver(probe: MatchingProbe()),
+                proveEntry: { _, _, _, _ in fixture }
+            )
         )
         XCTAssertFalse(failed === retry)
         let result = try await retry.result(intent: .speculative)
@@ -453,17 +461,121 @@ final class VotingDelegationOperationTests: XCTestCase {
             pirEndpoints: [endpoint],
             expectedSnapshotHeight: 100,
             layout: layout,
-            pirResolver: PirSnapshotResolver(probe: RejectingProbe()),
-            proveEntry: { _, _, _, _ in
-                XCTFail("Persisted proof must not enter the prover again")
-                throw VotingRustBackendError.invalidData("unexpected proof entry")
-            }
+            execution: VotingDelegationExecution(
+                pirResolver: PirSnapshotResolver(probe: RejectingProbe()),
+                proveEntry: { _, _, _, _ in
+                    XCTFail("Persisted proof must not enter the prover again")
+                    throw VotingRustBackendError.invalidData("unexpected proof entry")
+                }
+            )
         )
         let result = try await operation.result(intent: .speculative)
         XCTAssertEqual(result.proof, [1, 2, 3])
         XCTAssertEqual(result.publicInputs.count, 14)
         XCTAssertEqual(result.nfSigned, [UInt8](repeating: 0, count: 32))
         await backend.cancelDelegationOperationsAndWait()
+    }
+
+    func testRetryKeepsFailedProgressCallbackOwnedUntilBackendDrain() async throws {
+        let backend = try makeBackend()
+        let callbackEntered = DispatchSemaphore(value: 0)
+        let callbackRelease = DispatchSemaphore(value: 0)
+        let callbackFinished = LockedCounter()
+        let failed = try await backend.delegationOperation(
+            params: makeParams(),
+            pirEndpoints: [endpoint],
+            expectedSnapshotHeight: 100,
+            layout: layout,
+            execution: VotingDelegationExecution(
+                pirResolver: PirSnapshotResolver(probe: MatchingProbe()),
+                proveEntry: { _, _, _, _ in
+                    callbackEntered.wait()
+                    throw VotingRustBackendError.invalidData("fixture failure")
+                }
+            )
+        )
+        do {
+            _ = try await failed.result(intent: .speculative) { _ in
+                callbackEntered.signal()
+                callbackRelease.wait()
+                callbackFinished.increment()
+            }
+            XCTFail("Fixture must fail after progress starts")
+        } catch {
+            XCTAssertEqual(error as? VotingRustBackendError, .invalidData("fixture failure"))
+        }
+        let retryProof = ProofGate(result: makeResult())
+        let retry = try await makeOperation(backend, proof: retryProof)
+        XCTAssertFalse(retry === failed)
+        let waiter = Task { try await retry.result(intent: .speculative) }
+        await fulfillment(of: [retryProof.entered], timeout: 5)
+        let drained = LockedCounter()
+        let drain = Task {
+            await backend.cancelDelegationOperationsAndWait()
+            XCTAssertEqual(callbackFinished.value, 1)
+            drained.increment()
+        }
+        assertCancelled(await waiter.result)
+        // Inspect the actual teardown ownership after the public drain has fenced admissions.
+        // This also makes the missing-retirement failure deterministic without a timed wait.
+        let joined = backend.delegationRegistry.beginMutation()
+        XCTAssertTrue(joined.contains { $0 === failed })
+        XCTAssertEqual(drained.value, 0)
+        retryProof.release.signal()
+        callbackRelease.signal()
+        await drain.value
+        backend.delegationRegistry.endMutation()
+        XCTAssertEqual(callbackFinished.value, 1)
+        XCTAssertEqual(drained.value, 1)
+    }
+
+    func testCloseJoinsIdentityReaderAndRejectsStaleAdmissionBeforeFileRecreation() async throws {
+        let backend = try makeBackend()
+        let path = try XCTUnwrap(paths.last)
+        let scope = try backend.delegationRegistry.scope()
+        let params = try makeParams()
+        let fixture = makeResult()
+        let endpoint = endpoint
+        let layout = layout
+        let readerEntered = expectation(description: "native identity reader entered")
+        let readerRelease = DispatchSemaphore(value: 0)
+        let readerFinished = LockedCounter()
+        let admission = Task.detached {
+            try backend.delegationRegistry.operation(scope: scope) { reader in
+                readerEntered.fulfill()
+                readerRelease.wait()
+                let sighash = try reader.getStoredPcztSighash(roundId: params.roundId, bundleIndex: params.bundleIndex)
+                let identity = try VotingDelegationIdentity(params: params, endpoints: [endpoint], height: 100, layout: layout, sighash: sighash)
+                readerFinished.increment()
+                return identity
+            } make: {
+                VotingDelegationOperation { _ in fixture }
+            }
+        }
+        await fulfillment(of: [readerEntered], timeout: 5)
+        let closeStarted = expectation(description: "close requested during identity read")
+        let close = Task.detached {
+            closeStarted.fulfill()
+            backend.close()
+            XCTAssertEqual(readerFinished.value, 1)
+        }
+        await fulfillment(of: [closeStarted], timeout: 5)
+        readerRelease.signal()
+        let operation = try await admission.value
+        await close.value
+        await backend.cancelDelegationOperationsAndWait()
+        try FileManager.default.removeItem(atPath: path)
+        XCTAssertThrowsError(
+            try backend.delegationRegistry.operation(scope: scope) { _ in
+                XCTFail("A stale admission must not open a native reader after cleanup")
+                return try VotingDelegationIdentity(params: params, endpoints: [endpoint], height: 100, layout: layout, sighash: [])
+            } make: {
+                VotingDelegationOperation { _ in fixture }
+            }
+        ) { XCTAssertTrue($0 is CancellationError) }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: path))
+        let waiter = Task { try await operation.result(intent: .speculative) }
+        assertCancelled(await waiter.result)
     }
 
     private struct RejectingProbe: PirSnapshotProbing {
@@ -500,12 +612,14 @@ final class VotingDelegationOperationTests: XCTestCase {
         var database: OpaquePointer?
         XCTAssertEqual(sqlite3_open(path, &database), SQLITE_OK)
         defer { sqlite3_close(database) }
+        XCTAssertEqual(sqlite3_exec(database, "DELETE FROM bundles", nil, nil, nil), SQLITE_OK)
+        _ = try backend.setupBundles(roundId: round, notes: [note])
         // With the fixture's zero alpha, rk is the FVK's encoded spend-validating key.
         let rk = fvk.prefix(32).map { String(format: "%02x", $0) }.joined()
         let commitment = van.map { String(format: "%02x", $0) }.joined()
         let effects = "01\(String(repeating: "00", count: 820))"
         let sql = """
-            UPDATE bundles SET note_positions_blob = zeroblob(8), alpha = zeroblob(32), rk = X'\(rk)',
+            UPDATE bundles SET pczt_sighash = zeroblob(32), alpha = zeroblob(32), rk = X'\(rk)',
                 nf_signed = zeroblob(32), cmx_new = zeroblob(32), gov_comm = X'\(commitment)',
                 gov_nullifiers_blob = zeroblob(160), tx1_effects = X'\(effects)',
                 van_comm_rand = zeroblob(32), total_note_value = 13000000, address_index = 0
@@ -538,8 +652,10 @@ final class VotingDelegationOperationTests: XCTestCase {
             pirEndpoints: [endpoint],
             expectedSnapshotHeight: 100,
             layout: layout,
-            pirResolver: PirSnapshotResolver(probe: MatchingProbe()),
-            proveEntry: proof.prove
+            execution: VotingDelegationExecution(
+                pirResolver: PirSnapshotResolver(probe: MatchingProbe()),
+                proveEntry: proof.prove
+            )
         )
     }
 

@@ -28,6 +28,12 @@ return the same object. Identity includes the wallet, database, network, round, 
 bundle, stored PCZT sighash and every proof/PIR input. A completed persisted proof is
 validated against the supplied inputs and reused before any PIR request.
 
+Reuse requires persisted full note identities and an exact match of every Orchard
+viewing-key component. Legacy or imported completed bundles that contain only note
+positions cannot establish this binding and return an error. They are never treated
+as missing proofs or automatically reproved. Existing direct proving and recovery
+APIs keep their behavior.
+
 Cancelling `preparation` only detaches that waiter. Native proving cannot be interrupted,
 and the producer retains its backend until it actually returns. To abandon all work
 before clearing a round, changing accounts or reopening the database:

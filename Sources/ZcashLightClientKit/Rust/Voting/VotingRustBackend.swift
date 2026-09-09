@@ -2045,25 +2045,22 @@ extension VotingRustBackend {
     ) async throws -> VotingDelegationProofResult {
         try await resolveAndProveDelegation(
             params,
-            pirEndpoints: pirEndpoints,
-            expectedSnapshotHeight: expectedSnapshotHeight,
-            pirLayout: pirLayout,
-            pirResolver: pirResolver,
+            context: VotingDelegationProvingContext(
+                endpoints: pirEndpoints,
+                snapshotHeight: expectedSnapshotHeight,
+                layout: pirLayout,
+                execution: VotingDelegationExecution(pirResolver: pirResolver, proveEntry: proveEntry)
+            ),
             progress: progress,
-            operation: nil,
-            proveEntry: proveEntry
+            operation: nil
         )
     }
 
     func resolveAndProveDelegation(
         _ params: VotingDelegationProofParams,
-        pirEndpoints: [String],
-        expectedSnapshotHeight: UInt64,
-        pirLayout: VotingPirLayout,
-        pirResolver: PirSnapshotResolver,
+        context: VotingDelegationProvingContext,
         progress: (@Sendable (Double) -> Void)?,
-        operation: VotingDelegationOperation?,
-        proveEntry: @escaping VotingDelegationProveEntry
+        operation: VotingDelegationOperation?
     ) async throws -> VotingDelegationProofResult {
         try requireOpenDatabase()
 
@@ -2073,9 +2070,12 @@ extension VotingRustBackend {
             )
         }
 
-        let pirServerUrl = try await pirResolver.resolve(
-            endpoints: pirEndpoints,
-            expectedSnapshotHeight: BlockHeight(expectedSnapshotHeight)
+        guard let proveEntry = context.execution.proveEntry else {
+            throw VotingRustBackendError.invalidData("Delegation proving entry is unavailable")
+        }
+        let pirServerUrl = try await context.execution.pirResolver.resolve(
+            endpoints: context.endpoints,
+            expectedSnapshotHeight: BlockHeight(context.snapshotHeight)
         )
 
         // `resolve` above already refuses to return a match once cancelled, but a cancellation
@@ -2101,11 +2101,11 @@ extension VotingRustBackend {
                 if let operation {
                     try operation.beginProof()
                     defer { operation.endProof() }
-                    return try proveEntry(params, pirServerUrl, pirLayout, progress)
+                    return try proveEntry(params, pirServerUrl, context.layout, progress)
                 }
                 Self.beginInteractiveProvingBoost()
                 defer { Self.endInteractiveProvingBoost() }
-                return try proveEntry(params, pirServerUrl, pirLayout, progress)
+                return try proveEntry(params, pirServerUrl, context.layout, progress)
             }.value
         } onCancel: {
             cancellationFlag.markCancelled()
