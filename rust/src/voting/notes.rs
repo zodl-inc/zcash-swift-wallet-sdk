@@ -11,6 +11,39 @@ use super::db::VotingDatabaseHandle;
 use super::helpers::{bytes_from_ptr, json_to_boxed_slice, open_wallet_db, str_from_ptr};
 use super::json::JsonNoteInfo;
 
+// Only primitive encodings cross the ordinary-wallet and voting backend families.
+fn neutral_note_info<P: zcash_protocol::consensus::Parameters>(
+    note: &orchard::Note,
+    position: u64,
+    scope: zip32::Scope,
+    ufvk: &zcash_keys::keys::UnifiedFullViewingKey,
+    network: &P,
+) -> anyhow::Result<JsonNoteInfo> {
+    use orchard::note::{ExtractedNoteCommitment, NoteVersion};
+    if note.version() != NoteVersion::V3 {
+        return Err(anyhow!("voting requires Ironwood/V3 notes"));
+    }
+    let fvk = ufvk
+        .orchard()
+        .ok_or_else(|| anyhow!("voting requires an Orchard viewing key"))?;
+    Ok(JsonNoteInfo {
+        commitment: ExtractedNoteCommitment::from(note.commitment())
+            .to_bytes()
+            .to_vec(),
+        nullifier: note.nullifier(fvk).to_bytes().to_vec(),
+        value: note.value().inner(),
+        position,
+        diversifier: note.recipient().diversifier().as_array().to_vec(),
+        rho: note.rho().to_bytes().to_vec(),
+        rseed: note.rseed().as_bytes().to_vec(),
+        scope: match scope {
+            zip32::Scope::External => 0,
+            zip32::Scope::Internal => 1,
+        },
+        ufvk_str: ufvk.encode(network),
+    })
+}
+
 // =============================================================================
 // VotingDatabase methods — Wallet notes
 // =============================================================================
@@ -98,7 +131,7 @@ pub unsafe extern "C" fn zcashlc_voting_get_wallet_notes(
         let network = wallet_db.params();
         let mut json_notes = Vec::with_capacity(received_notes.len());
         for rn in &received_notes {
-            let note_info = zcash_voting::NoteInfo::from_orchard_note(
+            let note_info = neutral_note_info(
                 rn.note(),
                 u64::from(rn.note_commitment_tree_position()),
                 rn.spending_key_scope(),
@@ -115,6 +148,86 @@ pub unsafe extern "C" fn zcashlc_voting_get_wallet_notes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orchard::note::{ExtractedNoteCommitment, NoteVersion, Rho};
+    use orchard::value::NoteValue;
+    use rand::rngs::OsRng;
+    use zcash_keys::keys::UnifiedSpendingKey;
+    use zcash_protocol::consensus::TEST_NETWORK;
+    use zip32::{AccountId, Scope};
+    #[test]
+    fn from_orchard_note_populates_note_info() {
+        let seed = [0x42u8; 32];
+        let account = AccountId::try_from(0u32).unwrap();
+        let usk = UnifiedSpendingKey::from_seed(&TEST_NETWORK, &seed, account).unwrap();
+        let ufvk = usk.to_unified_full_viewing_key();
+        let fvk = ufvk.orchard().unwrap().clone();
+        let address = fvk.address_at(0u32, Scope::External);
+
+        let mut rng = OsRng;
+        let note = test_note(&fvk, address, NoteVersion::V3, &mut rng);
+
+        let note_info =
+            neutral_note_info(&note, 42, Scope::External, &ufvk, &TEST_NETWORK).unwrap();
+        let commitment: ExtractedNoteCommitment = note.commitment().into();
+
+        assert_eq!(note_info.commitment, commitment.to_bytes().to_vec());
+        assert_eq!(
+            note_info.nullifier,
+            note.nullifier(&fvk).to_bytes().to_vec()
+        );
+        assert_eq!(note_info.value, 12_500_000);
+        assert_eq!(note_info.position, 42);
+        assert_eq!(
+            note_info.diversifier,
+            note.recipient().diversifier().as_array().to_vec()
+        );
+        assert_eq!(note_info.rho, note.rho().to_bytes().to_vec());
+        assert_eq!(note_info.rseed, note.rseed().as_bytes().to_vec());
+        assert_eq!(note_info.scope, 0);
+        assert_eq!(note_info.ufvk_str, ufvk.encode(&TEST_NETWORK));
+    }
+
+    #[test]
+    fn from_orchard_note_rejects_non_ironwood_notes() {
+        let seed = [0x42u8; 32];
+        let account = AccountId::try_from(0u32).unwrap();
+        let usk = UnifiedSpendingKey::from_seed(&TEST_NETWORK, &seed, account).unwrap();
+        let ufvk = usk.to_unified_full_viewing_key();
+        let fvk = ufvk.orchard().unwrap().clone();
+        let address = fvk.address_at(0u32, Scope::External);
+
+        let mut rng = OsRng;
+        let note = test_note(&fvk, address, NoteVersion::V2, &mut rng);
+
+        let err = neutral_note_info(&note, 42, Scope::External, &ufvk, &TEST_NETWORK)
+            .expect_err("Orchard/V2 notes are not eligible for voting");
+
+        assert!(
+            err.to_string().contains("requires Ironwood/V3 notes"),
+            "{err}"
+        );
+    }
+
+    fn test_note(
+        _fvk: &orchard::keys::FullViewingKey,
+        address: orchard::Address,
+        version: NoteVersion,
+        _rng: &mut OsRng,
+    ) -> orchard::Note {
+        let mut rho_bytes = [0u8; 32];
+        rho_bytes[0] = 1;
+        let rho = Rho::from_bytes(&rho_bytes).unwrap();
+        let rseed = orchard::note::RandomSeed::from_bytes([0x42; 32], &rho).unwrap();
+        orchard::Note::from_parts(
+            address,
+            NoteValue::from_raw(12_500_000),
+            rho,
+            rseed,
+            version,
+        )
+        .unwrap()
+    }
+
     use crate::NETWORK_ID_MAINNET;
     use crate::voting::db::{zcashlc_voting_db_free, zcashlc_voting_db_open};
 

@@ -72,6 +72,11 @@ public actor TorClient {
         return runtimePtr
     }
 
+    /// Clone native Tor ownership into the helper context before this actor can close it.
+    func makeVotingHelperClient(for backend: VotingRustBackend) throws -> VotingHelperClient {
+        try backend.makeHelperClient(torRuntime: resolveRuntime())
+    }
+
     public func isolatedClient() throws -> TorClient {
         let runtime = try resolveRuntime()
 

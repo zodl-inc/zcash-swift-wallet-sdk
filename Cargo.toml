@@ -9,7 +9,7 @@ authors = [
 ]
 license = "AGPL-3.0-only"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.91"
 build = "rust/build.rs"
 
 [dependencies]
@@ -103,7 +103,7 @@ rust_decimal = { version = "1", default-features = false, features = ["c-repr"] 
 xz2 = { version = "0.1", features = ["static"] }
 
 # Zcash voting
-zcash_voting = { version = "=3.0.0" }
+zcash_voting = { version = "=3.1.0" }
 zeroize = "1"
 
 # Used by the pool-migration engine as well as by voting.
@@ -127,6 +127,8 @@ hex = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+zcash_voting = { version = "=3.1.0", features = ["test-fixtures"] }
+tokio = { version = "1", features = ["test-util"] }
 
 [build-dependencies]
 bindgen = "0.72"

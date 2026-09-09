@@ -8,6 +8,35 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `zcashlc_voting_helper_create(db, tor)` creates a wallet/path/network-scoped helper
+  handle. A null Tor pointer explicitly selects direct transport; a non-null pointer
+  is cloned during this call and never falls back to direct. The primary voting handle
+  can subsequently close or switch wallets without changing the helper's scope.
+- `zcashlc_voting_helper_acquire` returns an operation lease retained until
+  `zcashlc_voting_helper_operation_free`. `zcashlc_voting_helper_execute` accepts a UTF-8
+  JSON request with an `operation` tag: `preflight`, `set_intents`, `intents`, `prepare`,
+  `submit`, `confirm`, or `track`. It returns a boxed JSON lifecycle report (free with
+  `zcashlc_free_boxed_slice`), or null on error. Prepare persists placement before vote
+  confirmation; submit recovers the freshly confirmed position. Reports retain accepted,
+  ambiguous, pending and unrecoverable state and the next tracking delay; raw helper
+  payloads are not returned. See `../MIGRATING.md` for required ballot/confirmation ordering.
+- `zcashlc_voting_helper_cancel` cancels the helper and fences future acquisitions;
+  `zcashlc_voting_helper_operation_cancel` signals one lease. Neither proves native return.
+  Join each executing call and free its lease before destructive database cleanup.
+  `zcashlc_voting_helper_free` releases the root handle and signals cancellation; active
+  leases retain ownership until freed after execution.
+- `zcashlc_voting_validate_round_id` validates UTF-8 round bytes using the native canonical
+  lowercase 32-byte field-element decoder and returns a boolean. Validate once when
+  converting a consumer's round identifier.
+- JSON returned by `zcashlc_voting_get_share_delegations` and
+  `zcashlc_voting_get_unconfirmed_delegations` now also includes `attempting_urls`,
+  `ambiguous_urls` and `target_count`. `sent_to_urls` alone records definite acknowledgements.
+  Attempting/ambiguous helpers have unknown outcomes and do not count toward placement;
+  native tracking owns their early exclusion and overdue duplicate-safe retry. Target
+  zero marks legacy records whose target native tracking derives. Consumers must not
+  infer successful initial delivery from a row's presence. Existing fields remain intact.
+
+
 - `zcashlc_voting_restore_recovered_delegation` restores a delegation whose `van_comm_rand`
   was lost locally. It takes one JSON request plus the hotkey secret as raw bytes, builds a
   `DelegationCapabilityV1` for the handle's own hotkey, refuses unless the round holds no
@@ -264,6 +293,21 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that bundle's delegation setup.
 
 ### Changed
+
+- Building this FFI now requires Rust 1.91 or newer. Upgrade older toolchains for
+  `zcash_voting` 3.1.0 / `voting-circuits` 0.11.2 with the default Zakura backend.
+  Opening the voting database upgrades schema 13 to 17, which older voting cores
+  cannot reopen. Existing bundles and full voting weight are preserved; new helper
+  preparation requires durable terminal decisions for the complete proposal roster.
+- `zcashlc_voting_clear_recovery_state`, `zcashlc_voting_record_share_delegation`,
+  `zcashlc_voting_mark_share_confirmed` and `zcashlc_voting_add_sent_servers` are removed;
+  consumers calling them will no longer compile/link. Replace their custom journal
+  writes with `zcashlc_voting_helper_execute` preparation, submission, confirmation and
+  tracking operations. Persist confirmed vote position and replacement authority before
+  submission, and join cancelled operations before destructive cleanup. The existing
+  recovery-package requirement to cover every stored bundle, including no-hash rows,
+  remains in force. See `../MIGRATING.md` for migration ordering and legacy recovery.
+
 
 - `zcashlc_slipstream_snapshot` reports `tip_fresh = 1` only once the run that refreshed the
   chain tip has also completed a ChainTip-priority scan range (`spendable_hint = 1`) or reached

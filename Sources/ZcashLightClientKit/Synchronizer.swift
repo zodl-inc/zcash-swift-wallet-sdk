@@ -648,6 +648,11 @@ public protocol Synchronizer: AnyObject {
     ///    - retryLimit: How many times the request will be retried in case of failure
     func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse)
 
+    /// Create an independent voting helper client on the explicitly selected route.
+    /// Tor requires an available enabled client and never falls back to direct HTTP.
+    func makeVotingHelperClient(for backend: VotingRustBackend, route: VotingHelperRoute) async throws -> VotingHelperClient
+
+
     /// Performs an `sql` query on a database and returns some output as a string
     /// Use cautiously!
     /// The connection to the database is created in a read-only mode. it's a hard requirement.
@@ -1565,6 +1570,16 @@ private final class UnimplementedBroadcaster: Broadcaster {
 }
 
 public extension Synchronizer {
+    /// Alternate conformers must explicitly provide access to their Tor route.
+    func makeVotingHelperClient(for backend: VotingRustBackend, route: VotingHelperRoute) async throws -> VotingHelperClient {
+        switch route {
+        case .direct:
+            return try await backend.makeHelperClient(transport: .direct)
+        case .tor:
+            throw ZcashError.torClientUnavailable
+        }
+    }
+
     /// Alternate synchronizer implementations that do not provide a durable local snapshot remain
     /// source-compatible and report that the capability is unavailable.
     func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance]? {
@@ -1796,6 +1811,16 @@ public extension Synchronizer {
 }
 
 public extension ClosureSynchronizer {
+    /// Alternate conformers support direct helpers and explicitly reject unavailable Tor ownership.
+    func makeVotingHelperClient(for backend: VotingRustBackend, route: VotingHelperRoute, completion: @escaping (Result<VotingHelperClient, Error>) -> Void) {
+        AsyncToClosureGateway.executeThrowingAction(completion) {
+            switch route {
+            case .direct: return try await backend.makeHelperClient(transport: .direct)
+            case .tor: throw ZcashError.torClientUnavailable
+            }
+        }
+    }
+
     /// Default implementation so adding `broadcaster` to the protocol is not a
     /// source-breaking change for downstream conformers. Conformers with broadcast
     /// support override this; mocks, stubs, and alternate transports can fall
@@ -1817,6 +1842,16 @@ public extension ClosureSynchronizer {
 }
 
 public extension CombineSynchronizer {
+    /// Alternate conformers support direct helpers and explicitly reject unavailable Tor ownership.
+    func makeVotingHelperClient(for backend: VotingRustBackend, route: VotingHelperRoute) -> SinglePublisher<VotingHelperClient, Error> {
+        AsyncToCombineGateway.executeThrowingAction {
+            switch route {
+            case .direct: return try await backend.makeHelperClient(transport: .direct)
+            case .tor: throw ZcashError.torClientUnavailable
+            }
+        }
+    }
+
     /// Default implementation so adding `broadcaster` to the protocol is not a
     /// source-breaking change for downstream conformers. Conformers with broadcast
     /// support override this; mocks, stubs, and alternate transports can fall

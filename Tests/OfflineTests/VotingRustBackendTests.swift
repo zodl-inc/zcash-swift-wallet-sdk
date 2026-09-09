@@ -1111,64 +1111,7 @@ final class VotingRustBackendTests: XCTestCase {
         XCTAssertTrue(try backend.getKeystoneSignatures(roundId: missingRoundId).isEmpty)
     }
 
-    func test_clearRecoveryState_isNoop_onMissingRound() throws {
-        let backend = try makeReadyBackend()
-        defer { backend.close() }
-
-        XCTAssertNoThrow(try backend.clearRecoveryState(roundId: missingRoundId))
-    }
-
     // MARK: - Share delegation tracking
-
-    // The former `test_shareDelegationLifecycle_roundTripsHexNullifier` and
-    // `test_recordShareDelegation_rejectsInvalidNullifierLength` are gone: the
-    // share nullifier is no longer a caller-supplied argument. `zcash_voting`
-    // derives it from the committed vote's recovery bundle, so recording a share
-    // now requires a real `vote::commit` and its proof — too expensive for a unit
-    // test. Only the missing-vote rejection below remains observable offline.
-
-    func test_recordShareDelegation_throwsRustError_whenVoteNotCommitted() throws {
-        let backend = try makeReadyBackend()
-        defer { backend.close() }
-
-        try createRoundWithBundle(backend, roundId: roundTripRoundId)
-
-        XCTAssertThrowsError(
-            try backend.recordShareDelegation(
-                roundId: roundTripRoundId,
-                bundleIndex: roundTripBundleIndex,
-                proposalId: roundTripProposalId,
-                shareIndex: roundTripShareIndex,
-                sentToURLs: [roundTripHelperURL],
-                submitAt: roundTripSubmitAt
-            )
-        ) { error in
-            guard case VotingRustBackendError.rustError(let message) = error else {
-                XCTFail("expected .rustError, got \(error.localizedDescription)")
-                return
-            }
-            XCTAssertTrue(message.contains("share::record failed"), "unexpected message: \(message)")
-        }
-    }
-
-    func test_recordShareDelegation_beforeOpen_throwsDatabaseNotOpen() {
-        let backend = VotingRustBackend()
-        XCTAssertThrowsError(
-            try backend.recordShareDelegation(
-                roundId: hexRoundId(0x31),
-                bundleIndex: 0,
-                proposalId: 0,
-                shareIndex: 0,
-                sentToURLs: [roundTripHelperURL],
-                submitAt: 0
-            )
-        ) { error in
-            guard case VotingRustBackendError.databaseNotOpen = error else {
-                XCTFail("expected .databaseNotOpen, got \(error.localizedDescription)")
-                return
-            }
-        }
-    }
 
     func test_getShareDelegations_returnsEmpty_forUnknownRound() throws {
         let backend = try makeReadyBackend()

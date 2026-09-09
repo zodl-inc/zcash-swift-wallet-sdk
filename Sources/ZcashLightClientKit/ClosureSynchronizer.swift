@@ -205,6 +205,8 @@ public protocol ClosureSynchronizer {
 
     func estimateBirthdayHeight(for date: Date, completion: @escaping (BlockHeight) -> Void)
 
+    func makeVotingHelperClient(for backend: VotingRustBackend, route: VotingHelperRoute, completion: @escaping (Result<VotingHelperClient, Error>) -> Void)
+
     func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8, completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void)
 
     var broadcaster: Broadcaster { get }

@@ -8,6 +8,22 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Added
 
+### Voting helper lifecycle
+
+- Add wallet-scoped `VotingHelperClient`, `VotingRoundID`, typed ballot decisions and
+  helper reports, and `Synchronizer.makeVotingHelperClient(for:route:)` (also on closure
+  and Combine adapters). Use `setBallotIntents`/`ballotIntents` for durable choices,
+  `preflightFleet`/`prepareShareDelivery` before vote confirmation, then
+  `submitPreparedShares`, `confirmPendingShare` and `trackPendingShares` for delivery
+  and recovery. Reports distinguish accepted and unknown outcomes and expose the next
+  tracking delay. Helper HTTP work can overlap later primary voting work.
+  `cancelAndWait()` fences new operations and joins active work before destructive reset.
+- `VotingShareDelegation` now preserves `attemptingURLs`, `ambiguousURLs` and
+  `targetCount`; a journal row alone does not prove delivery. Older encoded records
+  decode with empty new URL arrays and target zero. Existing call sites need no edit
+  unless they inferred successful delivery from row presence; use definite acceptance
+  and the native helper reports instead. See `MIGRATING.md` for lifecycle ordering.
+
 ### Spendable balance masking
 
 - `SynchronizerState.isSpendableMasked` reports whether the spendable balance in `accountsBalances`
@@ -61,6 +77,19 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without submit-plan bookkeeping keep compiling unchanged.
 
 ## Changed
+
+- Rust source builds now require Rust 1.91 or newer after the upgrade to
+  `zcash_voting` 3.1.0 and `voting-circuits` 0.11.2 with the default Zakura backend.
+  Update older toolchains before rebuilding the FFI. Opening a voting database migrates
+  schema 13 to 17; older voting cores cannot reopen it. Existing five-note bundles and
+  their full voting weight are preserved. New helper preparation requires durable
+  terminal ballot decisions for the complete proposal roster; missing choices are not skips.
+- `VotingRustBackend.clearRecoveryState`, `recordShareDelegation`, `markShareConfirmed`
+  and `addSentServers` are removed; calls no longer compile. Replace custom journal
+  mutation with `VotingHelperClient` preparation, submission, confirmation and tracking.
+  Follow `MIGRATING.md` for confirmation/VAN persistence, partial intent-write handling
+  and cancellation before destructive cleanup.
+
 
 - `SlipstreamSynchronizer.importAccount`, `deleteAccount`, `switchTo(endpoint:)` and
   `restartSync(at:)` now throw `ZcashError.slipstreamEngineNotQuiescent` (`ZRUST0155`), and

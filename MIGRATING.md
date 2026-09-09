@@ -1,5 +1,74 @@
 # Migrating from previous versions to _Unreleased_
 
+## Voting 3.1: native helper ownership and durable ballot decisions
+
+Source FFI builds require Rust 1.91 or newer. The voting database migrates from schema 13
+to 17 when opened. Back up before upgrading: older voting cores cannot reopen the migrated
+schema. Existing proof, PIR, PCZT, replacement authority note and helper recovery records
+remain durable. Ordinary wallet storage and signing keep their existing backend.
+
+Create a helper from the prepared voting backend and the selected synchronizer route:
+
+```swift
+let helper = try await synchronizer.makeVotingHelperClient(for: votingBackend, route: .tor)
+let roundID = try VotingRoundID(validating: roundString)
+```
+
+The factory captures the current wallet identity, database path and network. Retain one
+helper for that scope. Switching the primary backend's wallet or closing it does not change
+an existing helper. A requested unavailable Tor route throws; it never selects direct
+transport. Custom synchronizers have a default direct factory and must supply their own
+Tor ownership to support that route.
+
+For each complete confirmed ballot, persist `VotingBallotIntent` values with
+`setBallotIntents(roundID:intents:)` before creating new commitments. Include preserved
+prior choices and only user-acknowledged skipped proposals. Writes are individually atomic:
+a later native conflict can leave earlier decisions persisted. Read back with
+`ballotIntents(roundID:)` and finish the entire setter successfully before commitment or
+helper dispatch. Missing decisions never mean skipped; native submitted/unknown evidence
+cannot be overridden.
+
+Use this order for each new commitment:
+
+1. Commit the vote locally and preflight the configured helper fleet.
+2. Call `prepareShareDelivery(identity:fleet:configuration:now:)` before broadcasting the
+   vote commitment. Preparation requires the complete proposal roster and known end time;
+   a nil `lastMomentBuffer` uses native policy. It persists the entire native placement plan.
+3. Confirm the vote commitment and persist its position and replacement authority note
+   before advancing to the next proposal.
+4. Call `submitPreparedShares(delivery:configuration:now:)`. Native code recovers the fresh
+   committed vote with its confirmed position and uses the already persisted plan.
+
+Times are Unix seconds. Use `confirmPendingShare` for a focused check and
+`trackPendingShares` for recovery; schedule the next tracking pass from `nextDelaySeconds`.
+Reports distinguish accepted, ambiguous, resubmitted, confirmed and unrecoverable results.
+An ambiguous helper attempt must not be treated as rejected. Native early replenishment
+excludes unknown helpers; only its overdue duplicate-safe recovery policy may retry them.
+Native tracking can resume legacy accepted/unknown deliveries without inventing ballot
+intents. New preparation still requires complete durable decisions; recovery must not
+manufacture skips to make that requirement pass.
+
+Before deleting/replacing a voting database or discarding its account scope, await
+`helper.cancelAndWait()`. It permanently rejects new calls, signals cancellation and waits
+for actual native return, including any in-flight POST. Cancelling a Swift task signals its
+operation but is not proof that its native lease has returned.
+
+`VotingShareDelegation` readers now preserve `attemptingURLs`, `ambiguousURLs` and
+`targetCount`. `sentToURLs` means definite acknowledgement. Attempting URLs were journaled
+before POST and have not reached a definite outcome; after restart they are unknown.
+Ambiguous URLs also do not count toward definite placement. The native tracker excludes
+both during early replenishment and owns any overdue duplicate-safe retry. A zero target
+identifies legacy records whose canonical target is derived by native tracking. A row's
+presence alone never means initial delivery succeeded. Older encoded records decode with
+empty new URL arrays and target zero.
+
+Remove calls to `VotingRustBackend.clearRecoveryState`, `recordShareDelegation`,
+`markShareConfirmed` and `addSentServers` (and the matching `zcashlc_voting_*` functions).
+Their replacements are the supported lifecycle methods above; do not recreate journal
+writes in application SQL. Recovery package completeness still covers every stored bundle,
+including rows without a delegation transaction hash.
+
+
 ## `ZIP318Kind` gained a case — `canonicalCrossingPayment`
 
 `ZcashTransaction.Overview.ZIP318Kind`, the type of `zip318Kind`, has a fifth case,

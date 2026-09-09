@@ -362,39 +362,6 @@ pub unsafe extern "C" fn zcashlc_voting_clear_keystone_signature(
     unwrap_exc_or(res, -1)
 }
 
-/// Clear retryable recovery state for a round without erasing recorded
-/// confirmations.
-///
-/// Share-delegation rows and Keystone signatures are always removed. Since
-/// `zcash_voting` 3.0 the clear is conservative about confirmed state:
-/// delegation tx hashes survive on bundles with a recorded VAN leaf position
-/// (and on capability-imported bundles), and votes with a recorded
-/// `vc_tree_position` keep their tx hash, commitment bundle, and position.
-///
-/// # Safety
-///
-/// - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
-/// - `round_id` must be a valid UTF-8 pointer with its stated length.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_voting_clear_recovery_state(
-    db: *mut VotingDatabaseHandle,
-    round_id: *const u8,
-    round_id_len: usize,
-) -> i32 {
-    let db = AssertUnwindSafe(db);
-    let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        handle
-            .db
-            .clear_recovery_state(&round_id_str)
-            .map_err(|e| anyhow!("clear_recovery_state failed: {}", e))?;
-        Ok(0)
-    });
-    unwrap_exc_or(res, -1)
-}
-
 /// Drops the round's cached vote tree and clears locally prepared unsigned
 /// delegation setup fields so an interrupted Keystone signing request can be
 /// rebuilt. Bundles that already have a Keystone signature, a stored
@@ -448,7 +415,6 @@ mod tests {
     use crate::voting::delegation::{
         zcashlc_voting_get_bundle_count, zcashlc_voting_store_van_position,
     };
-    use crate::voting::share_tracking::zcashlc_voting_get_share_delegations;
     use crate::voting::test_helpers::{
         TEST_ROUND_ID, call_get_sighash, insert_round_and_bundle, open_memory_db,
         plant_signing_request,
@@ -771,170 +737,10 @@ mod tests {
 
     /// Stores the delegation tx hash, vote tx hash, and a Keystone signature
     /// that the clear-recovery tests start from.
-    fn store_recovery_fixture(db: *mut VotingDatabaseHandle, round_id: &[u8]) {
-        let delegation_tx = b"delegation-tx";
-        assert_eq!(
-            unsafe {
-                zcashlc_voting_store_delegation_tx_hash(
-                    db,
-                    round_id.as_ptr(),
-                    round_id.len(),
-                    0,
-                    delegation_tx.as_ptr(),
-                    delegation_tx.len(),
-                )
-            },
-            0
-        );
-
-        let vote_tx = b"vote-tx";
-        assert_eq!(
-            unsafe {
-                zcashlc_voting_store_vote_tx_hash(
-                    db,
-                    round_id.as_ptr(),
-                    round_id.len(),
-                    0,
-                    0,
-                    vote_tx.as_ptr(),
-                    vote_tx.len(),
-                )
-            },
-            0
-        );
-
-        let sig = [1u8; KEYSTONE_SIGNATURE_LEN];
-        let sighash = [2u8; PCZT_SIGHASH_LEN];
-        let rk = [3u8; RANDOMIZED_KEY_LEN];
-        assert_eq!(
-            unsafe {
-                zcashlc_voting_store_keystone_signature(
-                    db,
-                    round_id.as_ptr(),
-                    round_id.len(),
-                    0,
-                    sig.as_ptr(),
-                    sig.len(),
-                    sighash.as_ptr(),
-                    sighash.len(),
-                    rk.as_ptr(),
-                    rk.len(),
-                )
-            },
-            0
-        );
-
-        // Share delegations are deliberately absent from this fixture:
-        // `zcashlc_voting_record_share_delegation` now derives the share
-        // nullifier from the persisted vote recovery bundle, which only a real
-        // `vote::commit` can write. The clear is still asserted to leave no
-        // share rows behind.
-    }
-
-    #[test]
-    fn clear_recovery_state_removes_unconfirmed_recovery_data() {
-        let db = open_memory_db();
-        let round_id = b"round";
-        insert_round_and_bundle(db, "round");
-        insert_vote(db, "round");
-        store_recovery_fixture(db, round_id);
-
-        assert_eq!(
-            unsafe { zcashlc_voting_clear_recovery_state(db, round_id.as_ptr(), round_id.len()) },
-            0
-        );
-
-        let delegation_tx: Option<String> = decode_boxed_json(unsafe {
-            zcashlc_voting_get_delegation_tx_hash(db, round_id.as_ptr(), round_id.len(), 0)
-        });
-        assert_eq!(delegation_tx, None);
-
-        let vote_tx: Option<String> = decode_boxed_json(unsafe {
-            zcashlc_voting_get_vote_tx_hash(db, round_id.as_ptr(), round_id.len(), 0, 0)
-        });
-        assert_eq!(vote_tx, None);
-
-        // No position was recorded before the clear, so the vote row survives
-        // with its recovery columns reset and accepts a fresh recording.
-        assert_eq!(
-            unsafe {
-                zcashlc_voting_record_vc_position(db, round_id.as_ptr(), round_id.len(), 0, 0, 43)
-            },
-            0
-        );
-
-        let keystone_sigs: Vec<serde_json::Value> = decode_boxed_json(unsafe {
-            zcashlc_voting_get_keystone_signatures(db, round_id.as_ptr(), round_id.len())
-        });
-        assert!(keystone_sigs.is_empty());
-
-        let share_delegations: Vec<serde_json::Value> = decode_boxed_json(unsafe {
-            zcashlc_voting_get_share_delegations(db, round_id.as_ptr(), round_id.len())
-        });
-        assert!(share_delegations.is_empty());
-
-        unsafe { zcashlc_voting_db_free(db) };
-    }
 
     /// Pins the conservative `zcash_voting` 3.0 clear semantics: a vote whose
     /// on-chain `vc_tree_position` is recorded is confirmed state, and the
     /// recovery clear must preserve it (rc.5 nulled it unconditionally).
-    #[test]
-    fn clear_recovery_state_preserves_recorded_vc_position() {
-        let db = open_memory_db();
-        let round_id = b"round";
-        insert_round_and_bundle(db, "round");
-        insert_vote(db, "round");
-        store_recovery_fixture(db, round_id);
-
-        assert_eq!(
-            unsafe {
-                zcashlc_voting_record_vc_position(db, round_id.as_ptr(), round_id.len(), 0, 0, 42)
-            },
-            0
-        );
-
-        assert_eq!(
-            unsafe { zcashlc_voting_clear_recovery_state(db, round_id.as_ptr(), round_id.len()) },
-            0
-        );
-
-        // The confirmed vote keeps its tx hash: the vote reset skips rows with
-        // a recorded position.
-        let vote_tx: Option<String> = decode_boxed_json(unsafe {
-            zcashlc_voting_get_vote_tx_hash(db, round_id.as_ptr(), round_id.len(), 0, 0)
-        });
-        assert_eq!(vote_tx.as_deref(), Some("vote-tx"));
-
-        // The recorded position survived: a conflicting recording is refused
-        // while re-recording the same position stays idempotent.
-        assert_eq!(
-            unsafe {
-                zcashlc_voting_record_vc_position(db, round_id.as_ptr(), round_id.len(), 0, 0, 43)
-            },
-            -1
-        );
-        assert_eq!(
-            unsafe {
-                zcashlc_voting_record_vc_position(db, round_id.as_ptr(), round_id.len(), 0, 0, 42)
-            },
-            0
-        );
-
-        // The unconfirmed delegation (no recorded VAN leaf position) is still
-        // cleared, and the unconditional lanes still empty out.
-        let delegation_tx: Option<String> = decode_boxed_json(unsafe {
-            zcashlc_voting_get_delegation_tx_hash(db, round_id.as_ptr(), round_id.len(), 0)
-        });
-        assert_eq!(delegation_tx, None);
-
-        let keystone_sigs: Vec<serde_json::Value> = decode_boxed_json(unsafe {
-            zcashlc_voting_get_keystone_signatures(db, round_id.as_ptr(), round_id.len())
-        });
-        assert!(keystone_sigs.is_empty());
-
-        unsafe { zcashlc_voting_db_free(db) };
-    }
 
     /// Round-trip proof that the reset actually clears the unsigned delegation
     /// setup: a planted signing request answers the sighash readback before the

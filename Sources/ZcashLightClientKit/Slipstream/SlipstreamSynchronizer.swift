@@ -2767,6 +2767,22 @@ public actor SlipstreamSynchronizer: Synchronizer {
         return await sdkFlags.torClientInitializationSuccessfullyDone
     }
 
+    public func makeVotingHelperClient(for backend: VotingRustBackend, route: VotingHelperRoute) async throws -> VotingHelperClient {
+        switch route {
+        case .direct:
+            return try await backend.makeHelperClient(transport: .direct)
+        case .tor:
+            let flags = initializer.container.resolve(SDKFlags.self)
+            let torEnabled = await flags.torEnabled
+            let exchangeRateEnabled = await flags.exchangeRateEnabled
+            guard torEnabled || exchangeRateEnabled else {
+                throw ZcashError.torNotEnabled
+            }
+            let torClient = initializer.container.resolve(TorClient.self)
+            return try await backend.makeHelperClient(transport: .tor(torClient))
+        }
+    }
+
     public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) {
         let sdkFlags = initializer.container.resolve(SDKFlags.self)
         let torEnabled = await sdkFlags.torEnabled

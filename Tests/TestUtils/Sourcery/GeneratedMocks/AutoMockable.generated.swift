@@ -2619,6 +2619,30 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - makeVotingHelperClient
+
+    var makeVotingHelperClientForRouteThrowableError: Error?
+    var makeVotingHelperClientForRouteCallsCount = 0
+    var makeVotingHelperClientForRouteCalled: Bool {
+        return makeVotingHelperClientForRouteCallsCount > 0
+    }
+    var makeVotingHelperClientForRouteReceivedArguments: (backend: VotingRustBackend, route: VotingHelperRoute)?
+    var makeVotingHelperClientForRouteReturnValue: VotingHelperClient!
+    var makeVotingHelperClientForRouteClosure: ((VotingRustBackend, VotingHelperRoute) async throws -> VotingHelperClient)?
+
+    func makeVotingHelperClient(for backend: VotingRustBackend, route: VotingHelperRoute) async throws -> VotingHelperClient {
+        if let error = makeVotingHelperClientForRouteThrowableError {
+            throw error
+        }
+        makeVotingHelperClientForRouteCallsCount += 1
+        makeVotingHelperClientForRouteReceivedArguments = (backend: backend, route: route)
+        if let closure = makeVotingHelperClientForRouteClosure {
+            return try await closure(backend, route)
+        } else {
+            return makeVotingHelperClientForRouteReturnValue
+        }
+    }
+
     // MARK: - debugDatabase
 
     var debugDatabaseSqlCallsCount = 0

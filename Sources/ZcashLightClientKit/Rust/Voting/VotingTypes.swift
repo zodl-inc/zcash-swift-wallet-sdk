@@ -203,17 +203,70 @@ public struct VotingWitnessData: Codable, Sendable {
 
 // MARK: - Share Delegation (JSON)
 
-/// Record of a share delegation sent to helper servers.
+/// Native helper journal state. Presence alone does not establish accepted delivery.
 public struct VotingShareDelegation: Codable, Equatable, Sendable {
     public let roundId: String
     public let bundleIndex: UInt32
     public let proposalId: UInt32
     public let shareIndex: UInt32
+    /// Helpers that definitely acknowledged the share.
     public let sentToURLs: [String]
+    /// POSTs journaled before dispatch whose outcome is not yet definite.
+    /// Native recovery treats these as unknown after restart.
+    public let attemptingURLs: [String]
+    /// Unknown outcomes do not count toward definite placement. Native tracking
+    /// excludes them during early replenishment and owns overdue duplicate-safe retry.
+    public let ambiguousURLs: [String]
+    /// Desired definite placements. Zero marks legacy records whose target native tracking derives.
+    public let targetCount: UInt32
     public let nullifier: String
     public let confirmed: Bool
     public let submitAt: UInt64
     public let createdAt: UInt64
+
+    public init(
+        roundId: String,
+        bundleIndex: UInt32,
+        proposalId: UInt32,
+        shareIndex: UInt32,
+        sentToURLs: [String],
+        nullifier: String,
+        confirmed: Bool,
+        submitAt: UInt64,
+        createdAt: UInt64,
+        attemptingURLs: [String] = [],
+        ambiguousURLs: [String] = [],
+        targetCount: UInt32 = 0
+    ) {
+        self.roundId = roundId
+        self.bundleIndex = bundleIndex
+        self.proposalId = proposalId
+        self.shareIndex = shareIndex
+        self.sentToURLs = sentToURLs
+        self.nullifier = nullifier
+        self.confirmed = confirmed
+        self.submitAt = submitAt
+        self.createdAt = createdAt
+        self.attemptingURLs = attemptingURLs
+        self.ambiguousURLs = ambiguousURLs
+        self.targetCount = targetCount
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        roundId = try container.decode(String.self, forKey: .roundId)
+        bundleIndex = try container.decode(UInt32.self, forKey: .bundleIndex)
+        proposalId = try container.decode(UInt32.self, forKey: .proposalId)
+        shareIndex = try container.decode(UInt32.self, forKey: .shareIndex)
+        sentToURLs = try container.decode([String].self, forKey: .sentToURLs)
+        nullifier = try container.decode(String.self, forKey: .nullifier)
+        confirmed = try container.decode(Bool.self, forKey: .confirmed)
+        submitAt = try container.decode(UInt64.self, forKey: .submitAt)
+        createdAt = try container.decode(UInt64.self, forKey: .createdAt)
+        attemptingURLs = try container.decodeIfPresent([String].self, forKey: .attemptingURLs) ?? []
+        ambiguousURLs = try container.decodeIfPresent([String].self, forKey: .ambiguousURLs) ?? []
+        targetCount = try container.decodeIfPresent(UInt32.self, forKey: .targetCount) ?? 0
+    }
 
     enum CodingKeys: String, CodingKey {
         case roundId = "round_id"
@@ -221,6 +274,9 @@ public struct VotingShareDelegation: Codable, Equatable, Sendable {
         case proposalId = "proposal_id"
         case shareIndex = "share_index"
         case sentToURLs = "sent_to_urls"
+        case attemptingURLs = "attempting_urls"
+        case ambiguousURLs = "ambiguous_urls"
+        case targetCount = "target_count"
         case nullifier
         case confirmed
         case submitAt = "submit_at"

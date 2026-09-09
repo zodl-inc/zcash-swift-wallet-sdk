@@ -307,6 +307,12 @@ extension ClosureSDKSynchronizer: ClosureSynchronizer {
         completion(height)
     }
 
+    public func makeVotingHelperClient(for backend: VotingRustBackend, route: VotingHelperRoute, completion: @escaping (Result<VotingHelperClient, Error>) -> Void) {
+        AsyncToClosureGateway.executeThrowingAction(completion) {
+            try await self.synchronizer.makeVotingHelperClient(for: backend, route: route)
+        }
+    }
+
     public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8, completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void) {
         AsyncToClosureGateway.executeThrowingAction(completion) {
             try await self.synchronizer.httpRequestOverTor(for: request, retryLimit: retryLimit)

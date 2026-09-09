@@ -1,4 +1,4 @@
-//! C FFI for the voting functionality, backed by upstream `zcash_voting` 1.0.
+//! C FFI for the voting functionality, backed by upstream `zcash_voting` 3.1.
 //!
 //! Implementation is split into submodules for navigation. Exported FFI functions
 //! keep their stable C symbols with `#[unsafe(no_mangle)]`. Entry points that the
@@ -12,6 +12,8 @@ mod constants;
 pub mod db;
 pub mod delegation;
 pub mod ffi_types;
+pub mod helper_client;
+mod helper_transport;
 pub mod helpers;
 pub mod json;
 pub mod notes;
@@ -25,3 +27,4 @@ pub(crate) mod test_helpers;
 pub mod tree;
 pub mod util;
 pub mod vote;
+mod witness;

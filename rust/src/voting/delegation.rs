@@ -2,9 +2,9 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use anyhow::anyhow;
-use ff::PrimeField;
 use ffi_helpers::panic::catch_panic;
-use pasta_curves::pallas;
+use zcash_voting::backend::pasta_curves::group::ff::PrimeField;
+use zcash_voting::backend::pasta_curves::pallas;
 use zcash_voting::{self as voting, zkp1};
 
 use crate::{unwrap_exc_or, unwrap_exc_or_null};
@@ -112,7 +112,11 @@ pub unsafe extern "C" fn zcashlc_voting_setup_bundles(
 
         let layout = handle
             .db
-            .ensure_bundles(&round_id_str, &core_notes)
+            .ensure_bundles_with_policy(
+                &round_id_str,
+                &core_notes,
+                voting::BundlePolicy::default().with_max_privacy_bundles(None),
+            )
             .map_err(|e| anyhow!("ensure_bundles failed: {}", e))?;
 
         Ok(Box::into_raw(Box::new(FfiBundleSetupResult {
@@ -318,29 +322,11 @@ pub unsafe extern "C" fn zcashlc_voting_generate_note_witnesses(
         };
         let core_notes: Vec<voting::NoteInfo> = json_notes.into_iter().map(Into::into).collect();
 
-        // `zcash_voting` owns shielded-protocol-aware witness generation and has
-        // since 2.0. It loads this round's cached `TreeState` and stored params,
-        // checks the wallet DB's network against the round's, resolves the
-        // shielded protocol for the snapshot height (Ironwood — the crate
-        // supports no other, and rejects a pre-NU6.3 snapshot outright), reads
-        // the **Ironwood** note-commitment tree out of the cached `TreeState`,
-        // binds that frontier to the round (same height, same `nc_root` — the
-        // check this SDK used to hand-roll), and generates the historical
-        // Ironwood Merkle paths from the wallet's own shard data.
-        //
-        // Do not re-hand-roll this against the Orchard tree. Voting notes live
-        // in the Ironwood pool — `notes.rs` already selects them with
-        // `get_unspent_ironwood_notes_at_historical_height` — so an Orchard root
-        // can never equal a round's `nc_root`, on any chain, against any server.
-        // That hand-rolled version is what `8a40d1f9` deleted and what the
-        // `eea6cde8` merge silently brought back.
-        let witnesses = voting::witness::generate_note_witnesses(
-            &handle.db,
-            &round_id_str,
-            &core_notes,
-            &wallet_db,
-        )
-        .map_err(|e| anyhow!("failed to generate voting note witnesses: {}", e))?;
+        // Extract historical Ironwood paths through the ordinary wallet backend,
+        // then pass only primitive encodings into native voting verification.
+        let witnesses =
+            super::witness::generate(&handle.db, &round_id_str, &core_notes, &wallet_db)
+                .map_err(|e| anyhow!("failed to generate voting note witnesses: {}", e))?;
 
         // Verify and cache in voting DB
         handle
@@ -738,6 +724,65 @@ fn parse_path(bytes: &[u8]) -> anyhow::Result<[pallas::Base; PIR_PATH_ELEMENT_CO
 mod tests {
     use super::*;
 
+    #[test]
+    fn setup_bundles_preserves_low_value_tail_and_full_weight() {
+        let db = crate::voting::test_helpers::open_memory_db();
+        let round_id = "01".repeat(32);
+        let handle = unsafe { &*db };
+        handle
+            .db
+            .init_round(
+                voting::Network::Mainnet,
+                &voting::VotingRoundParams {
+                    vote_round_id: round_id.clone(),
+                    snapshot_height: 123,
+                    ea_pk: vec![7; 32],
+                    nc_root: vec![8; 32],
+                    nullifier_imt_root: vec![9; 32],
+                },
+                None,
+            )
+            .unwrap();
+        let notes: Vec<JsonNoteInfo> = (0u64..198)
+            .map(|position| JsonNoteInfo {
+                commitment: position.to_le_bytes().repeat(4),
+                nullifier: position.to_le_bytes().repeat(4),
+                value: if position < 8 {
+                    50_000_000_000
+                } else {
+                    10_000_000
+                },
+                position,
+                diversifier: vec![0; 11],
+                rho: vec![3; 32],
+                rseed: vec![4; 32],
+                scope: 0,
+                ufvk_str: String::new(),
+            })
+            .collect();
+        // Preserve the existing whole-ballot weight after per-bundle rounding.
+        let expected_weight = 401_887_500_000;
+        let json = serde_json::to_vec(&notes).unwrap();
+        let result = unsafe {
+            zcashlc_voting_setup_bundles(
+                db,
+                round_id.as_ptr(),
+                round_id.len(),
+                json.as_ptr(),
+                json.len(),
+            )
+        };
+        assert!(!result.is_null());
+        let result_ref = unsafe { &*result };
+        assert_eq!(
+            result_ref.bundle_count, 40,
+            "the default privacy trim must not discard low-value bundles"
+        );
+        assert_eq!(result_ref.eligible_weight, expected_weight);
+        unsafe { crate::voting::ffi_types::zcashlc_voting_free_bundle_setup_result(result) };
+        unsafe { crate::voting::db::zcashlc_voting_db_free(db) };
+    }
+
     /// The PIR geometry the live dynamic voting config serves today. These
     /// tests never reach the PIR handshake — they assert null-handle and
     /// input-validation rejections — so the values only need to be a
@@ -1128,6 +1173,15 @@ mod tests {
             )
             .expect("rebuild returned Merkle path");
             assert_eq!(path.root(note_leaf).to_bytes().to_vec(), expected_root);
+            assert!(
+                voting::witness::verify_witness(&voting::WitnessData {
+                    note_commitment: witness.note_commitment.clone(),
+                    position: witness.position,
+                    root: witness.root.clone(),
+                    auth_path: witness.auth_path.clone(),
+                })
+                .unwrap()
+            );
         }
     }
 
@@ -1541,6 +1595,48 @@ mod tests {
             )
         };
         assert!(result.is_null());
+        unsafe { zcashlc_voting_db_free(db) };
+    }
+
+    #[test]
+    fn ordinary_witness_adapter_rejects_actual_wallet_network_mismatch() {
+        assert_witness_boundary_rejected(true, "network");
+    }
+
+    #[test]
+    fn ordinary_witness_adapter_rejects_pre_ironwood_snapshot() {
+        assert_witness_boundary_rejected(false, "NU6.3");
+    }
+
+    fn assert_witness_boundary_rejected(wrong_network: bool, message: &str) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wallet.sqlite");
+        let positions = vec![Position::from(2)];
+        let (frontier, leaves) =
+            seed_wallet_ironwood_tree(&path, SNAPSHOT_HEIGHT, LATER_HEIGHT, &positions);
+        let height = if wrong_network { SNAPSHOT_HEIGHT } else { 1 };
+        let db = open_memory_voting_db();
+        store_round_bundle_and_tree_state(
+            db,
+            height,
+            0,
+            &positions,
+            frontier.root().to_bytes().to_vec(),
+            &tree_state_from_frontier(height, &frontier),
+        );
+        let handle = unsafe { &*db };
+        if wrong_network {
+            handle
+                .db
+                .conn()
+                .execute("UPDATE rounds SET network='mainnet'", [])
+                .unwrap();
+        }
+        let wallet = open_wallet_db(path.to_str().unwrap(), NETWORK_ID_TESTNET).unwrap();
+        let notes = vec![note_json_for(positions[0], leaves[2]).into()];
+        let error = super::super::witness::generate(&handle.db, TEST_ROUND_ID, &notes, &wallet)
+            .unwrap_err();
+        assert!(error.to_string().contains(message));
         unsafe { zcashlc_voting_db_free(db) };
     }
 

@@ -13,6 +13,7 @@ use super::helpers::str_from_ptr;
 
 /// Opaque handle wrapping the voting database and its tree-sync state.
 pub struct VotingDatabaseHandle {
+    pub(super) path: String,
     pub(super) db: Arc<VotingDb>,
     pub(super) tree_sync: VoteTreeSync,
     pub(super) network: voting::types::Network,
@@ -60,6 +61,7 @@ pub unsafe extern "C" fn zcashlc_voting_db_open(
         let db = VotingDb::open(&path_str)
             .map_err(|e| anyhow!("Error opening voting database: {}", e))?;
         Ok(Box::into_raw(Box::new(VotingDatabaseHandle {
+            path: path_str,
             db: Arc::new(db),
             tree_sync: VoteTreeSync::new(),
             network,

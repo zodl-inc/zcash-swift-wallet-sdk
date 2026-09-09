@@ -8,11 +8,11 @@ use ffi_helpers::panic::catch_panic;
 use serde::{Deserialize, Serialize};
 use zcash_voting as voting;
 
-use crate::{unwrap_exc_or, unwrap_exc_or_null};
+use crate::unwrap_exc_or_null;
 
 use super::constants::CANONICAL_FIELD_LEN;
 use super::db::VotingDatabaseHandle;
-use super::helpers::{bytes_from_ptr, json_to_boxed_slice, str_from_ptr};
+use super::helpers::{json_to_boxed_slice, str_from_ptr};
 
 /// JSON representation for share delegation records crossing the FFI boundary.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -22,6 +22,12 @@ pub struct JsonShareDelegationRecord {
     pub proposal_id: u32,
     pub share_index: u32,
     pub sent_to_urls: Vec<String>,
+    #[serde(default)]
+    pub attempting_urls: Vec<String>,
+    #[serde(default)]
+    pub ambiguous_urls: Vec<String>,
+    #[serde(default)]
+    pub target_count: u32,
     /// Hex-encoded share reveal nullifier, matching
     /// `zcashlc_voting_compute_share_nullifier`.
     pub nullifier: String,
@@ -38,6 +44,9 @@ impl From<voting::ShareDelegationRecord> for JsonShareDelegationRecord {
             proposal_id: r.proposal_id,
             share_index: r.share_index,
             sent_to_urls: r.sent_to_urls,
+            attempting_urls: r.attempting_urls,
+            ambiguous_urls: r.ambiguous_urls,
+            target_count: r.target_count,
             nullifier: bytes_to_hex(&r.nullifier),
             confirmed: r.confirmed,
             submit_at: r.submit_at,
@@ -90,54 +99,6 @@ pub unsafe extern "C" fn zcashlc_voting_compute_share_nullifier(
         Ok(c_str.into_raw())
     });
     unwrap_exc_or_null(res)
-}
-
-/// Record a share delegation after sending to helper servers.
-///
-/// The share's nullifier is derived internally from the round's recovery state
-/// rather than supplied by the caller, so a caller cannot record a nullifier
-/// that disagrees with the share it belongs to.
-///
-/// Returns 0 on success, -1 on error.
-///
-/// # Safety
-///
-/// - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
-/// - String params must be valid UTF-8 pointers with correct lengths.
-/// - `sent_to_urls_json` must be a JSON array of strings.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_voting_record_share_delegation(
-    db: *mut VotingDatabaseHandle,
-    round_id: *const u8,
-    round_id_len: usize,
-    bundle_index: u32,
-    proposal_id: u32,
-    share_index: u32,
-    sent_to_urls_json: *const u8,
-    sent_to_urls_json_len: usize,
-    submit_at: u64,
-) -> i32 {
-    let db = AssertUnwindSafe(db);
-    let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        let urls_bytes = unsafe { bytes_from_ptr(sent_to_urls_json, sent_to_urls_json_len) }?;
-        let sent_to_urls: Vec<String> = serde_json::from_slice(urls_bytes)?;
-
-        voting::share::record(
-            &handle.db,
-            &round_id_str,
-            bundle_index,
-            proposal_id,
-            share_index,
-            &sent_to_urls,
-            submit_at,
-        )
-        .map_err(|e| anyhow!("share::record failed: {}", e))?;
-        Ok(0)
-    });
-    unwrap_exc_or(res, -1)
 }
 
 /// Get all share delegations for a round.
@@ -200,79 +161,6 @@ pub unsafe extern "C" fn zcashlc_voting_get_unconfirmed_delegations(
         json_to_boxed_slice(&json_records)
     });
     unwrap_exc_or_null(res)
-}
-
-/// Mark a share delegation as confirmed on-chain.
-///
-/// Returns 0 on success, -1 on error.
-///
-/// # Safety
-///
-/// - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_voting_mark_share_confirmed(
-    db: *mut VotingDatabaseHandle,
-    round_id: *const u8,
-    round_id_len: usize,
-    bundle_index: u32,
-    proposal_id: u32,
-    share_index: u32,
-) -> i32 {
-    let db = AssertUnwindSafe(db);
-    let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-
-        handle
-            .db
-            .mark_share_confirmed(&round_id_str, bundle_index, proposal_id, share_index)
-            .map_err(|e| anyhow!("mark_share_confirmed failed: {}", e))?;
-        Ok(0)
-    });
-    unwrap_exc_or(res, -1)
-}
-
-/// Append new server URLs to a share delegation's `sent_to_urls`.
-///
-/// Returns 0 on success, -1 on error.
-///
-/// # Safety
-///
-/// - `db` must be a valid, non-null `VotingDatabaseHandle` pointer.
-/// - `new_urls_json` must be a JSON array of strings.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn zcashlc_voting_add_sent_servers(
-    db: *mut VotingDatabaseHandle,
-    round_id: *const u8,
-    round_id_len: usize,
-    bundle_index: u32,
-    proposal_id: u32,
-    share_index: u32,
-    new_urls_json: *const u8,
-    new_urls_json_len: usize,
-) -> i32 {
-    let db = AssertUnwindSafe(db);
-    let res = catch_panic(|| {
-        let handle =
-            unsafe { db.as_ref() }.ok_or_else(|| anyhow!("VotingDatabaseHandle is null"))?;
-        let round_id_str = unsafe { str_from_ptr(round_id, round_id_len) }?;
-        let urls_bytes = unsafe { bytes_from_ptr(new_urls_json, new_urls_json_len) }?;
-        let new_urls: Vec<String> = serde_json::from_slice(urls_bytes)?;
-
-        handle
-            .db
-            .add_sent_servers(
-                &round_id_str,
-                bundle_index,
-                proposal_id,
-                share_index,
-                &new_urls,
-            )
-            .map_err(|e| anyhow!("add_sent_servers failed: {}", e))?;
-        Ok(0)
-    });
-    unwrap_exc_or(res, -1)
 }
 
 /// Rebuild one helper-server share payload as the crate's own wire JSON.
@@ -371,59 +259,35 @@ pub unsafe extern "C" fn zcashlc_voting_recoverable_share_indices(
 mod tests {
     use super::*;
     use crate::ffi::zcashlc_free_boxed_slice;
-    use crate::voting::db::zcashlc_voting_db_free;
-    use crate::voting::test_helpers::{insert_round_and_bundle, open_memory_db};
-
-    // A test asserting that an invalid caller-supplied nullifier is rejected
-    // used to live here. `share::record` now derives the nullifier from the
-    // round's recovery state, so callers cannot supply one at all and there is
-    // no longer a malformed-input case to exercise.
-
-    // The former round-trip test asserted that a caller-supplied hex nullifier
-    // came back unchanged. `share::record` now derives the nullifier from the
-    // vote's persisted recovery bundle, which only a real `vote::commit` writes
-    // — `zcash_voting` exposes a public reader for that bundle but no writer.
-    // A successful record therefore cannot be staged from a unit test, so the
-    // boundary that remains testable is the failure below.
 
     #[test]
-    fn record_share_delegation_rejects_a_vote_that_was_never_committed() {
-        let db = open_memory_db();
-        let round_id = b"round";
-        insert_round_and_bundle(db, "round");
-        let urls_json = br#"["https://helper.example"]"#;
-
-        // The round and bundle exist, but no vote has been committed for them,
-        // so there is no recovery bundle to derive a share nullifier from.
-        // Recording must fail rather than persist a share with no provenance.
-        let code = unsafe {
-            zcashlc_voting_record_share_delegation(
-                db,
-                round_id.as_ptr(),
-                round_id.len(),
-                0,
-                0,
-                0,
-                urls_json.as_ptr(),
-                urls_json.len(),
-                0,
-            )
+    fn share_journal_read_preserves_attempting_ambiguous_and_target() {
+        let native = voting::ShareDelegationRecord {
+            round_id: "round".to_string(),
+            bundle_index: 0,
+            proposal_id: 1,
+            share_index: 2,
+            sent_to_urls: vec!["https://accepted.example".to_string()],
+            ambiguous_urls: vec!["https://unknown.example".to_string()],
+            attempting_urls: vec!["https://attempting.example".to_string()],
+            target_count: 3,
+            nullifier: vec![1; 32],
+            confirmed: false,
+            submit_at: 0,
+            created_at: 100,
         };
-        assert_eq!(code, -1);
-
-        let result =
-            unsafe { zcashlc_voting_get_share_delegations(db, round_id.as_ptr(), round_id.len()) };
-        assert!(!result.is_null());
-        let json = unsafe { (*result).as_slice() }.to_vec();
-        let records: Vec<JsonShareDelegationRecord> =
-            serde_json::from_slice(&json).expect("share delegation records");
-        assert!(
-            records.is_empty(),
-            "a rejected record must not leave a partial row behind"
+        let value = serde_json::to_value(JsonShareDelegationRecord::from(native)).unwrap();
+        assert_eq!(
+            value["attempting_urls"],
+            serde_json::json!(["https://attempting.example"])
         );
-
-        unsafe { zcashlc_free_boxed_slice(result) };
-        unsafe { zcashlc_voting_db_free(db) };
+        assert_eq!(
+            value["ambiguous_urls"],
+            serde_json::json!(["https://unknown.example"])
+        );
+        assert_eq!(value["target_count"], 3);
+        let decoded: JsonShareDelegationRecord = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), value);
     }
 
     fn field_bytes(value: u8) -> [u8; 32] {
@@ -482,6 +346,7 @@ mod tests {
             encrypted_shares,
             share_blinds,
             share_comms,
+            batch: None,
         }
     }
 
