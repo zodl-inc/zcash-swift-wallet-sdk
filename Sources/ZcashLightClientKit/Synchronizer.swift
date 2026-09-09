@@ -71,9 +71,11 @@ public struct SynchronizerState: Equatable {
     /// out" affordance — a spinner, a held error — must gate on this and must not infer it from a
     /// zero balance, which would leave the affordance up indefinitely in the other two cases.
     ///
-    /// Bounded: it clears as soon as the engine refreshes the tip, which is what makes it safe to
-    /// drive a spinner from. Always `false` on the legacy `SDKSynchronizer` path, which applies its
-    /// mask inside `ZcashRustBackend.getWalletSummary()` and does not report it here.
+    /// Bounded: it clears once the engine has refreshed the tip and scanned the chain-tip range
+    /// that refresh queued (or the pass completed), so the value it uncovers is one the wallet
+    /// database can already vouch for — which is what makes it safe to drive a spinner from.
+    /// Always `false` on the legacy `SDKSynchronizer` path, which applies its mask inside
+    /// `ZcashRustBackend.getWalletSummary()` and does not report it here.
     public var isSpendableMasked: Bool
 
     /// Represents a synchronizer that has made zero progress hasn't done a sync attempt

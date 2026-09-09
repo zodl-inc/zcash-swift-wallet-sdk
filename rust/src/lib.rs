@@ -4951,6 +4951,44 @@ mod tests {
         );
         assert!(unfinished.is_empty());
     }
+
+    /// [MOB-1852] `update_chain_tip` re-queues the blocks up to the new tip as unscanned, and until
+    /// they are scanned the wallet database reports every non-stabilized note as unspendable. A
+    /// refresh alone therefore proves the tip moved, not that the spendable value can be trusted:
+    /// freshness has to wait for the ChainTip-priority range to complete (`spendable_hint == 1`).
+    #[test]
+    fn a_refreshed_tip_is_not_fresh_until_its_chain_tip_range_is_scanned() {
+        assert!(
+            !fresh_tip_decision(false, true, 1, 0),
+            "refreshed but not yet scanned to: the mask must stay on"
+        );
+        assert!(
+            fresh_tip_decision(false, true, 1, 1),
+            "refreshed and the chain-tip range completed: fresh"
+        );
+    }
+
+    /// [MOB-1852] The rest of the rule is unchanged: the latch holds for the run, a pass that
+    /// reached Done proves the tip, and nothing else does.
+    #[test]
+    fn tip_freshness_keeps_its_latch_and_its_done_rule() {
+        assert!(
+            fresh_tip_decision(true, false, 1, 0),
+            "a latched fresh tip stays fresh within the run"
+        );
+        assert!(
+            fresh_tip_decision(false, false, 3, 0),
+            "a pass that reached Done proves the tip"
+        );
+        assert!(
+            !fresh_tip_decision(false, false, 1, 0),
+            "no refresh and not Done: not fresh"
+        );
+        assert!(
+            !fresh_tip_decision(false, false, 1, 1),
+            "a completed range without a refresh this run proves nothing"
+        );
+    }
 }
 
 // ── Slipstream FFI surface ────────────────────────────────────────────────────
@@ -5707,6 +5745,25 @@ pub unsafe extern "C" fn zcashlc_slipstream_stop(handle: *mut SlipstreamHandle) 
     unwrap_exc_or(res, false)
 }
 
+/// [MOB-1852] The freshness rule behind `SlipstreamHandle::tip_fresh_now`, kept free of the
+/// handle so it can be tested as a table. A refresh proves the wallet-database tip moved; only
+/// a completed ChainTip-priority scan (`spendable_hint == 1`) or a pass that reached Done
+/// (`state == 3`) proves the database can also vouch for the spendable value at that tip —
+/// between the two, `update_chain_tip` has queued the blocks up to the new tip as unscanned and
+/// librustzcash reports every non-stabilized note as unspendable, so lifting the mask at the
+/// refresh would uncover a transient zero. A latched tip stays fresh for the run.
+fn fresh_tip_decision(
+    latched: bool,
+    refresh_advanced: bool,
+    state: u8,
+    spendable_hint: u8,
+) -> bool {
+    if latched {
+        return true;
+    }
+    state == 3 || (refresh_advanced && spendable_hint == 1)
+}
+
 /// Aborts the running pass (if any), keeps every pass that has not finished yet on record, and
 /// waits within `budget` for all of them to finish. Returns whether the engine is quiescent with
 /// respect to its passes. A pass that outlives the budget STAYS on record, so a later stop cannot
@@ -5817,7 +5874,11 @@ pub unsafe extern "C" fn zcashlc_slipstream_snapshot(
             is_recovering: s.is_recovering,
             progress_permille: s.progress_permille,
             stalled_seconds: s.stalled_seconds,
-            tip_fresh: if handle.tip_fresh_now(s.state) { 1 } else { 0 },
+            tip_fresh: if handle.tip_fresh_now(s.state, s.spendable_hint) {
+                1
+            } else {
+                0
+            },
             tx_set_version: s.tx_set_version,
         })
     });
@@ -5825,27 +5886,28 @@ pub unsafe extern "C" fn zcashlc_slipstream_snapshot(
 }
 
 impl SlipstreamHandle {
-    /// [API v2.1 E-2] Lazily evaluates + latches tip freshness — the exact
-    /// `shouldMarkChainTipUpdated` semantics the SDK derived host-side:
+    /// [API v2.1 E-2] Lazily evaluates + latches tip freshness — the `shouldMarkChainTipUpdated`
+    /// semantics the SDK derived host-side, tightened by [MOB-1852]; the rule itself is
+    /// `fresh_tip_decision`:
     /// - already fresh → stays fresh (until a >120 s stop→start gap re-masks in `start()`);
-    /// - the refresh counter advanced past its `start()` baseline → the engine bumps it
-    ///   only AFTER `session.update_chain_tip` succeeds, so an advance proves THIS run
-    ///   refreshed the wallet-DB tip (counter-based so the E-3 DB-seeded tip can neither
-    ///   fake freshness nor mask a refresh that fetched the same height);
+    /// - the refresh counter advanced past its `start()` baseline AND this pass has completed a
+    ///   ChainTip-priority range (`spendable_hint == 1`) → fresh. The engine bumps the counter
+    ///   only AFTER `session.update_chain_tip` succeeds, so an advance proves THIS run refreshed
+    ///   the wallet-DB tip (counter-based so the E-3 DB-seeded tip can neither fake freshness nor
+    ///   mask a refresh that fetched the same height); the hint proves the database has been
+    ///   scanned to that tip, without which it reports every non-stabilized note as unspendable;
     /// - otherwise → trust only a pass that reached Done (state 3): `sync_once` cannot
-    ///   complete without `update_chain_tip` having succeeded.
-    fn tip_fresh_now(&self, state: u8) -> bool {
+    ///   complete without `update_chain_tip` having succeeded and the tip range scanned.
+    fn tip_fresh_now(&self, state: u8, spendable_hint: u8) -> bool {
         use std::sync::atomic::Ordering;
-        if self.tip_fresh.load(Ordering::Relaxed) {
-            return true;
-        }
+        let latched = self.tip_fresh.load(Ordering::Relaxed);
         let advanced = self.inner.progress.tip_refreshes()
             > self.tip_refreshes_at_run_start.load(Ordering::Relaxed);
-        if advanced || state == 3 {
+        let fresh = fresh_tip_decision(latched, advanced, state, spendable_hint);
+        if fresh && !latched {
             self.tip_fresh.store(true, Ordering::Relaxed);
-            return true;
         }
-        false
+        fresh
     }
 }
 

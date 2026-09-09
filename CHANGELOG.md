@@ -36,11 +36,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Spendable balance masking
 
-- `SynchronizerState.isSpendableMasked` reports whether the spendable balance in
-  `accountsBalances` is currently masked because the engine has not yet confirmed a fresh chain
-  tip — the only signal that separates "the wallet cannot spend this" from "the SDK is not
-  willing to say yet," which a zero balance alone cannot express (an empty wallet, funds still
-  confirming, and a masked balance all read as zero). It clears as soon as the tip refreshes, so a
+- `SynchronizerState.isSpendableMasked` reports whether the spendable balance in `accountsBalances`
+  is currently masked because the engine has not yet confirmed a fresh chain tip — the only signal
+  that separates "the wallet cannot spend this" from "the SDK is not willing to say yet," which a
+  zero balance alone cannot express (an empty wallet, funds still confirming, and a masked balance
+  all read as zero). It clears once the refreshed tip's chain-tip range has been scanned (or the
+  pass completes), so the value it uncovers is one the wallet database can already vouch for and a
   client can safely drive a "working it out" affordance from it. The property is additive: the
   memberwise initializer defaults it to `false`, so existing call sites and test doubles are
   unaffected. Always `false` on the legacy `SDKSynchronizer` path, which applies its own masking
