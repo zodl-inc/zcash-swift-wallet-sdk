@@ -191,7 +191,7 @@ fn decide(rows: &RoundRows, package: &[(u32, [u8; 32], String)]) -> anyhow::Resu
 
 /// The VAN commitment `hotkey`, `round_id`, `total_note_value` and
 /// `van_comm_rand` open: what the crate stores for a bundle built from them.
-fn van_commitment(
+pub(super) fn van_commitment(
     hotkey: &voting::VotingHotkey,
     round_id: &str,
     total_note_value: u64,

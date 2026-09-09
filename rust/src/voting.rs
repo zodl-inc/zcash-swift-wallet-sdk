@@ -18,6 +18,7 @@ pub mod helpers;
 pub mod json;
 pub mod notes;
 pub mod progress;
+pub mod proof_readback;
 pub mod recovery;
 pub mod rounds;
 pub mod share_tracking;

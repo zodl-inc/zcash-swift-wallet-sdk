@@ -1,5 +1,50 @@
 # Migrating from previous versions to _Unreleased_
 
+## Optional shared delegation precomputation
+
+Existing `buildAndProveDelegation` calls keep their interactive behavior. To prepare a
+software delegation before confirmation, retain an operation after the bundle's PCZT
+setup has been persisted:
+
+```swift
+let operation = try await votingBackend.delegationOperation(
+    params: proofParams,
+    pirEndpoints: pirURLs,
+    expectedSnapshotHeight: snapshotHeight,
+    layout: pirLayout
+)
+let preparation = Task {
+    try await operation.result(intent: .speculative, progress: updateProgress)
+}
+// When the user confirms, promote and join the same producer.
+await operation.promote()
+let proof = try await operation.result(intent: .interactive, progress: updateProgress)
+```
+
+The factory starts work on the first result subscription. Speculative work runs at
+utility priority; interactive subscription or promotion holds one proving boost during
+native computation, including when promotion arrives after entry. Matching requests
+return the same object. Identity includes the wallet, database, network, round, snapshot,
+bundle, stored PCZT sighash and every proof/PIR input. A completed persisted proof is
+validated against the supplied inputs and reused before any PIR request.
+
+Cancelling `preparation` only detaches that waiter. Native proving cannot be interrupted,
+and the producer retains its backend until it actually returns. To abandon all work
+before clearing a round, changing accounts or reopening the database:
+
+```swift
+await votingBackend.cancelDelegationOperationsAndWait()
+try votingBackend.clearRound(roundId: roundID)
+```
+
+The drain rejects stale entry, results and progress, joins native work and callbacks,
+and closes the scoped identity reader. Previously returned operations stay invalid.
+Legacy synchronous lifecycle mutations also invalidate operations and retain the existing
+handle lock as a safety fallback; use the asynchronous drain to avoid blocking on native
+proving. Operation progress callbacks run outside the database and operation locks.
+This API uses the existing FVK/hotkey proof parameters and performs no authentication,
+signing or broadcast. Keystone signing behavior is unchanged.
+
 ## Voting 3.1: native helper ownership and durable ballot decisions
 
 Source FFI builds require Rust 1.91 or newer. The voting database migrates from schema 13

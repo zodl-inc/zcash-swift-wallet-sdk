@@ -47,6 +47,7 @@ public enum VotingRustBackendError: LocalizedError, Equatable {
 public final class VotingRustBackend: @unchecked Sendable {
     private let lock = NSLock()
     private var handle: OpaquePointer?
+    let delegationRegistry = VotingDelegationRegistry()
 
     public init() {}
 
@@ -70,6 +71,9 @@ public final class VotingRustBackend: @unchecked Sendable {
     /// Throws `VotingRustBackendError.databaseAlreadyOpen` if the backend
     /// already holds an open handle.
     public func open(path: String, networkId: UInt32) throws {
+        delegationRegistry.beginMutation()
+        defer { delegationRegistry.endMutation() }
+
         lock.lock()
         defer { lock.unlock() }
 
@@ -86,18 +90,23 @@ public final class VotingRustBackend: @unchecked Sendable {
             )
         }
         handle = ptr
+        delegationRegistry.open(path: path, network: networkId)
     }
 
     /// Close the voting database, freeing the underlying handle.
     ///
     /// Idempotent: calling `close()` on an already-closed backend is a no-op.
     public func close() {
+        delegationRegistry.beginMutation()
+        defer { delegationRegistry.endMutation() }
+
         lock.lock()
         defer { lock.unlock() }
 
         if let dbh = handle {
             zcashlc_voting_db_free(dbh)
             handle = nil
+            delegationRegistry.close()
         }
     }
 }
@@ -129,6 +138,9 @@ extension VotingRustBackend {
     ///
     /// Must be called after `open(path:)` and before any round operations.
     public func setWalletId(_ walletId: String) throws {
+        delegationRegistry.beginMutation()
+        defer { delegationRegistry.endMutation() }
+
         let walletIdBytes = [UInt8](walletId.utf8)
 
         try withHandle { dbh in
@@ -139,6 +151,7 @@ extension VotingRustBackend {
             guard result == 0 else {
                 throw VotingRustBackendError.rustError(lastErrorMessage(fallback: "`set_wallet_id` failed"))
             }
+            delegationRegistry.setWallet(walletId)
         }
     }
 }
@@ -619,6 +632,61 @@ extension VotingRustBackend {
     }
 }
 
+extension VotingRustBackend {
+    func completedDelegationProof(
+        _ params: VotingDelegationProofParams,
+        snapshotHeight: BlockHeight,
+        sighash: [UInt8],
+        expectedScope: VotingDelegationScope? = nil
+    ) throws -> VotingDelegationProofResult? {
+        struct Request: Encodable {
+            let roundId: String
+            let bundleIndex: UInt32
+            let notes: [VotingNoteInfo]
+            let fvk: [UInt8]
+            let seedFingerprint: [UInt8]
+            let accountIndex: UInt32
+            let roundName: String
+            let snapshotHeight: BlockHeight
+            let pcztSighash: [UInt8]
+        }
+        let request = Request(
+            roundId: params.roundId,
+            bundleIndex: params.bundleIndex,
+            notes: params.notes,
+            fvk: params.keys.fvk,
+            seedFingerprint: params.keys.seedFingerprint,
+            accountIndex: params.keys.accountIndex,
+            roundName: params.keys.roundName,
+            snapshotHeight: snapshotHeight,
+            pcztSighash: sighash
+        )
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let bytes = [UInt8](try encoder.encode(request))
+        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { handle in
+            if let expectedScope { try delegationRegistry.check(expectedScope) }
+            let ptr = bytes.withUnsafeBufferPointer { request in
+                params.keys.hotkeyStoredSecret.withUnsafeBufferPointer { secret in
+                    zcashlc_voting_get_completed_delegation_proof(
+                        handle,
+                        request.baseAddress,
+                        UInt(request.count),
+                        secret.baseAddress,
+                        UInt(secret.count)
+                    )
+                }
+            }
+            guard let ptr else {
+                throw VotingRustBackendError.rustError(lastErrorMessage(fallback: "completed delegation proof readback failed"))
+            }
+            return ptr
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        return try decodeJSON(from: ptr)
+    }
+}
+
 // MARK: - Interactive proving QoS boost
 
 extension VotingRustBackend {
@@ -839,6 +907,9 @@ extension VotingRustBackend {
         nullifierImtRoot: [UInt8],
         sessionJson: String? = nil
     ) throws {
+        delegationRegistry.beginMutation()
+        defer { delegationRegistry.endMutation() }
+
         let roundIdBytes = [UInt8](roundId.utf8)
         let sessionBytes = sessionJson.map { [UInt8]($0.utf8) }
 
@@ -982,6 +1053,9 @@ extension VotingRustBackend {
 
     /// Clear all persisted data for a round.
     public func clearRound(roundId: String) throws {
+        delegationRegistry.beginMutation()
+        defer { delegationRegistry.endMutation() }
+
         let roundIdBytes = [UInt8](roundId.utf8)
         try withHandle { dbh in
             let result = roundIdBytes.withUnsafeBufferPointer { buf in
@@ -1004,6 +1078,9 @@ extension VotingRustBackend {
     public func restoreRecoveredDelegation(
         _ request: RecoveredDelegationRestoreRequest
     ) throws -> RecoveredDelegationRestoreResult {
+        delegationRegistry.beginMutation()
+        defer { delegationRegistry.endMutation() }
+
         let requestBytes = [UInt8](try JSONEncoder().encode(request))
         let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
             let ptr = requestBytes.withUnsafeBufferPointer { requestBuffer in
@@ -1365,6 +1442,9 @@ extension VotingRustBackend {
     ///   also refuses it rather than resetting every round's cached tree
     ///   client account-wide.
     public func resetSessionState(roundId: String) throws {
+        delegationRegistry.beginMutation()
+        defer { delegationRegistry.endMutation() }
+
         guard !roundId.isEmpty else {
             throw VotingRustBackendError.invalidData("roundId must not be empty")
         }
@@ -1504,6 +1584,9 @@ extension VotingRustBackend {
         roundId: String,
         notes: [VotingNoteInfo]
     ) throws -> VotingBundleSetupResult {
+        delegationRegistry.beginMutation()
+        defer { delegationRegistry.endMutation() }
+
         let roundIdBytes = [UInt8](roundId.utf8)
         let notesJson = try JSONEncoder().encode(notes)
         let notesBytes = [UInt8](notesJson)
@@ -1555,6 +1638,9 @@ extension VotingRustBackend {
 
     /// Build the voting PCZT for a bundle.
     public func buildPczt(_ params: VotingBuildPcztParams) throws -> VotingPczt {
+        delegationRegistry.beginMutation()
+        defer { delegationRegistry.endMutation() }
+
         let keys = params.keys
         guard keys.seedFingerprint.count == votingSeedFingerprintByteCount else {
             throw VotingRustBackendError.invalidData(
@@ -1957,6 +2043,28 @@ extension VotingRustBackend {
             (@Sendable (Double) -> Void)?
         ) throws -> VotingDelegationProofResult
     ) async throws -> VotingDelegationProofResult {
+        try await resolveAndProveDelegation(
+            params,
+            pirEndpoints: pirEndpoints,
+            expectedSnapshotHeight: expectedSnapshotHeight,
+            pirLayout: pirLayout,
+            pirResolver: pirResolver,
+            progress: progress,
+            operation: nil,
+            proveEntry: proveEntry
+        )
+    }
+
+    func resolveAndProveDelegation(
+        _ params: VotingDelegationProofParams,
+        pirEndpoints: [String],
+        expectedSnapshotHeight: UInt64,
+        pirLayout: VotingPirLayout,
+        pirResolver: PirSnapshotResolver,
+        progress: (@Sendable (Double) -> Void)?,
+        operation: VotingDelegationOperation?,
+        proveEntry: @escaping VotingDelegationProveEntry
+    ) async throws -> VotingDelegationProofResult {
         try requireOpenDatabase()
 
         guard params.keys.seedFingerprint.count == votingSeedFingerprintByteCount else {
@@ -1987,14 +2095,18 @@ extension VotingRustBackend {
         // closure consults before calling `proveEntry`. Once `proveEntry` has been entered, nothing
         // here can interrupt it — see this method's doc comment for why.
         return try await withTaskCancellationHandler {
-            try await Self.withInteractiveProvingBoost {
-                try await Task.detached(priority: .userInitiated) {
-                    if cancellationFlag.isCancelled {
-                        throw CancellationError()
-                    }
+            let priority: TaskPriority = operation == nil ? .userInitiated : Task.currentPriority
+            return try await Task.detached(priority: priority) {
+                if cancellationFlag.isCancelled { throw CancellationError() }
+                if let operation {
+                    try operation.beginProof()
+                    defer { operation.endProof() }
                     return try proveEntry(params, pirServerUrl, pirLayout, progress)
-                }.value
-            }
+                }
+                Self.beginInteractiveProvingBoost()
+                defer { Self.endInteractiveProvingBoost() }
+                return try proveEntry(params, pirServerUrl, pirLayout, progress)
+            }.value
         } onCancel: {
             cancellationFlag.markCancelled()
         }
@@ -2230,7 +2342,9 @@ private extension VotingRustBackend {
         defer { zcashlc_free_boxed_slice(ptr) }
         return try decodeJSON(from: ptr)
     }
+}
 
+extension VotingRustBackend {
     /// Synchronous body of `buildAndProveDelegation`. Lives on the FFI thread
     /// inside `Task.detached` so the calling actor is not blocked for the
     /// duration of proving (potentially minutes).
@@ -2238,7 +2352,8 @@ private extension VotingRustBackend {
         _ params: VotingDelegationProofParams,
         pirServerUrl: String,
         pirLayout: VotingPirLayout,
-        progress: (@Sendable (Double) -> Void)?
+        progress: (@Sendable (Double) -> Void)?,
+        expectedScope: VotingDelegationScope? = nil
     ) throws -> VotingDelegationProofResult {
         let keys = params.keys
         let roundIdBytes = [UInt8](params.roundId.utf8)
@@ -2257,6 +2372,7 @@ private extension VotingRustBackend {
         let trampoline: VotingProgressCallback? = progressBox == nil ? nil : votingProgressCallbackTrampoline
 
         let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
+            if let expectedScope { try delegationRegistry.check(expectedScope) }
             let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
                 notesBytes.withUnsafeBufferPointer { notesBuf in
                     keys.fvk.withUnsafeBufferPointer { fvkBuf in

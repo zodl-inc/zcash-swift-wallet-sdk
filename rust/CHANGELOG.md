@@ -8,6 +8,13 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `zcashlc_voting_get_completed_delegation_proof`, a read-only completed-proof
+  lookup accepting a JSON proof-parameter aggregate with expected snapshot and PCZT
+  sighash, plus a separately borrowed hotkey secret. It returns boxed JSON `null` for
+  an unproved bundle, a complete proof result for matching persisted inputs, or a null
+  pointer on mismatch/corruption. Free successful return buffers with
+  `zcashlc_free_boxed_slice`. Submitted or confirmed bundles lacking proof data fail
+  closed instead of requesting a new proof. No signing or network operation occurs.
 - `zcashlc_voting_helper_create(db, tor)` creates a wallet/path/network-scoped helper
   handle. A null Tor pointer explicitly selects direct transport; a non-null pointer
   is cloned during this call and never falls back to direct. The primary voting handle

@@ -3157,6 +3157,7 @@ dependencies = [
  "ur",
  "ur-registry",
  "uuid",
+ "voting-circuits",
  "xz2",
  "zcash_address",
  "zcash_client_backend",

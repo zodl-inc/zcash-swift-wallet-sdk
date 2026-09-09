@@ -8,6 +8,21 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Added
 
+### Shared delegation proof operations
+
+- Add `VotingRustBackend.delegationOperation(params:pirEndpoints:expectedSnapshotHeight:layout:)`,
+  `VotingDelegationOperation` and `VotingProvingIntent`. Matching persisted setup and inputs
+  share one retained producer; different bundles enter the prover serially. Use
+  `result(intent: .speculative, progress:)` before confirmation, then `promote()` or an
+  interactive result subscription to boost the same proof. Completed persisted proofs
+  are reused without PIR lookup or re-proving after restart.
+- Cancelling a result waiter leaves other waiters and the producer alive. Use the
+  operation's `cancelAndWait()` to invalidate its delivery, or the backend's
+  `cancelDelegationOperationsAndWait()` before destructive reset or reopen. Native
+  proving cannot be interrupted; these methods join its actual return and queued
+  progress callbacks. Existing direct `buildAndProveDelegation` calls remain interactive
+  and require no call-site change.
+
 ### Voting helper lifecycle
 
 - Add wallet-scoped `VotingHelperClient`, `VotingRoundID`, typed ballot decisions and
