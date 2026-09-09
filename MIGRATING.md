@@ -1,5 +1,35 @@
 # Migrating from previous versions to _Unreleased_
 
+## `ZIP318Kind` gained a case — `canonicalCrossingPayment`
+
+`ZcashTransaction.Overview.ZIP318Kind`, the type of `zip318Kind`, has a fifth case,
+`canonicalCrossingPayment`: a canonical pool crossing that pays a third party. It has the same
+on-chain shape as a migration `transfer` but is not a migration this account made. Transactions of
+this kind were previously decoded as `notClassified`. The encoding stays append-only, so the four
+existing cases keep their meaning.
+
+An exhaustive `switch` over `ZIP318Kind` stops compiling until the new case is handled. Like
+`nonconforming`, it is not this account's migration activity: a host that derives migration
+progress or labels from `preparation` and `transfer` must not group the new case with them.
+
+```swift
+// Before: exhaustive over the four cases 4.2.0 had.
+switch overview.zip318Kind {
+case .preparation, .transfer:
+    markAsMigrationActivity(overview)
+case .nonconforming, .notClassified:
+    showAsOrdinaryTransaction(overview)
+}
+
+// After: the new case is a third party's canonical crossing, not this account's migration.
+switch overview.zip318Kind {
+case .preparation, .transfer:
+    markAsMigrationActivity(overview)
+case .nonconforming, .canonicalCrossingPayment, .notClassified:
+    showAsOrdinaryTransaction(overview)
+}
+```
+
 ## Migration runs are sized per account — stamp `Account.keystoneKeySource` on a Keystone import
 
 The SDK now reads the `keySource` an account was created or imported with. An account tagged

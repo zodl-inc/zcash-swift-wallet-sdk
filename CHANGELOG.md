@@ -8,32 +8,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Added
 
-### Balances
-
-- `Synchronizer.getLocalAccountBalances()` and `SynchronizerState.localAccountsBalances` expose
-  the last account balances stored in the wallet database without chain-tip freshness masking.
-  Wallet apps can keep a stale balance visible while they replace networking. Synchronizers that
-  do not support durable snapshots return `nil`. Existing balance APIs keep their masking behavior.
-
-### Voting
-
-- `VotingRustBackend.restoreRecoveredDelegation(_:)`, `RecoveredDelegationRestoreRequest`,
-  `RecoveredDelegationBundle` and `RecoveredDelegationRestoreResult` restore a delegation from
-  recovered `(bundle_index, total_note_value, van_comm_rand, delegation_tx_hash)` tuples. The
-  call refuses to clear a round that holds votes, shares, Keystone signatures, or an accepted
-  bundle the package does not restore, and reports `.alreadyRestored` without writing when the
-  round already holds the package. The package must be contiguous from bundle zero; it may be
-  a prefix of what a failed rebuild left behind, or extend a prefix restored earlier. Each
-  bundle carries `van`, the commitment the recovered row held; the call refuses a bundle whose
-  blinding and weight do not open it before clearing anything. The request takes a
-  `VotingHotkey`; its secret is unwrapped only at the FFI boundary, and the recovered blinding
-  factors are `Undescribable`.
-- `VotingRustBackend.vanCommitment(hotkey:networkId:roundId:totalNoteValue:vanCommRand:)` returns
-  the VAN commitment those inputs open, the value the restore recomputes per bundle.
-- `VotingRustBackend.hotkey(fromStoredSecret:networkId:)` returns the `VotingHotkey` a persisted
-  stored secret describes, so applications no longer need to pass bare secret bytes to SDK calls
-  that want the semantic type.
-
 ### Spendable balance masking
 
 - `SynchronizerState.isSpendableMasked` reports whether the spendable balance in `accountsBalances`
@@ -108,48 +82,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   background, no longer get a pass started behind their own stop. `SDKSynchronizer` is unaffected.
   The call still returns only once its queued lifecycle operation is reached, so a cancelled call
   is not necessarily prompt to return.
-- `Synchronizer` gained a new requirement:
-  `evaluateServerSwitch(current:candidates:fetchThresholdSeconds:nBlocksToFetch:network:)`. Any
-  custom `Synchronizer` conformer or test double stops compiling until it implements it — see
-  `MIGRATING.md` for a drop-in stub. The method benchmarks the candidates (always including the
-  current endpoint, appending it when the caller's list omits it) and returns the endpoint worth
-  switching to, or `nil` to stay. A switch requires beating the current server's score on both an
-  absolute and a relative gate; the gates are bypassed only when the current server fails the
-  benchmark twice in a row. On `SDKSynchronizer` the block-fetch phase is bounded to the three
-  fastest candidates by latency plus the current server — never the whole list — so network cost
-  does not grow with the number of candidates. A call whose surrounding task is cancelled returns
-  `nil`.
-- Proposal and transaction-creation failures now report WHY they failed, and from WHERE
-  (MOB-1201). Previously every such failure surfaced as `ZcashError.rustCreateToAddress`, whose
-  `errorDescription` printed only the static sentence "Error from rust layer when calling
-  ZcashRustBackend.createToAddress" — the rust error string was carried in the associated value and
-  never rendered, so a user's error report named no cause and did not even say whether the failure
-  happened while BUILDING a proposal or while signing an already-confirmed one.
-
-  The rust layer now classifies these failures instead of flattening them into a string, and each
-  call site throws its own code: `rustProposeTransfer` (`ZRUST0151`), `rustProposeTransferFromURI`
-  (`ZRUST0057`), `rustProposeSendMaxTransfer` (`ZRUST0129`),
-  `rustProposeOrchardToIronwoodMigration` (`ZRUST0152`), and `rustCreateToAddress` (`ZRUST0002`),
-  which now covers only the signing step. Two conditions a wallet should render itself rather than
-  show as an error get dedicated cases: `rustProposalScanRequired` (`ZRUST0153`) and
-  `rustProposalInsufficientFunds(available:required:)` (`ZRUST0154`), the latter carrying both
-  amounts as `Zatoshi`.
-
-  BREAKING: the associated value of `rustCreateToAddress`, `rustProposeTransferFromURI`, and
-  `rustProposeSendMaxTransfer` changes from `String` to the new `RedactedRustError`, which carries
-  a `RustErrorKind` to switch on alongside the message. `ZcashError` also gains a `detail` property,
-  and `errorDescription` appends it when present. See MIGRATING.md.
-
-  The rendered detail is redacted at the rust boundary: it never contains an amount, address, note
-  identifier or txid, so it is safe to submit in a support ticket. `RedactedRustError` is the
-  certificate of that — `detail` renders a payload only when it has that type, so the raw strings
-  still carried by other `rust*` cases cannot reach a report. The unredacted text is logged on the
-  device at `debug!` level.
-- `ZcashTransaction.Overview.ZIP318Kind` (the type of `zip318Kind`) gained the case
-  `canonicalCrossingPayment`: a canonical pool crossing that pays a third party — the same
-  on-chain shape as a migration `transfer`, but not a migration this account made. Such
-  transactions were previously reported as `notClassified`. An exhaustive `switch` over
-  `ZIP318Kind` stops compiling until the new case is handled.
 - `SlipstreamSynchronizer` now bounds each candidate's `getInfo` probe to 5 s instead of the
   endpoint's much longer gRPC single-call default, so a slow or unreachable server can no longer
   make a call take an unbounded amount of time. `evaluateServerSwitch` and `evaluateBestOf` share
@@ -187,19 +119,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for a pass that is gone. Previously a stale tick could resurrect a deliberately stopped
   synchronizer, and a recovery restart could tear down a newer pass or start the engine inside an
   account mutation's stopped interval.
-- The server benchmark behind `evaluateBestOf` and `evaluateServerSwitch` no longer ranks
-  endpoints whose block stream delivers fewer blocks than requested — an empty or truncated
-  stream previously recorded a near-zero time and won the ranking outright.
-- The server benchmark closes its per-endpoint gRPC connections when evaluation finishes instead
-  of leaving teardown to object lifetime, and stops opening new connections once its surrounding
-  task is cancelled.
-- Server-benchmark timings use a monotonic clock, so a wall-clock adjustment mid-measurement can
-  no longer produce negative or nonsense scores.
-- `SlipstreamSynchronizer`'s server benchmark (`evaluateBestOf`, `evaluateServerSwitch`) now
-  applies the same health checks as `SDKSynchronizer`: a consensus-branch-id check and a
-  synced-height check rule out servers on the wrong fork or far behind the chain tip, and
-  regtest chain names are accepted on the regtest network. Previously a stalled server that
-  answered `getInfo` quickly could rank first.
 - `SynchronizerState.isSpendableMasked` now always describes the balances carried in the same
   emission: a poll that falls back to the previous balances carries their mask flag, and a
   standalone `getAccountsBalances()` read no longer changes the flag the next emission reports.
@@ -226,6 +145,108 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   skips the transaction, instead of reading the missing file as a never-written store and
   broadcasting through the default endpoint. `transactionSubmissionStatus(for:)` is unaffected: it
   already reported no status for that case.
+
+# 4.3.0 - 2026-09-08
+
+## Added
+
+### Voting
+
+- `VotingRustBackend.restoreRecoveredDelegation(_:)`, `RecoveredDelegationRestoreRequest`,
+  `RecoveredDelegationBundle` and `RecoveredDelegationRestoreResult` restore a delegation from
+  recovered `(bundle_index, total_note_value, van_comm_rand, delegation_tx_hash)` tuples. The
+  call refuses to clear a round that holds votes, shares, Keystone signatures, or any bundle
+  the package does not restore, and reports `.alreadyRestored` without writing when the round
+  already holds the package. The package must be contiguous from bundle zero and cover every
+  bundle the round holds; it may extend a prefix restored earlier. Each
+  bundle carries `van`, the commitment the recovered row held; the call refuses a bundle whose
+  blinding and weight do not open it before clearing anything. The request takes a
+  `VotingHotkey`; its secret is unwrapped only at the FFI boundary, and the recovered blinding
+  factors are `Undescribable`.
+- `VotingRustBackend.vanCommitment(hotkey:networkId:roundId:totalNoteValue:vanCommRand:)` returns
+  the VAN commitment those inputs open, the value the restore recomputes per bundle.
+- `VotingRustBackend.hotkey(fromStoredSecret:networkId:)` returns the `VotingHotkey` a persisted
+  stored secret describes, so applications no longer need to pass bare secret bytes to SDK calls
+  that want the semantic type.
+
+## Changed
+
+- `ZcashTransaction.Overview.ZIP318Kind` (the type of `zip318Kind`) gained the case
+  `canonicalCrossingPayment`: a canonical pool crossing that pays a third party — the same
+  on-chain shape as a migration `transfer`, but not a migration this account made. Such
+  transactions were previously reported as `notClassified`. An exhaustive `switch` over
+  `ZIP318Kind` stops compiling until the new case is handled.
+
+# 4.2.0 - 2026-09-03
+
+## Added
+
+### Balances
+
+- `Synchronizer.getLocalAccountBalances()` and `SynchronizerState.localAccountsBalances` expose
+  the last account balances stored in the wallet database without chain-tip freshness masking.
+  Wallet apps can keep a stale balance visible while they replace networking. Synchronizers that
+  do not support durable snapshots return `nil`. Existing balance APIs keep their masking behavior.
+
+## Changed
+
+- `Synchronizer` gained a new requirement:
+  `evaluateServerSwitch(current:candidates:fetchThresholdSeconds:nBlocksToFetch:network:)`. Any
+  custom `Synchronizer` conformer or test double stops compiling until it implements it — see
+  `MIGRATING.md` for a drop-in stub. The method benchmarks the candidates (always including the
+  current endpoint, appending it when the caller's list omits it) and returns the endpoint worth
+  switching to, or `nil` to stay. A switch requires beating the current server's score on both an
+  absolute and a relative gate; the gates are bypassed only when the current server fails the
+  benchmark twice in a row. On `SDKSynchronizer` the block-fetch phase is bounded to the three
+  fastest candidates by latency plus the current server — never the whole list — so network cost
+  does not grow with the number of candidates. A call whose surrounding task is cancelled returns
+  `nil`.
+- Proposal and transaction-creation failures now report WHY they failed, and from WHERE
+  (MOB-1201). Previously every such failure surfaced as `ZcashError.rustCreateToAddress`, whose
+  `errorDescription` printed only the static sentence "Error from rust layer when calling
+  ZcashRustBackend.createToAddress" — the rust error string was carried in the associated value and
+  never rendered, so a user's error report named no cause and did not even say whether the failure
+  happened while BUILDING a proposal or while signing an already-confirmed one.
+
+  The rust layer now classifies these failures instead of flattening them into a string, and each
+  call site throws its own code: `rustProposeTransfer` (`ZRUST0151`), `rustProposeTransferFromURI`
+  (`ZRUST0057`), `rustProposeSendMaxTransfer` (`ZRUST0129`),
+  `rustProposeOrchardToIronwoodMigration` (`ZRUST0152`), and `rustCreateToAddress` (`ZRUST0002`),
+  which now covers only the signing step. Two conditions a wallet should render itself rather than
+  show as an error get dedicated cases: `rustProposalScanRequired` (`ZRUST0153`) and
+  `rustProposalInsufficientFunds(available:required:)` (`ZRUST0154`), the latter carrying both
+  amounts as `Zatoshi`.
+
+  BREAKING: the associated value of `rustCreateToAddress`, `rustProposeTransferFromURI`, and
+  `rustProposeSendMaxTransfer` changes from `String` to the new `RedactedRustError`, which carries
+  a `RustErrorKind` to switch on alongside the message. `ZcashError` also gains a `detail` property,
+  and `errorDescription` appends it when present. See MIGRATING.md.
+
+  The rendered detail is redacted at the rust boundary: it never contains an amount, address, note
+  identifier or txid, so it is safe to submit in a support ticket. `RedactedRustError` is the
+  certificate of that — `detail` renders a payload only when it has that type, so the raw strings
+  still carried by other `rust*` cases cannot reach a report. The unredacted text is logged on the
+  device at `debug!` level.
+
+## Fixed
+
+- `SyncStatus.==` now reports `.stopped` equal to `.stopped`. Previously two `.stopped` values
+  compared unequal, so any `Equatable` type that embeds a `SyncStatus`, such as `SynchronizerState`,
+  could never equal itself while the synchronizer was stopped, and code diffing consecutive states
+  saw a change on every stopped tick. No call-site edit is needed.
+- The server benchmark behind `evaluateBestOf` and `evaluateServerSwitch` no longer ranks
+  endpoints whose block stream delivers fewer blocks than requested — an empty or truncated
+  stream previously recorded a near-zero time and won the ranking outright.
+- The server benchmark closes its per-endpoint gRPC connections when evaluation finishes instead
+  of leaving teardown to object lifetime, and stops opening new connections once its surrounding
+  task is cancelled.
+- Server-benchmark timings use a monotonic clock, so a wall-clock adjustment mid-measurement can
+  no longer produce negative or nonsense scores.
+- `SlipstreamSynchronizer`'s server benchmark (`evaluateBestOf`, `evaluateServerSwitch`) now
+  applies the same health checks as `SDKSynchronizer`: a consensus-branch-id check and a
+  synced-height check rule out servers on the wrong fork or far behind the chain tip, and
+  regtest chain names are accepted on the regtest network. Previously a stalled server that
+  answered `getInfo` quickly could rank first.
 
 # 4.1.0 - 2026-09-01
 

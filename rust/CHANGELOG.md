@@ -10,12 +10,12 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `zcashlc_voting_restore_recovered_delegation` restores a delegation whose `van_comm_rand`
   was lost locally. It takes one JSON request plus the hotkey secret as raw bytes, builds a
-  `DelegationCapabilityV1` for the handle's own hotkey, refuses unless every row the package
-  does not restore is useless to the wallet (no votes, shares, Keystone signatures, or bundle
-  with an accepted hash), and only then clears the round and runs
+  `DelegationCapabilityV1` for the handle's own hotkey, refuses unless the round holds no
+  votes, shares, or Keystone signatures and every bundle row it holds is restored by the
+  package under its accepted hash, and only then clears the round and runs
   `zcash_voting::import_delegation_capability`. The package must be contiguous from bundle
-  zero; it may stop short of what a failed rebuild left behind, or extend a prefix restored
-  earlier. Replies `{"outcome":"restored"}` or
+  zero and cover every stored row; it may extend a prefix restored earlier. Replies
+  `{"outcome":"restored"}` or
   `{"outcome":"already_restored"}` as a boxed slice; null with the error set otherwise.
   Each bundle carries `van`, the commitment the recovered row held; the call recomputes the
   VAN from the hotkey, weight and blinding and refuses, before clearing anything, when it

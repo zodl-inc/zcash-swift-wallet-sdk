@@ -1837,12 +1837,17 @@ public extension CombineSynchronizer {
 }
 
 public enum SyncStatus: Equatable {
+    // Hand-rolled because `.error` carries a payload that is not `Equatable`. Every payload-free
+    // case has to be listed here: one that is missing falls to `default` and compares unequal to
+    // itself, which breaks reflexivity for every type whose synthesized `Equatable` embeds a
+    // `SyncStatus`.
     public static func == (lhs: SyncStatus, rhs: SyncStatus) -> Bool {
         switch (lhs, rhs) {
         case (.unprepared, .unprepared): return true
         case let (.syncing(lhsSyncProgress, lhsRecoveryPrgoress), .syncing(rhsSyncProgress, rhsRecoveryPrgoress)):
             return lhsSyncProgress == rhsSyncProgress && lhsRecoveryPrgoress == rhsRecoveryPrgoress
         case (.upToDate, .upToDate): return true
+        case (.stopped, .stopped): return true
         case (.error, .error): return true
         default: return false
         }

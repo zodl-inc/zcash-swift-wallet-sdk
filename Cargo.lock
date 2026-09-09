@@ -2929,7 +2929,7 @@ dependencies = [
 
 [[package]]
 name = "libzcashlc"
-version = "4.1.0"
+version = "4.3.0"
 dependencies = [
  "anyhow",
  "base64",
