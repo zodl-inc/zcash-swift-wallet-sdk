@@ -497,7 +497,12 @@ final class SlipstreamLifecycleOwnershipTests: ZcashTestCase {
 
         try await restart.value
 
-        let settled = await waitUntil { await sync.isRunningForTesting() == false }
+        // isRunning retires the pass before the awaited engine stop finishes.
+        // Observe the later stop's completion before inspecting its final trace.
+        let settled = await waitUntil {
+            let calls = await engine.calls
+            return Self.lifecycleCalls(calls).last == "stop:done"
+        }
         XCTAssertTrue(settled, "the stop queued behind the restart still runs")
 
         let calls = await engine.calls
