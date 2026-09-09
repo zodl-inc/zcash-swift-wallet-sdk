@@ -93,6 +93,25 @@ final class VotingDelegationOperationTests: XCTestCase {
         XCTAssertEqual(VotingRustBackend.interactiveProvingBoostCount(), 0)
     }
 
+    func testAlreadyCancelledInteractiveWaiterDoesNotPromoteSpeculativeProof() async throws {
+        let backend = try makeBackend()
+        let proof = ProofGate(result: makeResult())
+        let operation = try await makeOperation(backend, proof: proof)
+        let speculative = Task { try await operation.result(intent: .speculative) }
+        await fulfillment(of: [proof.entered], timeout: 5)
+        let subscribe = Gate()
+        let interactive = Task {
+            await subscribe.wait()
+            return try await operation.result(intent: .interactive)
+        }
+        interactive.cancel()
+        subscribe.open()
+        assertCancelled(await interactive.result)
+        XCTAssertEqual(VotingRustBackend.interactiveProvingBoostCount(), 0)
+        proof.release.signal()
+        _ = try await speculative.value
+    }
+
     func testCancellingOneWaiterLeavesOtherWaiterAndProducerAlive() async throws {
         let backend = try makeBackend()
         let proof = ProofGate(result: makeResult())
@@ -552,12 +571,14 @@ final class VotingDelegationOperationTests: XCTestCase {
         private let fixture: VotingDelegationProofResult
         var count: Int { entries.value }
         init(result: VotingDelegationProofResult) { fixture = result }
-        lazy var prove: VotingDelegationProveEntry = { [self] _, _, _, progress in
-            entries.increment()
-            progress?(0.25)
-            entered.fulfill()
-            release.wait()
-            return fixture
+        var prove: VotingDelegationProveEntry {
+            { [self] _, _, _, progress in
+                entries.increment()
+                progress?(0.25)
+                entered.fulfill()
+                release.wait()
+                return fixture
+            }
         }
     }
 

@@ -140,6 +140,10 @@ public final class VotingDelegationOperation: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard !cancelled, completion == nil else { return }
+        promoteLocked()
+    }
+
+    private func promoteLocked() {
         interactive = true
         if entered && !boosted {
             VotingRustBackend.beginInteractiveProvingBoost()
@@ -154,7 +158,6 @@ public final class VotingDelegationOperation: @unchecked Sendable {
         cancellation: CancellationFlag,
         continuation: CheckedContinuation<VotingDelegationProofResult, Error>
     ) {
-        if intent == .interactive { promoteSynchronously() }
         lock.lock()
         if cancelled || cancellation.isCancelled {
             lock.unlock()
@@ -166,6 +169,7 @@ public final class VotingDelegationOperation: @unchecked Sendable {
             continuation.resume(with: completion)
             return
         }
+        if intent == .interactive { promoteLocked() }
         subscribers[id] = Subscriber(continuation: continuation, progress: progress)
         let replay = latestProgress
         if task == nil, let producer {
