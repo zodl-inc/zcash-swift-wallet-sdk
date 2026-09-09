@@ -5131,11 +5131,14 @@ pub struct FfiSlipstreamSnapshot {
     pub stalled_seconds: u32,
     // ── API v2.1 fields (appended at END for padding stability) ──
     /// [E-2] 1 once the CURRENT run has refreshed the wallet-DB chain tip (the [#1591]
-    /// stale-tip fact, engine-owned): the engine's tip-refresh counter advanced past its
-    /// `start()` baseline (bumped only after `update_chain_tip` succeeds), or a pass
-    /// reached Done. Survives stop→start hops shorter than 120 s. While 0, hosts must
-    /// mask spendable balances (the mask transform stays host-side because the C
-    /// `AccountBalance` cannot express the awaiting-resolution shift).
+    /// stale-tip fact, engine-owned) AND has since completed a ChainTip-priority scan range
+    /// (`spendable_hint` = 1), or once a pass reached Done. The tip-refresh counter advancing
+    /// past its `start()` baseline (bumped only after `update_chain_tip` succeeds) proves the
+    /// tip moved; the completed range proves the wallet database can vouch for the spendable
+    /// value at that tip — between the two it reports every non-stabilized note as unspendable.
+    /// Survives stop→start hops shorter than 120 s. While 0, hosts must mask spendable balances
+    /// (the mask transform stays host-side because the C `AccountBalance` cannot express the
+    /// awaiting-resolution shift).
     pub tip_fresh: u8,
     /// [E-4] Monotonic version of the wallet's stored transaction set: bumps exactly when
     /// enhancement stores/updates a tx, the mempool monitor stores a 0-conf hit, a range

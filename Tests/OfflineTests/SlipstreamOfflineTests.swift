@@ -1083,7 +1083,8 @@ class SlipstreamOfflineTests: ZcashTestCase {
 
     // [v2.1 Phase 2] The boundary/idle timeout constants and the shouldMarkChainTipUpdated
     // suite are GONE with their machinery: summary rationing + tip freshness are engine-owned
-    // (E-1 / E-2 — `snapshot.tipFresh` carries the same semantics, computed at the source).
+    // (E-1 / E-2 — `snapshot.tipFresh` turns 1 only once the refreshed tip's ChainTip-priority
+    // range has been scanned, or the pass reached Done).
 
     // MARK: - 14. B4 stall-watchdog pure helpers (#1755 failure-path hardening)
     //

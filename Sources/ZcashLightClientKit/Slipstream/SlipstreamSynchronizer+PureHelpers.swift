@@ -79,7 +79,8 @@ extension SlipstreamSynchronizer {
     }
 
     // [v2.1 Phase 2] `shouldMarkChainTipUpdated` is GONE: tip freshness is the engine-owned
-    // snapshot fact `tipFresh` (E-2 — same semantics, computed where the tip is refreshed).
+    // snapshot fact `tipFresh` (E-2), which the engine reports only once the refreshed tip's
+    // ChainTip-priority range has also been scanned, or the pass reached Done.
 
     // ── B4 (#1755 failure-path hardening): stall watchdog ─────────────────────
 
