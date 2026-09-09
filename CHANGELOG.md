@@ -88,6 +88,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- `SyncStatus.==` now reports `.stopped` equal to `.stopped`. Previously two `.stopped` values
+  compared unequal, so any `Equatable` type that embeds a `SyncStatus`, such as `SynchronizerState`,
+  could never equal itself while the synchronizer was stopped, and code diffing consecutive states
+  saw a change on every stopped tick. No call-site edit is needed.
 - The server benchmark behind `evaluateBestOf` and `evaluateServerSwitch` no longer ranks
   endpoints whose block stream delivers fewer blocks than requested — an empty or truncated
   stream previously recorded a near-zero time and won the ranking outright.
