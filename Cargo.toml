@@ -1,6 +1,6 @@
 [package]
 name = "libzcashlc"
-version = "4.2.0"
+version = "4.3.0"
 authors = [
   "Jack Grigg <thestr4d@gmail.com>",
   "Lukas Korba <lukas@zodl.com>",
@@ -122,9 +122,10 @@ incrementalmerkletree = { version = "0.8", default-features = false }
 # instance.
 slipstream-core = { version = "0.2", package = "zodl-slipstream" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+base64 = "0.22"
+hex = "0.4"
 
 [dev-dependencies]
-hex = "0.4"
 tempfile = "3"
 
 [build-dependencies]

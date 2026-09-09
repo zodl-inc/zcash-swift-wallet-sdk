@@ -49,8 +49,13 @@ jobs:
         path: BuildSupport/products/libzcashlc.xcframework
         key: ffi-xcframework-macos-only-${{ runner.os }}-${{ steps.ffi-hash.outputs.hash }}
 
+    # Runs whenever anything in this job will invoke cargo: an FFI cache miss (the
+    # FFI build below) or an internal PR (the Rust test step). `~/.cargo/git` is
+    # deliberately left out of the cache — see `Cache Cargo` — so every cargo
+    # invocation needs a fresh authenticated clone of the private slipstream repo.
+    # Fork PRs get no secrets, which is why the Rust test step skips them.
     - name: Authorize cargo against the private slipstream repository
-      if: steps.cache-ffi.outputs.cache-hit != 'true'
+      if: steps.cache-ffi.outputs.cache-hit != 'true' || github.event.pull_request.head.repo.full_name == github.repository
       uses: ./.github/actions/authorize-slipstream
       with:
         app-id: ${{ secrets.SLIPSTREAM_APP_ID }}
@@ -64,8 +69,9 @@ jobs:
         toolchain: stable
         targets: aarch64-apple-darwin, x86_64-apple-darwin
 
+    # Used by both the FFI build and the Rust tests, so it is not conditional on
+    # the FFI cache.
     - name: Cache Cargo
-      if: steps.cache-ffi.outputs.cache-hit != 'true'
       uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
       with:
         # Deliberately enumerated rather than caching `~/.cargo` wholesale (which is what
@@ -103,6 +109,7 @@ jobs:
     # `swift test` filter reaches them. Without this step a failing Rust test
     # can sit on a branch indefinitely.
     - name: Run Rust unit tests
+      if: github.event.pull_request.head.repo.full_name == github.repository
       timeout-minutes: 30
       run: make test-rust
 

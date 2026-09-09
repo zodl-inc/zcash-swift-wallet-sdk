@@ -55,6 +55,34 @@ pub unsafe extern "C" fn zcashlc_voting_generate_hotkey(network_id: u32) -> *mut
     unwrap_exc_or_null(res)
 }
 
+/// Derive the voting hotkey a stored secret describes, for `network_id`.
+///
+/// Returns the same `FfiVotingHotkey` shape as `zcashlc_voting_generate_hotkey`,
+/// with the Orchard address and address index derived from `stored_secret`.
+/// This lets a caller that persisted only the secret hand the SDK the full
+/// semantic hotkey again. Returns null on error. Call
+/// `zcashlc_voting_free_hotkey` to free the returned pointer.
+///
+/// # Safety
+///
+/// - `stored_secret` must be valid for `stored_secret_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zcashlc_voting_hotkey_from_stored_secret(
+    stored_secret: *const u8,
+    stored_secret_len: usize,
+    network_id: u32,
+) -> *mut FfiVotingHotkey {
+    let res = catch_panic(|| {
+        let network = voting_network(network_id)?;
+        let secret = unsafe { bytes_from_ptr(stored_secret, stored_secret_len) }?;
+        let hotkey = voting::VotingHotkey::from_stored_secret(secret, network)
+            .map_err(|e| anyhow!("VotingHotkey::from_stored_secret failed: {}", e))?;
+
+        Ok(Box::into_raw(Box::new(voting_hotkey_to_ffi(hotkey)?)))
+    });
+    unwrap_exc_or_null(res)
+}
+
 /// Set up note bundles for a voting round.
 ///
 /// `notes_json` is a JSON-encoded `Vec<NoteInfo>`.

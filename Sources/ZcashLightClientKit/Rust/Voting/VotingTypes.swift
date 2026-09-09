@@ -656,3 +656,109 @@ public struct VotingDelegationSignature: Codable, Sendable, Equatable {
         case sighash
     }
 }
+
+// MARK: - Recovered delegation restore
+
+/// One bundle of a delegation recovered from a wiped voting database.
+///
+/// Carries the recovered VAN blinding factor, so it conforms to
+/// `Undescribable`: it cannot escape through `print`, interpolation, or
+/// reflection.
+public struct RecoveredDelegationBundle: Encodable, Equatable, Sendable, Undescribable {
+    public let bundleIndex: UInt32
+    /// Bundle weight in zatoshi.
+    public let totalNoteValue: UInt64
+    /// The 32-byte VAN blinding factor.
+    public let vanCommRand: [UInt8]
+    /// The 32-byte VAN commitment the recovered row carried. The restore
+    /// refuses a bundle whose blinding and weight do not open it.
+    public let van: [UInt8]
+    /// Lowercase hex SHA-256 of the signed delegation transaction.
+    public let delegationTxHash: String
+
+    public init(
+        bundleIndex: UInt32,
+        totalNoteValue: UInt64,
+        vanCommRand: [UInt8],
+        van: [UInt8],
+        delegationTxHash: String
+    ) {
+        self.bundleIndex = bundleIndex
+        self.totalNoteValue = totalNoteValue
+        self.vanCommRand = vanCommRand
+        self.van = van
+        self.delegationTxHash = delegationTxHash
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case bundleIndex = "bundle_index"
+        case totalNoteValue = "total_note_value"
+        case vanCommRand = "van_comm_rand"
+        case van
+        case delegationTxHash = "delegation_tx_hash"
+    }
+}
+
+/// Everything `restoreRecoveredDelegation` needs. Carries the hotkey and the
+/// blinding factors, so it is deliberately not printable. The hotkey is not
+/// part of the JSON encoding: its stored secret crosses the FFI as its own
+/// buffer, unwrapped only inside `VotingRustBackend`.
+public struct RecoveredDelegationRestoreRequest: Encodable, Sendable, Undescribable {
+    public let roundId: String
+    public let snapshotHeight: UInt64
+    public let eaPublicKey: [UInt8]
+    public let ncRoot: [UInt8]
+    public let nullifierImtRoot: [UInt8]
+    public let voteChainId: String
+    /// The wallet's voting hotkey. Every VAN is recomputed from its address.
+    public let hotkey: VotingHotkey
+    public let bundles: [RecoveredDelegationBundle]
+    public let sessionJson: String?
+
+    public init(
+        roundId: String,
+        snapshotHeight: UInt64,
+        eaPublicKey: [UInt8],
+        ncRoot: [UInt8],
+        nullifierImtRoot: [UInt8],
+        voteChainId: String,
+        hotkey: VotingHotkey,
+        bundles: [RecoveredDelegationBundle],
+        sessionJson: String?
+    ) {
+        self.roundId = roundId
+        self.snapshotHeight = snapshotHeight
+        self.eaPublicKey = eaPublicKey
+        self.ncRoot = ncRoot
+        self.nullifierImtRoot = nullifierImtRoot
+        self.voteChainId = voteChainId
+        self.hotkey = hotkey
+        self.bundles = bundles
+        self.sessionJson = sessionJson
+    }
+
+    /// `hotkey` is deliberately absent, so synthesized encoding never writes
+    /// its secret into the JSON document.
+    enum CodingKeys: String, CodingKey {
+        case roundId = "round_id"
+        case snapshotHeight = "snapshot_height"
+        case eaPublicKey = "ea_pk"
+        case ncRoot = "nc_root"
+        case nullifierImtRoot = "nullifier_imt_root"
+        case voteChainId = "vote_chain_id"
+        case bundles
+        case sessionJson = "session_json"
+    }
+}
+
+/// What `restoreRecoveredDelegation` did.
+public enum RecoveredDelegationRestoreResult: String, Decodable, Equatable, Sendable {
+    /// The round was cleared and the delegation imported.
+    case restored
+    /// The round already held exactly this delegation; nothing was written.
+    case alreadyRestored = "already_restored"
+}
+
+struct RecoveredDelegationRestoreReply: Decodable {
+    let outcome: RecoveredDelegationRestoreResult
+}

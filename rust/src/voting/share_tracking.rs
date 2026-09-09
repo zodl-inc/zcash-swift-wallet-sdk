@@ -493,7 +493,10 @@ mod tests {
         let ptr = unsafe {
             zcashlc_voting_recoverable_share_indices(json_bytes.as_ptr(), json_bytes.len())
         };
-        assert!(!ptr.is_null(), "expected recoverable share indices, got null");
+        assert!(
+            !ptr.is_null(),
+            "expected recoverable share indices, got null"
+        );
         let result_bytes = unsafe { (*ptr).as_slice() }.to_vec();
         unsafe { zcashlc_free_boxed_slice(ptr) };
         serde_json::from_slice(&result_bytes).expect("share indices json")

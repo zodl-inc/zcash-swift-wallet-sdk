@@ -973,6 +973,42 @@ extension VotingRustBackend {
         }
     }
 
+    /// Restore a delegation carved out of a wiped voting database.
+    ///
+    /// Rust refuses unless every row of the round is provably useless to the
+    /// wallet: no votes, no delivered shares, no Keystone signatures, and no
+    /// accepted transaction hash other than the package's. Only then does it
+    /// clear the round and import the package, recomputing every VAN from
+    /// the hotkey first. A round already holding this delegation returns
+    /// `.alreadyRestored` without writing.
+    public func restoreRecoveredDelegation(
+        _ request: RecoveredDelegationRestoreRequest
+    ) throws -> RecoveredDelegationRestoreResult {
+        let requestBytes = [UInt8](try JSONEncoder().encode(request))
+        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
+            let ptr = requestBytes.withUnsafeBufferPointer { requestBuffer in
+                request.hotkey.storedSecret.withUnsafeBufferPointer { secretBuffer in
+                    zcashlc_voting_restore_recovered_delegation(
+                        dbh,
+                        requestBuffer.baseAddress,
+                        UInt(requestBuffer.count),
+                        secretBuffer.baseAddress,
+                        UInt(secretBuffer.count)
+                    )
+                }
+            }
+            guard let ptr else {
+                throw VotingRustBackendError.rustError(
+                    lastErrorMessage(fallback: "`restore_recovered_delegation` failed")
+                )
+            }
+            return ptr
+        }
+        defer { zcashlc_free_boxed_slice(ptr) }
+        let reply: RecoveredDelegationRestoreReply = try decodeJSON(from: ptr)
+        return reply.outcome
+    }
+
     /// Delete bundle rows with index ≥ `keepCount`, returning the number of rows deleted.
     public func deleteSkippedBundles(roundId: String, keepCount: UInt32) throws -> UInt32 {
         let roundIdBytes = [UInt8](roundId.utf8)
@@ -1497,7 +1533,62 @@ extension VotingRustBackend {
             )
         }
         defer { zcashlc_voting_free_hotkey(ptr) }
+        return votingHotkey(from: ptr)
+    }
 
+    /// The hotkey a stored secret describes, for `networkId`.
+    ///
+    /// The address and address index are derived from the secret, so an
+    /// application that persisted only ``VotingHotkey/storedSecret`` can hand
+    /// the SDK the full semantic hotkey again instead of bare key bytes.
+    public static func hotkey(fromStoredSecret storedSecret: [UInt8], networkId: UInt32) throws -> VotingHotkey {
+        let ptr = storedSecret.withUnsafeBufferPointer { buffer in
+            zcashlc_voting_hotkey_from_stored_secret(buffer.baseAddress, UInt(buffer.count), networkId)
+        }
+        guard let ptr else {
+            throw VotingRustBackendError.rustError(
+                staticLastErrorMessage(fallback: "`hotkey_from_stored_secret` failed")
+            )
+        }
+        defer { zcashlc_voting_free_hotkey(ptr) }
+        return votingHotkey(from: ptr)
+    }
+
+    /// The VAN commitment `hotkey`, `roundId`, `totalNoteValue` and
+    /// `vanCommRand` open. It is the value `restoreRecoveredDelegation`
+    /// recomputes for each bundle before it clears anything, so a caller can
+    /// check a recovered row the same way.
+    public static func vanCommitment(
+        hotkey: VotingHotkey,
+        networkId: UInt32,
+        roundId: String,
+        totalNoteValue: UInt64,
+        vanCommRand: [UInt8]
+    ) throws -> [UInt8] {
+        let roundIdBytes = [UInt8](roundId.utf8)
+        return try staticBoxedSliceFFI(fallback: "`van_commitment` failed") {
+            hotkey.storedSecret.withUnsafeBufferPointer { secret in
+                roundIdBytes.withUnsafeBufferPointer { round in
+                    vanCommRand.withUnsafeBufferPointer { rand in
+                        zcashlc_voting_van_commitment(
+                            secret.baseAddress,
+                            UInt(secret.count),
+                            networkId,
+                            round.baseAddress,
+                            UInt(round.count),
+                            totalNoteValue,
+                            rand.baseAddress,
+                            UInt(rand.count)
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /// Copies an `FfiVotingHotkey` into Swift-owned memory. The caller frees
+    /// the Rust allocation.
+    private static func votingHotkey(from ptr: UnsafeMutablePointer<FfiVotingHotkey>) -> VotingHotkey {
         let raw = ptr.pointee
         return VotingHotkey(
             storedSecret: bytesFromRawPointer(raw.stored_secret, count: Int(raw.stored_secret_len)),

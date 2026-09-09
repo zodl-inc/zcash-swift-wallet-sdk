@@ -6,7 +6,7 @@
 # that Scripts/tests/run-tests.sh can exercise it without a network, a git
 # remote, or a GitHub token.
 #
-# Written for bash 3.2, which is what macOS ships.
+# Compatible with bash 3.2, which remains available on macOS.
 
 # Paths, relative to the repository root.
 PLIST="BuildSupport/platform-Info.plist"
