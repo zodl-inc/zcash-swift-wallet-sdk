@@ -268,6 +268,41 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
         await synchronizer.resetKeystoneSignBatchDecoder()
     }
 
+    // MARK: - Wrapper-protocol `restartSync(at:)` defaults (source compatibility)
+
+    /// [MOB-1850 review] `restartSync(at:)` was added to `ClosureSynchronizer` and
+    /// `CombineSynchronizer` alongside `Synchronizer`, but only `Synchronizer` originally shipped a
+    /// default implementation. Without one on the other two, any external conformer of either
+    /// protocol that is not simply a thin forwarder to a `Synchronizer` -- `ClosureSDKSynchronizer`
+    /// and `CombineSDKSynchronizer` both are, so neither exercises this -- would stop compiling the
+    /// moment the member was added. `ClosureSynchronizerWithoutRestartSync` below is a compile-only
+    /// double built to pin the fix: it conforms to `ClosureSynchronizer` without overriding
+    /// `restartSync`, so this test only compiles at all if the default exists, and only passes if the
+    /// default behaves correctly.
+    func testClosureSynchronizerRestartSyncDefaultThrowsUnimplemented() {
+        let sync: ClosureSynchronizer = ClosureSynchronizerWithoutRestartSync()
+        var receivedError: Error?
+        sync.restartSync(at: LightWalletEndpoint(address: "example.com", port: 443, secure: true)) { error in
+            receivedError = error
+        }
+        assertUnimplemented(receivedError)
+    }
+
+    /// Same pin as above, for `CombineSynchronizer` -- see `CombineSynchronizerWithoutRestartSync`.
+    func testCombineSynchronizerRestartSyncDefaultFailsWithUnimplemented() {
+        let sync: CombineSynchronizer = CombineSynchronizerWithoutRestartSync()
+        var receivedCompletion: Subscribers.Completion<Error>?
+        let cancellable = sync.restartSync(at: LightWalletEndpoint(address: "example.com", port: 443, secure: true))
+            .sink(receiveCompletion: { receivedCompletion = $0 }, receiveValue: { _ in })
+        defer { cancellable.cancel() }
+
+        guard case .failure(let error) = receivedCompletion else {
+            XCTFail("Expected the default to fail the publisher, got \(String(describing: receivedCompletion))")
+            return
+        }
+        assertUnimplemented(error)
+    }
+
     // MARK: - Helpers
 
     /// Asserts `operation` throws a `LocalizedError` describing a missing default implementation --
@@ -292,6 +327,22 @@ final class SynchronizerMigrationDefaultsTests: XCTestCase {
         } catch {
             XCTFail("Expected a LocalizedError describing a missing default implementation, got \(error)", file: file, line: line)
         }
+    }
+
+    /// Non-async restatement of `assertThrowsMigrationUnimplemented`'s check, for the closure/Combine
+    /// wrapper defaults above, which resolve synchronously rather than via `async throws`.
+    private func assertUnimplemented(_ error: Error?, file: StaticString = #filePath, line: UInt = #line) {
+        guard let localizedError = error as? LocalizedError else {
+            XCTFail("Expected a LocalizedError describing a missing default implementation, got \(String(describing: error))", file: file, line: line)
+            return
+        }
+        XCTAssertEqual(
+            localizedError.errorDescription?.contains("has no default implementation"),
+            true,
+            "expected an 'unimplemented' style message, got: \(String(describing: localizedError.errorDescription))",
+            file: file,
+            line: line
+        )
     }
 }
 
@@ -423,6 +474,260 @@ private final class NonMigratingSynchronizer: Synchronizer {
     func enhanceTransactionBy(txId: TxId) async throws -> Void { Self.unused() }
     func deleteAccount(_ accountUUID: AccountUUID) async throws -> Void { Self.unused() }
 
-    // `getTreeState(height:)` and `broadcaster` are intentionally left unimplemented too, relying on
-    // their own pre-existing defaults -- this conformer implements the bare minimum.
+    // `getTreeState(height:)`, `broadcaster` and `restartSync(at:)` are intentionally left
+    // unimplemented too, relying on their own pre-existing defaults -- this conformer implements the
+    // bare minimum.
+}
+
+/// [MOB-1850 review] Compile-only double proving `ClosureSynchronizer` remains source-compatible
+/// without an override for the `restartSync(at:completion:)` requirement. Every other member is a
+/// `fatalError` stub: giving this protocol the full `NonMigratingSynchronizer` treatment (a real,
+/// exercised conformer) would be disproportionate for pinning a single default, and unnecessary --
+/// nothing here is ever called except `restartSync`, which deliberately falls through to the
+/// protocol-extension default under test.
+private final class ClosureSynchronizerWithoutRestartSync: ClosureSynchronizer {
+    private static func unused(_ member: StaticString = #function) -> Never {
+        fatalError("ClosureSynchronizerWithoutRestartSync.\(member) is not exercised by this test")
+    }
+
+    var alias: ZcashSynchronizerAlias { Self.unused() }
+    var latestState: SynchronizerState { Self.unused() }
+    var connectionState: ConnectionState { Self.unused() }
+    var stateStream: AnyPublisher<SynchronizerState, Never> { Self.unused() }
+    var eventStream: AnyPublisher<SynchronizerEvent, Never> { Self.unused() }
+
+    func prepare(
+        with seed: [UInt8]?,
+        walletBirthday: BlockHeight?,
+        name: String,
+        keySource: String?,
+        completion: @escaping (Result<Initializer.InitializationResult, Error>) -> Void
+    ) { Self.unused() }
+
+    func start(retry: Bool, completion: @escaping (Error?) -> Void) { Self.unused() }
+    func stop() { Self.unused() }
+
+    func getSaplingAddress(accountUUID: AccountUUID, completion: @escaping (Result<SaplingAddress, Error>) -> Void) { Self.unused() }
+    func getUnifiedAddress(accountUUID: AccountUUID, completion: @escaping (Result<UnifiedAddress, Error>) -> Void) { Self.unused() }
+    func getTransparentAddress(accountUUID: AccountUUID, completion: @escaping (Result<TransparentAddress, Error>) -> Void) { Self.unused() }
+
+    func getCustomUnifiedAddress(
+        accountUUID: AccountUUID,
+        receivers: Set<ReceiverType>,
+        completion: @escaping (Result<UnifiedAddress, Error>) -> Void
+    ) { Self.unused() }
+
+    func proposeTransfer(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        amount: Zatoshi,
+        memo: Memo?,
+        completion: @escaping (Result<Proposal, Error>) -> Void
+    ) { Self.unused() }
+
+    func proposeSendMax(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        memo: Memo?,
+        mode: MaxSpendMode,
+        completion: @escaping (Result<Proposal, Error>) -> Void
+    ) { Self.unused() }
+
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID, completion: @escaping (Result<Proposal, Error>) -> Void) { Self.unused() }
+
+    func proposeShielding(
+        accountUUID: AccountUUID,
+        shieldingThreshold: Zatoshi,
+        memo: Memo,
+        transparentReceiver: TransparentAddress?,
+        completion: @escaping (Result<Proposal?, Error>) -> Void
+    ) { Self.unused() }
+
+    func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey,
+        completion: @escaping (Result<AsyncThrowingStream<TransactionSubmitResult, Error>, Error>) -> Void
+    ) { Self.unused() }
+
+    func createPCZTFromProposal(accountUUID: AccountUUID, proposal: Proposal, completion: @escaping (Result<Pczt, Error>) -> Void) { Self.unused() }
+    func redactPCZTForSigner(pczt: Pczt, completion: @escaping (Result<Pczt, Error>) -> Void) { Self.unused() }
+    func PCZTRequiresSaplingProofs(pczt: Pczt, completion: @escaping (Bool) -> Void) { Self.unused() }
+    func addProofsToPCZT(pczt: Pczt, completion: @escaping (Result<Pczt, Error>) -> Void) { Self.unused() }
+
+    func createTransactionFromPCZT(
+        pcztWithProofs: Pczt,
+        pcztWithSigs: Pczt,
+        completion: @escaping (Result<AsyncThrowingStream<TransactionSubmitResult, Error>, Error>) -> Void
+    ) { Self.unused() }
+
+    func listAccounts(completion: @escaping (Result<[Account], Error>) -> Void) { Self.unused() }
+
+    func importAccount(
+        ufvk: String,
+        seedFingerprint: [UInt8]?,
+        zip32AccountIndex: Zip32AccountIndex?,
+        purpose: AccountPurpose,
+        name: String,
+        keySource: String?,
+        birthday: BlockHeight?,
+        completion: @escaping (Result<AccountUUID, Error>) -> Void
+    ) async throws { Self.unused() }
+
+    func clearedTransactions(completion: @escaping ([ZcashTransaction.Overview]) -> Void) { Self.unused() }
+    func sentTranscations(completion: @escaping ([ZcashTransaction.Overview]) -> Void) { Self.unused() }
+    func receivedTransactions(completion: @escaping ([ZcashTransaction.Overview]) -> Void) { Self.unused() }
+    func paginatedTransactions(of kind: TransactionKind) -> PaginatedTransactionRepository { Self.unused() }
+    func getMemos(for transaction: ZcashTransaction.Overview, completion: @escaping (Result<[Memo], Error>) -> Void) { Self.unused() }
+    func getRecipients(for transaction: ZcashTransaction.Overview, completion: @escaping ([TransactionRecipient]) -> Void) { Self.unused() }
+
+    func allConfirmedTransactions(
+        from transaction: ZcashTransaction.Overview,
+        limit: Int,
+        completion: @escaping (Result<[ZcashTransaction.Overview], Error>) -> Void
+    ) { Self.unused() }
+
+    func latestHeight(completion: @escaping (Result<BlockHeight, Error>) -> Void) { Self.unused() }
+
+    func refreshUTXOs(address: TransparentAddress, from height: BlockHeight, completion: @escaping (Result<RefreshedUTXOs, Error>) -> Void) {
+        Self.unused()
+    }
+
+    func getAccountsBalances(_ completion: @escaping (Result<[AccountUUID: AccountBalance], Error>) -> Void) { Self.unused() }
+    func getLocalAccountBalances(_ completion: @escaping (Result<[AccountUUID: AccountBalance]?, Error>) -> Void) { Self.unused() }
+
+    func refreshExchangeRateUSD() { Self.unused() }
+    func estimateBirthdayHeight(for date: Date, completion: @escaping (BlockHeight) -> Void) { Self.unused() }
+
+    func httpRequestOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8,
+        completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void
+    ) { Self.unused() }
+
+    func rewind(_ policy: RewindPolicy) -> CompletablePublisher<Error> { Self.unused() }
+    func wipe() -> CompletablePublisher<Error> { Self.unused() }
+    func rescanFrom(height: BlockHeight, completion: @escaping (Error?) -> Void) { Self.unused() }
+
+    // `broadcaster`, `transactionSubmissionStatus(for:completion:)` and `restartSync(at:completion:)`
+    // are intentionally left unimplemented, relying on their protocol-extension defaults -- the last
+    // one is the member this double exists to exercise.
+}
+
+/// [MOB-1850 review] Compile-only double proving `CombineSynchronizer` remains source-compatible
+/// without an override for the `restartSync(at:)` requirement. See
+/// `ClosureSynchronizerWithoutRestartSync`'s doc for why a `fatalError`-stubbed double, not a real
+/// conformer, is the proportionate way to pin this.
+private final class CombineSynchronizerWithoutRestartSync: CombineSynchronizer {
+    private static func unused(_ member: StaticString = #function) -> Never {
+        fatalError("CombineSynchronizerWithoutRestartSync.\(member) is not exercised by this test")
+    }
+
+    var alias: ZcashSynchronizerAlias { Self.unused() }
+    var latestState: SynchronizerState { Self.unused() }
+    var connectionState: ConnectionState { Self.unused() }
+    var stateStream: AnyPublisher<SynchronizerState, Never> { Self.unused() }
+    var eventStream: AnyPublisher<SynchronizerEvent, Never> { Self.unused() }
+
+    func prepare(
+        with seed: [UInt8]?,
+        walletBirthday: BlockHeight?,
+        name: String,
+        keySource: String?
+    ) -> SinglePublisher<Initializer.InitializationResult, Error> { Self.unused() }
+
+    func start(retry: Bool) -> CompletablePublisher<Error> { Self.unused() }
+    func stop() { Self.unused() }
+
+    func getSaplingAddress(accountUUID: AccountUUID) -> SinglePublisher<SaplingAddress, Error> { Self.unused() }
+    func getUnifiedAddress(accountUUID: AccountUUID) -> SinglePublisher<UnifiedAddress, Error> { Self.unused() }
+    func getTransparentAddress(accountUUID: AccountUUID) -> SinglePublisher<TransparentAddress, Error> { Self.unused() }
+
+    func getCustomUnifiedAddress(
+        accountUUID: AccountUUID,
+        receivers: Set<ReceiverType>
+    ) -> SinglePublisher<UnifiedAddress, Error> { Self.unused() }
+
+    func proposeTransfer(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        amount: Zatoshi,
+        memo: Memo?
+    ) -> SinglePublisher<Proposal, Error> { Self.unused() }
+
+    func proposeSendMax(
+        accountUUID: AccountUUID,
+        recipient: Recipient,
+        memo: Memo?,
+        mode: MaxSpendMode
+    ) -> SinglePublisher<Proposal, Error> { Self.unused() }
+
+    func proposeOrchardToIronwoodMigration(accountUUID: AccountUUID) -> SinglePublisher<Proposal, Error> { Self.unused() }
+
+    func proposeShielding(
+        accountUUID: AccountUUID,
+        shieldingThreshold: Zatoshi,
+        memo: Memo,
+        transparentReceiver: TransparentAddress?
+    ) -> SinglePublisher<Proposal?, Error> { Self.unused() }
+
+    func createProposedTransactions(
+        proposal: Proposal,
+        spendingKey: UnifiedSpendingKey
+    ) -> SinglePublisher<AsyncThrowingStream<TransactionSubmitResult, Error>, Error> { Self.unused() }
+
+    func createPCZTFromProposal(accountUUID: AccountUUID, proposal: Proposal) -> SinglePublisher<Pczt, Error> { Self.unused() }
+    func redactPCZTForSigner(pczt: Pczt) -> SinglePublisher<Pczt, Error> { Self.unused() }
+    func PCZTRequiresSaplingProofs(pczt: Pczt) -> SinglePublisher<Bool, Never> { Self.unused() }
+    func addProofsToPCZT(pczt: Pczt) -> SinglePublisher<Pczt, Error> { Self.unused() }
+
+    func createTransactionFromPCZT(
+        pcztWithProofs: Pczt,
+        pcztWithSigs: Pczt
+    ) -> SinglePublisher<AsyncThrowingStream<TransactionSubmitResult, Error>, Error> { Self.unused() }
+
+    func proposefulfillingPaymentURI(_ uri: String, accountUUID: AccountUUID) -> SinglePublisher<Proposal, Error> { Self.unused() }
+
+    func listAccounts() -> SinglePublisher<[Account], Error> { Self.unused() }
+
+    func importAccount(
+        ufvk: String,
+        seedFingerprint: [UInt8]?,
+        zip32AccountIndex: Zip32AccountIndex?,
+        purpose: AccountPurpose,
+        name: String,
+        keySource: String?,
+        birthday: BlockHeight?
+    ) async throws -> SinglePublisher<AccountUUID, Error> { Self.unused() }
+
+    var allTransactions: SinglePublisher<[ZcashTransaction.Overview], Never> { Self.unused() }
+    var sentTransactions: SinglePublisher<[ZcashTransaction.Overview], Never> { Self.unused() }
+    var receivedTransactions: SinglePublisher<[ZcashTransaction.Overview], Never> { Self.unused() }
+
+    func paginatedTransactions(of kind: TransactionKind) -> PaginatedTransactionRepository { Self.unused() }
+    func getMemos(for transaction: ZcashTransaction.Overview) -> SinglePublisher<[Memo], Error> { Self.unused() }
+    func getRecipients(for transaction: ZcashTransaction.Overview) -> SinglePublisher<[TransactionRecipient], Never> { Self.unused() }
+
+    func allTransactions(from transaction: ZcashTransaction.Overview, limit: Int) -> SinglePublisher<[ZcashTransaction.Overview], Error> {
+        Self.unused()
+    }
+
+    func latestHeight() -> SinglePublisher<BlockHeight, Error> { Self.unused() }
+    func refreshUTXOs(address: TransparentAddress, from height: BlockHeight) -> SinglePublisher<RefreshedUTXOs, Error> { Self.unused() }
+    func getLocalAccountBalances() -> SinglePublisher<[AccountUUID: AccountBalance]?, Error> { Self.unused() }
+
+    func refreshExchangeRateUSD() { Self.unused() }
+    func estimateBirthdayHeight(for date: Date) -> SinglePublisher<BlockHeight, Error> { Self.unused() }
+
+    func httpRequestOverTor(
+        for request: URLRequest,
+        retryLimit: UInt8
+    ) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error> { Self.unused() }
+
+    func rewind(_ policy: RewindPolicy) -> CompletablePublisher<Error> { Self.unused() }
+    func wipe() -> CompletablePublisher<Error> { Self.unused() }
+    func rescanFrom(height: BlockHeight) -> CompletablePublisher<Error> { Self.unused() }
+
+    // `broadcaster`, `transactionSubmissionStatus(for:)` and `restartSync(at:)` are intentionally
+    // left unimplemented, relying on their protocol-extension defaults -- the last one is the member
+    // this double exists to exercise.
 }

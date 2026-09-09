@@ -279,6 +279,18 @@ extension CombineSDKSynchronizer: CombineSynchronizer {
         }
     }
 
+    public func transactionSubmissionStatus(for rawID: Data) -> SinglePublisher<TransactionSubmissionStatus?, Never> {
+        AsyncToCombineGateway.executeAction() {
+            await self.synchronizer.transactionSubmissionStatus(for: rawID)
+        }
+    }
+
+    public func restartSync(at endpoint: LightWalletEndpoint) -> CompletablePublisher<Error> {
+        AsyncToCombineGateway.executeThrowingAction() {
+            try await self.synchronizer.restartSync(at: endpoint)
+        }
+    }
+
     public func refreshExchangeRateUSD() {
         synchronizer.refreshExchangeRateUSD()
     }

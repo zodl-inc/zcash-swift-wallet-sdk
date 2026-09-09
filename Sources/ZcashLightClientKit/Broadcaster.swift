@@ -19,6 +19,10 @@ import Foundation
 /// resubmission retries through those endpoints instead of the synchronizer's
 /// default endpoint.
 ///
+/// A host that created transactions but could not submit them itself (offline,
+/// backgrounded, submission abandoned) can instead hand them to background
+/// resubmission via ``releaseForResubmission(transactions:to:)``.
+///
 /// Typical usage:
 /// ```swift
 /// let transactions = try await synchronizer.broadcaster.createProposedTransactions(
@@ -75,6 +79,20 @@ public protocol Broadcaster: AnyObject {
         to endpoints: [LightWalletEndpoint],
         timing: SubmissionTiming
     ) async -> [TransactionSubmissionReport]
+
+    /// Releases transactions the app created but could not hand to a server itself (offline,
+    /// backgrounded, submission abandoned, etc.) to the SDK's background resubmission.
+    ///
+    /// Records each transaction's retry plan with `endpoints` — the same bookkeeping `submit`
+    /// does before its network attempt — without making a network attempt of its own, moving the
+    /// transaction from `.awaiting` to `.ready` so background resubmission broadcasts it on its
+    /// normal cadence using the same transaction id it was created with.
+    ///
+    /// An empty endpoint list records nothing; the transactions stay `.awaiting`.
+    func releaseForResubmission(
+        transactions: [CreatedTransaction],
+        to endpoints: [LightWalletEndpoint]
+    ) async
 }
 
 extension Broadcaster {
@@ -93,6 +111,16 @@ extension Broadcaster {
         to endpoints: [LightWalletEndpoint]
     ) async -> [TransactionSubmissionReport] {
         await submit(transactions: transactions, to: endpoints, timing: SubmissionTiming.default)
+    }
+
+    /// Default implementation so adding `releaseForResubmission(transactions:to:)` to the
+    /// protocol is not a source-breaking change for downstream conformers: custom `Broadcaster`
+    /// conformers without submit-plan bookkeeping have nothing to release, so they inherit this
+    /// no-op unless they choose to override it.
+    public func releaseForResubmission(
+        transactions: [CreatedTransaction],
+        to endpoints: [LightWalletEndpoint]
+    ) async {
     }
 }
 

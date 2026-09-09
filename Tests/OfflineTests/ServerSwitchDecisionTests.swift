@@ -374,13 +374,14 @@ final class ServerSwitchDecisionTests: XCTestCase {
         XCTAssertEqual(stub.requests.count, 2)
     }
 
-    // No healthy results at all → stay, and the re-probe was still attempted for current.
+    // No healthy results at all → stay, and the re-probe is skipped: nothing answered the first
+    // round, so a second call to the same set is not going to fare any better.
     func testEvaluateNoResultsStays() async {
-        let stub = BenchmarkStub([[], []])
+        let stub = BenchmarkStub([[]])
         let result = await evaluate(current: endpoint("current.example"), candidates: [endpoint("a.example")], stub: stub)
 
         XCTAssertNil(result)
-        XCTAssertEqual(stub.requests.count, 2)
+        XCTAssertEqual(stub.requests.count, 1)
     }
 
     // An empty candidate list still measures the current server and stays on it.

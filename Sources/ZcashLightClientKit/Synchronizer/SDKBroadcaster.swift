@@ -65,12 +65,49 @@ final class SDKBroadcaster: Broadcaster {
         logger.debug("Transaction \(txId) submitting to \(endpoints.count) endpoint(s): \(endpointList).")
 
         // Record before any network attempt so a cancelled or timed-out race
-        // still leaves the intended retry plan behind.
-        await submitPlanStore.recordPlan(txId: transaction.txId, endpoints: endpoints)
+        // still leaves the intended retry plan behind. The returned token is
+        // carried through the network race so a `wipe()` that lands while it
+        // is in flight leaves the eventual `markAccepted` call provably stale.
+        let lifecycle = await submitPlanStore.recordPlan(txId: transaction.txId, endpoints: endpoints)
 
         let outcome = await multiEndpointSubmitter.submit(transaction: transaction, to: endpoints, timing: timing)
         logger.debug("Transaction \(txId) submission \(outcome.logDescription).")
+
+        // Remember which server took it, so the app can tell "handed to a
+        // server" apart from "still trying" while the transaction waits to be
+        // mined. Retrying continues either way — a mempool is not a commitment.
+        if case .accepted(by: let endpoint) = outcome {
+            await submitPlanStore.markAccepted(txId: transaction.txId, host: "\(endpoint.host):\(endpoint.port)", lifecycle: lifecycle)
+        }
+
         return outcome
+    }
+
+    func releaseForResubmission(
+        transactions: [CreatedTransaction],
+        to endpoints: [LightWalletEndpoint]
+    ) async {
+        guard !endpoints.isEmpty else {
+            logger.debug("Release for resubmission requested with no endpoints; transactions stay awaiting.")
+            return
+        }
+        // `recordPlanForAwaitingTransaction`, not `recordPlan`: a release only succeeds for a
+        // transaction that already has an awaiting row from this wallet lifecycle, so a release
+        // landing after `wipe()` can never recreate the plan store's database file.
+        var releasedCount = 0
+        for transaction in transactions {
+            guard await submitPlanStore.recordPlanForAwaitingTransaction(txId: transaction.txId, endpoints: endpoints) != nil else {
+                logger.debug(
+                    """
+                    Release for resubmission dropped for \(transaction.txId.toHexStringTxId()); the transaction has \
+                    no awaiting row in the current wallet lifecycle.
+                    """
+                )
+                continue
+            }
+            releasedCount += 1
+        }
+        logger.debug("Released \(releasedCount) created transaction(s) to background resubmission.")
     }
 
     func submit(
@@ -111,6 +148,12 @@ final class SDKBroadcaster: Broadcaster {
         recordingPlans: Bool
     ) async throws -> [CreatedTransaction] {
         try statusCheck()
+
+        // Captured before the (potentially slow) sapling-parameter download and proving work so a
+        // `wipe()` that lands mid-flight leaves the eventual `markAwaitingSubmission` call provably
+        // stale instead of reopening — and thereby recreating — the database `wipe()` just deleted.
+        let lifecycle = await submitPlanStore.currentLifecycle()
+
         try await downloadSaplingParamsIfNeeded()
 
         let createdTransactions = try await transactionEncoder.createProposedTransactions(
@@ -122,7 +165,8 @@ final class SDKBroadcaster: Broadcaster {
         return await finishCreation(
             createdTransactions: createdTransactions,
             overviews: overviews,
-            recordingPlans: recordingPlans
+            recordingPlans: recordingPlans,
+            lifecycle: lifecycle
         )
     }
 
@@ -132,6 +176,13 @@ final class SDKBroadcaster: Broadcaster {
         recordingPlans: Bool
     ) async throws -> [CreatedTransaction] {
         try statusCheck()
+
+        // Captured before the (potentially slow) sapling-parameter download and PCZT extraction so
+        // a `wipe()` that lands mid-flight leaves the eventual `markAwaitingSubmission` call
+        // provably stale instead of reopening — and thereby recreating — the database `wipe()` just
+        // deleted.
+        let lifecycle = await submitPlanStore.currentLifecycle()
+
         try await downloadSaplingParamsIfNeeded()
 
         let txId = try await initializer.rustBackend.extractAndStoreTxFromPCZT(
@@ -149,7 +200,8 @@ final class SDKBroadcaster: Broadcaster {
         return await finishCreation(
             createdTransactions: [createdTransaction],
             overviews: overviews,
-            recordingPlans: recordingPlans
+            recordingPlans: recordingPlans,
+            lifecycle: lifecycle
         )
     }
 
@@ -187,12 +239,13 @@ final class SDKBroadcaster: Broadcaster {
     private func finishCreation(
         createdTransactions: [CreatedTransaction],
         overviews: [ZcashTransaction.Overview],
-        recordingPlans: Bool
+        recordingPlans: Bool,
+        lifecycle: SubmitPlanLifecycle
     ) async -> [CreatedTransaction] {
         let txIdList = createdTransactions.map { $0.txId.toHexStringTxId() }.joined(separator: ", ")
         if recordingPlans {
             logger.debug("Created \(createdTransactions.count) transaction(s) awaiting submission by the app: \(txIdList).")
-            await submitPlanStore.markAwaitingSubmission(txIds: createdTransactions.map(\.txId))
+            await submitPlanStore.markAwaitingSubmission(txIds: createdTransactions.map(\.txId), lifecycle: lifecycle)
         } else {
             logger.debug("Created \(createdTransactions.count) transaction(s) for immediate submission: \(txIdList).")
         }

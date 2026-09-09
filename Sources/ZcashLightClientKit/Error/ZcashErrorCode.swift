@@ -287,6 +287,8 @@ public enum ZcashErrorCode: String {
     case rustSlipstreamSyncFailed = "ZRUST0096"
     /// Operation is not supported by `SlipstreamSynchronizer` (wipe / switchTo).
     case rustSlipstreamUnsupported = "ZRUST0097"
+    /// The engine could not prove its previous pass and wallet writer had stopped before a wallet mutation; the mutation was refused.
+    case slipstreamEngineNotQuiescent = "ZRUST0155"
     /// Error from rust layer when calling ZcashRustBackend.migrationProgress
     case rustMigrationProgress = "ZRUST0099"
     /// Error from rust layer when calling ZcashRustBackend.migrationIsNoteSplitNeeded

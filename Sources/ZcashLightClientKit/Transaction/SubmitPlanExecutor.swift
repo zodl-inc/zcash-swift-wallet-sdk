@@ -17,7 +17,11 @@ final class SubmitPlanExecutor {
         self.logger = logger
     }
 
-    func submit(transaction: CreatedTransaction, endpoints: [LightWalletEndpoint]) async throws {
+    /// - Returns: the endpoint that accepted the transaction, or `nil` when
+    ///   there was nothing to submit to. Callers that only care whether the
+    ///   retry threw may ignore it.
+    @discardableResult
+    func submit(transaction: CreatedTransaction, endpoints: [LightWalletEndpoint]) async throws -> LightWalletEndpoint? {
         let txId = transaction.txId.toHexStringTxId()
         logger.debug("Transaction \(txId) background retry across \(endpoints.count) recorded endpoint(s).")
         var lastError: Error?
@@ -27,7 +31,7 @@ final class SubmitPlanExecutor {
             do {
                 try await endpointSubmitter.submit(transaction: transaction, to: endpoint)
                 logger.debug("Transaction \(txId) background retry accepted by \(endpoint.host):\(endpoint.port).")
-                return
+                return endpoint
             } catch {
                 logger.warn("Transaction \(txId) background retry to \(endpoint.host):\(endpoint.port) failed: \(error)")
                 lastError = error
@@ -38,5 +42,7 @@ final class SubmitPlanExecutor {
             logger.warn("Transaction \(txId) background retry exhausted all \(endpoints.count) recorded endpoint(s).")
             throw lastError
         }
+
+        return nil
     }
 }

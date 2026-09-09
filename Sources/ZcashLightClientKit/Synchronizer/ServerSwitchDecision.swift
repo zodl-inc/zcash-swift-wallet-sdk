@@ -87,7 +87,9 @@ enum ServerSwitchDecision {
 
     /// Runs the whole switch evaluation: benchmarks the candidates (always including
     /// `current`), gives a missing current server one confirming re-probe before treating it
-    /// as unhealthy, decides, and logs the outcome.
+    /// as unhealthy, decides, and logs the outcome. Skips the re-probe entirely when the first
+    /// round answered nothing at all -- a second call over the same set is not going to fare
+    /// any better, and the outcome is `nil` (stay) either way.
     ///
     /// `benchmark` measures the given endpoints and returns the healthy survivors sorted
     /// ascending by score; both invocations must measure the same way so their scores are
@@ -112,6 +114,11 @@ enum ServerSwitchDecision {
 
         if Task.isCancelled {
             logger.info("[evaluateServerSwitch] cancelled during benchmark -> stay")
+            return nil
+        }
+
+        guard !ranked.isEmpty else {
+            logger.info("[evaluateServerSwitch] no server answered the probe -> stay")
             return nil
         }
 
