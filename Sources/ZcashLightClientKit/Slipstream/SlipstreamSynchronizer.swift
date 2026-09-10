@@ -593,6 +593,10 @@ public actor SlipstreamSynchronizer: Synchronizer {
             ),
             latestBlockHeight: (snap?.chainTip).flatMap { $0 != 0 ? BlockHeight($0) : nil }
                 ?? latestState.latestBlockHeight,
+            // MOB-1912: carry the last known scanned height, as every in-pass state does. Without
+            // it the client sees `fullyScannedHeight == 0` next to a real chain tip and reads the
+            // whole chain as unsynced for the moment before the first in-pass state.
+            fullyScannedHeight: latestState.fullyScannedHeight,
             isRecovering: currentlyRecovering,
             isSpendableMasked: latestState.isSpendableMasked
         ))
@@ -648,6 +652,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
                 localAccountsBalances: latestState.localAccountsBalances,
                 internalSyncStatus: .stopped,
                 latestBlockHeight: latestState.latestBlockHeight,
+                fullyScannedHeight: latestState.fullyScannedHeight,
                 // Balances carry over verbatim here, so their masked-ness must carry with them
                 // rather than silently reading as authoritative.
                 isSpendableMasked: latestState.isSpendableMasked
@@ -691,6 +696,7 @@ public actor SlipstreamSynchronizer: Synchronizer {
             localAccountsBalances: latestState.localAccountsBalances,
             internalSyncStatus: status,
             latestBlockHeight: latestState.latestBlockHeight,
+            fullyScannedHeight: latestState.fullyScannedHeight,
             // Status-only transition: the balances are the previous ones, so their masked-ness is too.
             isSpendableMasked: latestState.isSpendableMasked
         ))
