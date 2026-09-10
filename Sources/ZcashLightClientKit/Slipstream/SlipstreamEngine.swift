@@ -176,16 +176,22 @@ public actor SlipstreamEngine {
 
     /// Stops the in-flight sync AND drains the engine's in-flight wallet commit
     /// ([B4-16] — `abort()` cannot cancel a `spawn_blocking` write-behind commit, so the
-    /// FFI now blocks, bounded ≤10 s, until the wallet file is quiescent). A returned
-    /// stop() is the contract deleteAccount/importAccount/rewind serialize on: their
-    /// wallet write can no longer interleave with an orphan commit. Hopped off the
-    /// cooperative pool — the drain is a real wait; never block an actor thread.
-    public func stop() async {
-        guard let handlePtr = handle else { return }
-        await withCheckedContinuation { continuation in
+    /// FFI blocks, bounded ≤10 s, waiting for the wallet file to fall quiet). Hopped off
+    /// the cooperative pool — the drain is a real wait; never block an actor thread.
+    ///
+    /// [MOB-1850] Returns whether the stop was QUIESCENT: `true` when the engine confirmed that
+    /// both its aborted pass and its wallet writer had finished, `false` when either was still
+    /// running when the ten-second budget ran out. The pass is stopped either way — what the
+    /// answer reports is whether the wallet file was PROVED free of the engine's own writers.
+    /// It is the contract `deleteAccount`/`importAccount`/`rewind`/`wipe` serialize on: on
+    /// `false` they refuse to write rather than interleave with a commit that may still land.
+    /// A nil handle is quiescent by definition — there is no engine to be writing.
+    @discardableResult
+    public func stop() async -> Bool {
+        guard let handlePtr = handle else { return true }
+        return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                _ = zcashlc_slipstream_stop(handlePtr)
-                continuation.resume()
+                continuation.resume(returning: zcashlc_slipstream_stop(handlePtr))
             }
         }
     }

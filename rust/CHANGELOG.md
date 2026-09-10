@@ -265,6 +265,16 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `zcashlc_slipstream_snapshot` reports `tip_fresh = 1` only once the run that refreshed the
+  chain tip has also completed a ChainTip-priority scan range (`spendable_hint = 1`) or reached
+  Done, so a host that lifts a spendable-balance mask on `tip_fresh` never uncovers the transient
+  zero the wallet database reports for every non-stabilized note until that range is scanned. A
+  pass that stalls before scanning it, or that never queues a ChainTip-priority range, keeps
+  `tip_fresh = 0` until it reaches Done. The field and its type are unchanged.
+- `zcashlc_slipstream_stop` now returns `false` while any aborted pass is still unwinding or an
+  in-flight wallet commit has not drained within its bounded budget, and a pass that outlived an
+  earlier stop or start stays on record so a later stop keeps reporting `false` until it has
+  actually finished; previously it returned `true` regardless.
 - `zcashlc_propose_transfer`, `zcashlc_propose_transfer_from_uri`,
   `zcashlc_propose_send_max_transfer`, and `zcashlc_create_proposed_transactions` classify their
   failures instead of flattening them into a string. Their last-error text now reads

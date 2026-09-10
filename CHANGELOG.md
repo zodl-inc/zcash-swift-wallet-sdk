@@ -6,6 +6,171 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 # Unreleased
 
+# 4.4.0 - 2026-09-10
+
+## Added
+
+### Spendable balance masking
+
+- `SynchronizerState.isSpendableMasked` reports whether the spendable balance in `accountsBalances`
+  is currently masked because the engine has not yet confirmed a fresh chain tip — the only signal
+  that separates "the wallet cannot spend this" from "the SDK is not willing to say yet," which a
+  zero balance alone cannot express (an empty wallet, funds still confirming, and a masked balance
+  all read as zero). It clears once the refreshed tip's chain-tip range has been scanned (or the
+  pass completes), so the value it uncovers is one the wallet database can already vouch for and a
+  client can safely drive a "working it out" affordance from it. The property is additive: the
+  memberwise initializer defaults it to `false`, so existing call sites and test doubles are
+  unaffected. Always `false` on the legacy `SDKSynchronizer` path, which applies its own masking
+  without reporting it here.
+
+### Submissions
+
+- `Synchronizer.transactionSubmissionStatus(for:)` reports how far a transaction this wallet sent
+  has got with the servers, so a sent transaction can be shown as handed over instead of as still
+  sending for the minutes it waits to be mined. It returns the new `TransactionSubmissionStatus`:
+  `.awaiting` (created, not sent yet), `.submitted` (sent, no server has acknowledged it), or
+  `.accepted(host:)`, whose `host` is the `host:port` of the server that took it into its mempool.
+  `nil` means the SDK has nothing to say — a transaction it never recorded, or a moment when its
+  record cannot be read. The method has a default implementation returning `nil`, so custom
+  `Synchronizer` conformers and test doubles keep compiling unchanged; the same method, and the
+  same default, is on `ClosureSynchronizer` and `CombineSynchronizer`. Acceptance describes
+  submission only, never mining: the SDK keeps resubmitting an accepted transaction until it is
+  mined or expires, exactly as before. The SDK's submit-plan database gained one nullable column
+  to record this; the change is additive and the file stays readable and writable by older SDK
+  builds on the same device.
+
+### Recovery
+
+- `Synchronizer.restartSync(at:)` rebuilds the sync engine at the given endpoint — the same server
+  or a different one — and starts a pass regardless of whether one was running. Call it when the
+  SDK's own stall recovery has given up (`SynchronizerEvent.syncStalled(attempt:gaveUp: true)`): a
+  plain `start()` cannot rebuild a handle a failed reopen left behind, and the Slipstream
+  `switchTo(endpoint:)` only restarts a pass that was already running and no-ops on the current
+  server. Throws what `start(retry:)` throws (`synchronizerNotPrepared`, `migrationSyncBlocked`,
+  engine start errors), plus whatever the engine rebuild itself throws. The method has a default
+  implementation that reports the capability as unavailable, so custom `Synchronizer` conformers
+  and test doubles keep compiling unchanged; the same method, with the same default, is on
+  `ClosureSynchronizer` (`restartSync(at:completion:)`) and `CombineSynchronizer` (`restartSync(at:)
+  -> CompletablePublisher<Error>`).
+
+### Resubmission
+
+- `Broadcaster.releaseForResubmission(transactions:to:)` records a submit plan for transactions
+  the app created but could not hand to a server itself, so the SDK's background resubmission
+  broadcasts them on its normal cadence with the same transaction ids. Makes no network attempt
+  of its own; an empty endpoint list records nothing and the transactions stay awaiting. The
+  method has a default implementation that does nothing, so custom `Broadcaster` conformers
+  without submit-plan bookkeeping keep compiling unchanged.
+
+## Changed
+
+- `SlipstreamSynchronizer.importAccount`, `deleteAccount`, `switchTo(endpoint:)` and
+  `restartSync(at:)` now throw `ZcashError.slipstreamEngineNotQuiescent` (`ZRUST0155`), and
+  `rewind(_:)` and `wipe()` now fail their publisher with it, leaving the wallet untouched, when
+  the engine could not confirm within its bounded stop budget that its previous pass and wallet
+  writer had stopped; previously the mutation proceeded on the assumption that they had. The pass
+  and its writer are each given their own budget, and a refused call that had stopped a running
+  pass restarts it before reporting the failure, so the wait can be noticeably longer than a
+  single budget. The refusal
+  persists across repeated stops: an aborted pass that outlived one stop's budget keeps every
+  later stop refusing until that pass has actually finished, not only the most recent one. The
+  SDK's own stall recovery meets the same refusal when it reopens the engine and reports it as
+  `.error(ZcashError.slipstreamEngineNotQuiescent)` on the state stream together with
+  `SynchronizerEvent.syncStalled(attempt:gaveUp: true)`. `SlipstreamEngine.stop()` now returns
+  whether the stop was quiescent. `SDKSynchronizer` is unaffected.
+- `SlipstreamSynchronizer.restartSync(at:)` now throws `CancellationError` and leaves the engine
+  untouched when the calling task was cancelled before the restart began executing (a restart
+  already under way completes). Hosts that cancel a restart, for example when the app enters the
+  background, no longer get a pass started behind their own stop. `SDKSynchronizer` is unaffected.
+  The call still returns only once its queued lifecycle operation is reached, so a cancelled call
+  is not necessarily prompt to return.
+- `SlipstreamSynchronizer` now bounds each candidate's `getInfo` probe to 5 s instead of the
+  endpoint's much longer gRPC single-call default, so a slow or unreachable server can no longer
+  make a call take an unbounded amount of time. `evaluateServerSwitch` and `evaluateBestOf` share
+  that benchmark, and a server that does not answer within the bound is now dropped from it rather
+  than ranked late: `evaluateBestOf` can return FEWER endpoints than the `kServers` it was asked
+  for, and an empty array when nothing answers in time, where it previously ranked the slow server
+  and returned a full list. A caller that indexes into the result, or that assumes it is
+  non-empty, must handle the shorter list — an empty result means "no server qualified", not "stay
+  where you are". `evaluateServerSwitch` keeps its shape: a benchmark nothing survives leaves it
+  returning `nil`, as it already did whenever no candidate was worth a switch. On both
+  `SlipstreamSynchronizer` and `SDKSynchronizer`, the confirming re-probe of the current server is now skipped when the first
+  benchmark round produced no results at all — nothing answered, so a second call could not have
+  fared any better; the outcome is unchanged.
+- `SynchronizerEvent` gained the case `syncStalled(attempt:gaveUp:)`. An exhaustive `switch` over
+  `SynchronizerEvent` stops compiling until the new case is handled; matching with `if case`, or a
+  `switch` with a `default`, needs no change — see `MIGRATING.md`. The event reports a sync pass
+  that made no progress for the stall window. The Slipstream synchronizer no longer merely logs
+  such a pass — it restarts it, up to 3 times per engine handle, and reopens the endpoint already
+  in use rather than moving the user to another server. Three restarts have two waits between
+  them: the SDK waits at least 60 seconds before the second and at least 120 before the third. In
+  practice the observed gap is about 120 seconds throughout, because a restarted pass cannot be
+  seen to stall again until the 120-second stall window of the new pass has elapsed. The event is
+  emitted before each restart begins (`gaveUp == false`, `attempt` 1-based), and once more when
+  the SDK stops trying (`gaveUp == true`) — because the cap is reached, or because a restart could
+  not bring the pass back up at all; only that second case additionally moves the sync status to
+  `.error`. The budget belongs to the handle, so `start()`, `switchTo(endpoint:)` and `wipe()` each
+  hand the next handle a fresh one. An app that surfaces connection trouble can treat `attempt: 1`
+  as the SDK reconnecting by itself and react only from attempt 2, or when `gaveUp` is true.
+
+## Fixed
+
+- Slipstream lifecycle operations (start, stop, server switch, account import and delete, rewind,
+  wipe, and the stall recovery restart) now run one at a time on a single lifecycle queue, and a
+  poll tick that was suspended while one of them ran no longer emits events or schedules a recovery
+  for a pass that is gone. Previously a stale tick could resurrect a deliberately stopped
+  synchronizer, and a recovery restart could tear down a newer pass or start the engine inside an
+  account mutation's stopped interval.
+- `SynchronizerState.isSpendableMasked` now always describes the balances carried in the same
+  emission: a poll that falls back to the previous balances carries their mask flag, and a
+  standalone `getAccountsBalances()` read no longer changes the flag the next emission reports.
+- A server acceptance that arrives for a submission started before `wipe()` no longer recreates
+  the deleted submit-plan store; the store tracks its lifecycle and ignores writes from a previous
+  one.
+- Cancelling a delegation proof while the PIR servers are still being probed no longer lets the
+  proof start afterwards: the resolver and the proving call now check for cancellation before
+  entering the FFI.
+- A transaction created through `Broadcaster` while a `wipe()` lands mid-creation no longer has
+  its "awaiting submission" mark recreate the deleted submit-plan store; like the existing
+  acceptance guard, the mark is dropped when it belongs to a lifecycle the store has since wiped.
+- `Synchronizer.deleteAccount(_:)` now restarts sync after a failed deletion too, the same way a
+  failed account import or rewind already do. Previously a deletion that failed before reaching
+  the engine left the synchronizer stopped, with no automatic recovery.
+- A restart that fails after a successful account import, delete, or rewind is now reported on
+  `SynchronizerState.internalSyncStatus` as `.error`, the same way a failed stall-recovery restart
+  already is. Previously the failure was silent: the mutation itself had already succeeded, so
+  nothing was thrown, and the synchronizer was left reporting `.syncing` with no pass running.
+- A submit-plan release that arrives after `wipe()` no longer recreates the wiped store: reads
+  never create the store file, and only a transaction created in the current wallet lifecycle can
+  be released to background resubmission.
+- Background resubmission treats a submit-plan store whose creation failed as unavailable again and
+  skips the transaction, instead of reading the missing file as a never-written store and
+  broadcasting through the default endpoint. `transactionSubmissionStatus(for:)` is unaffected: it
+  already reported no status for that case.
+- The state `start()` publishes before its first pass and the `.stopped` state `stop()` publishes
+  now carry `fullyScannedHeight`, like every in-pass state. Previously they omitted it, so it read
+  as 0 next to a real chain tip, and a client sizing "blocks remaining" as
+  `latestBlockHeight − fullyScannedHeight` saw the whole chain as unsynced for the moment before
+  the first in-pass state arrived.
+
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3392500.json
+...
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3477500.json
+````
+
+Testnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4100000.json
+...
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4330000.json
+````
+
 # 4.3.0 - 2026-09-08
 
 ## Added
@@ -90,6 +255,10 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Fixed
 
+- `SyncStatus.==` now reports `.stopped` equal to `.stopped`. Previously two `.stopped` values
+  compared unequal, so any `Equatable` type that embeds a `SyncStatus`, such as `SynchronizerState`,
+  could never equal itself while the synchronizer was stopped, and code diffing consecutive states
+  saw a change on every stopped tick. No call-site edit is needed.
 - The server benchmark behind `evaluateBestOf` and `evaluateServerSwitch` no longer ranks
   endpoints whose block stream delivers fewer blocks than requested — an empty or truncated
   stream previously recorded a near-zero time and won the ranking outright.

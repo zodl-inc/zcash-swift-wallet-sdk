@@ -154,6 +154,10 @@ final class EndpointSubmitterMock: EndpointSubmitter {
         /// Ignores task cancellation for the given duration, then fails with a
         /// transport error — simulates work stuck in non-cancellable FFI.
         case hangUncancellable(TimeInterval)
+        /// Suspends on `gate` until the test opens it, then behaves as `then`. Lets a test pin a
+        /// submission in flight at an exact point — e.g. across a store `wipe()` — instead of
+        /// racing a fixed delay against the rest of the test.
+        indirect case gated(Gate, then: Behavior)
     }
 
     struct MockTransportError: Error {}
@@ -162,6 +166,7 @@ final class EndpointSubmitterMock: EndpointSubmitter {
     private var behaviors: [String: Behavior] = [:]
     private var submitted: [LightWalletEndpoint] = []
     private var cancelled: [LightWalletEndpoint] = []
+    private var submissionStartContinuations: [String: [CheckedContinuation<Void, Never>]] = [:]
 
     func set(behavior: Behavior, for endpoint: LightWalletEndpoint) {
         queue.sync { behaviors[Self.key(endpoint)] = behavior }
@@ -175,10 +180,38 @@ final class EndpointSubmitterMock: EndpointSubmitter {
         queue.sync { cancelled }
     }
 
-    func submit(transaction: CreatedTransaction, to endpoint: LightWalletEndpoint) async throws {
-        queue.sync { submitted.append(endpoint) }
-        let behavior = queue.sync { behaviors[Self.key(endpoint)] } ?? Behavior.succeed
+    /// Suspends until a `submit(transaction:to:)` call for `endpoint` has been recorded — i.e. it
+    /// has reached this mock, whatever behavior it then suspends on — returning immediately if one
+    /// already has. Lets a test know a submission is in flight (and so it is safe to, say, wipe the
+    /// submit-plan store out from under it) without polling or a fixed delay.
+    func awaitSubmissionStarted(to endpoint: LightWalletEndpoint) async {
+        let key = Self.key(endpoint)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            queue.sync {
+                if submitted.contains(where: { Self.key($0) == key }) {
+                    continuation.resume()
+                } else {
+                    submissionStartContinuations[key, default: []].append(continuation)
+                }
+            }
+        }
+    }
 
+    func submit(transaction: CreatedTransaction, to endpoint: LightWalletEndpoint) async throws {
+        let key = Self.key(endpoint)
+        let startWaiters: [CheckedContinuation<Void, Never>] = queue.sync {
+            submitted.append(endpoint)
+            let waiters = submissionStartContinuations[key] ?? []
+            submissionStartContinuations[key] = nil
+            return waiters
+        }
+        startWaiters.forEach { $0.resume() }
+
+        let behavior = queue.sync { behaviors[key] } ?? Behavior.succeed
+        try await perform(behavior, endpoint: endpoint)
+    }
+
+    private func perform(_ behavior: Behavior, endpoint: LightWalletEndpoint) async throws {
         switch behavior {
         case .succeed:
             return
@@ -216,6 +249,10 @@ final class EndpointSubmitterMock: EndpointSubmitter {
                 queue.sync { cancelled.append(endpoint) }
                 throw CancellationError()
             }
+
+        case let .gated(gate, then):
+            await gate.wait()
+            try await perform(then, endpoint: endpoint)
         }
     }
 
@@ -327,21 +364,110 @@ final class SubmitPlanStoringMock: SubmitPlanStoring {
     private(set) var deletePlansReceivedTxIds: [[Data]] = []
     private(set) var clearCallsCount = 0
     private(set) var wipeCallsCount = 0
+    private var lifecycleGeneration = 0
+    /// Mirrors the real store's backing database file: `wipe()` deletes it, and any write that
+    /// would reach the real store's `connection()` recreates it. `recordPlanForAwaitingTransaction`
+    /// is the one write that checks this instead of unconditionally recreating it.
+    private var storeFileExists = true
+    /// When set, `plan(for:)` suspends on this gate after computing its result — reflecting the
+    /// store's state at the moment of the call — but before returning it to the caller. Lets a
+    /// test pin a plan read in flight across a `wipe()`, to prove a caller must capture its
+    /// lifecycle token before this read rather than merely before whatever it does with the
+    /// result: a token captured after the read could already reflect a wipe that landed while the
+    /// read itself was still in flight, one actor-hop earlier than a caller might expect.
+    var planReadGate: Gate?
+    // `plan(for:)` and `awaitPlanReadStarted()` run on different concurrent tasks (the resubmitter
+    // under test and the test itself), unlike every other member here which this mock's tests only
+    // ever call sequentially from one task. This mock is a plain class, not an actor, so that
+    // genuine cross-task access needs its own synchronization — the same `DispatchQueue.sync`
+    // idiom `EndpointSubmitterMock.awaitSubmissionStarted(to:)` already uses.
+    private let planReadQueue = DispatchQueue(label: "SubmitPlanStoringMock.planRead")
+    private var planReadStarted = false
+    private var planReadContinuations: [CheckedContinuation<Void, Never>] = []
 
-    func markAwaitingSubmission(txIds: [Data]) async {
+    /// Suspends until a `plan(for:)` call has been recorded, mirroring
+    /// `EndpointSubmitterMock.awaitSubmissionStarted(to:)`. A single "has any read started" signal
+    /// is enough — this mock's `planReadGate`-driven tests only ever have one read in flight.
+    func awaitPlanReadStarted() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            planReadQueue.sync {
+                if planReadStarted {
+                    continuation.resume()
+                } else {
+                    planReadContinuations.append(continuation)
+                }
+            }
+        }
+    }
+
+    func markAwaitingSubmission(txIds: [Data], lifecycle: SubmitPlanLifecycle) async {
+        // Mirrors the real store: a write carrying a token from before the most recent `wipe()`
+        // is dropped instead of resurrecting a plan the caller already asked to clear.
+        guard lifecycle.generation == lifecycleGeneration else { return }
+        storeFileExists = true
         for txId in txIds where plans[txId] == nil {
             plans[txId] = StoredSubmitPlan.awaiting
         }
     }
 
-    func recordPlan(txId: Data, endpoints: [LightWalletEndpoint]) async {
-        guard !endpoints.isEmpty else { return }
-        plans[txId] = StoredSubmitPlan.ready(endpoints)
+    @discardableResult
+    func recordPlan(txId: Data, endpoints: [LightWalletEndpoint]) async -> SubmitPlanLifecycle {
+        guard !endpoints.isEmpty else { return await currentLifecycle() }
+        storeFileExists = true
+        // Acceptance survives a re-recorded plan, as it does in the real store: a host that
+        // submits the same transaction again replaces the endpoint list, not the fact that a
+        // server already took the transaction.
+        var acceptedBy: String?
+        if case .ready(_, let host) = plans[txId] {
+            acceptedBy = host
+        }
+        plans[txId] = StoredSubmitPlan.ready(endpoints, acceptedBy: acceptedBy)
+        return await currentLifecycle()
+    }
+
+    /// `recordPlan`, but a no-op returning `nil` unless `txId` already has a row and the store's
+    /// backing file exists — the in-memory stand-in for the real store's requirement that only a
+    /// transaction with an existing row (one created in the current wallet lifecycle) can be
+    /// released to background resubmission.
+    @discardableResult
+    func recordPlanForAwaitingTransaction(txId: Data, endpoints: [LightWalletEndpoint]) async -> SubmitPlanLifecycle? {
+        guard storeFileExists, plans[txId] != nil else { return nil }
+        return await recordPlan(txId: txId, endpoints: endpoints)
+    }
+
+    func markAccepted(txId: Data, host: String, lifecycle: SubmitPlanLifecycle) async {
+        // Mirrors the real store: a write carrying a token from before the most recent `wipe()`
+        // is dropped instead of resurrecting a plan the caller already asked to clear.
+        guard lifecycle.generation == lifecycleGeneration else { return }
+        storeFileExists = true
+        switch plans[txId] {
+        case .ready(let endpoints, _):
+            plans[txId] = StoredSubmitPlan.ready(endpoints, acceptedBy: host)
+        default:
+            plans[txId] = StoredSubmitPlan.ready([], acceptedBy: host)
+        }
+    }
+
+    func currentLifecycle() async -> SubmitPlanLifecycle {
+        SubmitPlanLifecycle(generation: lifecycleGeneration)
     }
 
     func plan(for txId: Data) async -> StoredSubmitPlan? {
         guard !storeUnavailable else { return .storeUnavailable }
-        return plans[txId]
+        let result = plans[txId]
+
+        let waiters: [CheckedContinuation<Void, Never>] = planReadQueue.sync {
+            planReadStarted = true
+            let waiters = planReadContinuations
+            planReadContinuations = []
+            return waiters
+        }
+        waiters.forEach { $0.resume() }
+
+        if let planReadGate {
+            await planReadGate.wait()
+        }
+        return result
     }
 
     func allPlannedTransactionIds() async -> [Data] {
@@ -363,7 +489,9 @@ final class SubmitPlanStoringMock: SubmitPlanStoring {
 
     func wipe() async {
         wipeCallsCount += 1
+        lifecycleGeneration += 1
         plans.removeAll()
         storeUnavailable = false
+        storeFileExists = false
     }
 }

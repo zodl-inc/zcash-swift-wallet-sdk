@@ -426,6 +426,17 @@ class SynchronizerOfflineTests: ZcashTestCase {
         )
     }
 
+    func testSyncStatusStoppedEqualsItself() {
+        // `SyncStatus` hand-rolls its `==` because `.error` carries a non-`Equatable` payload; every
+        // payload-free case has to be listed there by hand, and a missing case makes that value
+        // compare unequal to itself, which then poisons any synthesized `Equatable` that embeds it.
+        XCTAssertEqual(SyncStatus.stopped, SyncStatus.stopped)
+        XCTAssertTrue(SyncStatus.stopped == SyncStatus.stopped)
+        XCTAssertFalse(SyncStatus.stopped != SyncStatus.stopped)
+        XCTAssertNotEqual(SyncStatus.stopped, SyncStatus.upToDate)
+        XCTAssertNotEqual(SyncStatus.stopped, SyncStatus.unprepared)
+    }
+
     func testInternalSyncStatusesDontDifferWhenOuterStatusIsTheSame() {
         XCTAssertFalse(InternalSyncStatus.disconnected.isDifferent(from: .disconnected))
         XCTAssertFalse(InternalSyncStatus.syncing(0, false).isDifferent(from: .syncing(0, false)))

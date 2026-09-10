@@ -32,18 +32,27 @@ final class SubmitPlanExecutorTests: ZcashTestCase {
     func testStopsAtFirstSuccess() async throws {
         mock.set(behavior: .succeed, for: endpoint(1))
 
-        try await executor.submit(transaction: makeTransaction(), endpoints: [endpoint(1), endpoint(2)])
+        let accepting = try await executor.submit(transaction: makeTransaction(), endpoints: [endpoint(1), endpoint(2)])
 
         XCTAssertEqual(mock.recordedSubmissions().map(\.host), ["server1.example.com"])
+        XCTAssertEqual(accepting, endpoint(1))
     }
 
     func testTriesNextEndpointAfterFailure() async throws {
         mock.set(behavior: .failTransport, for: endpoint(1))
         mock.set(behavior: .succeed, for: endpoint(2))
 
-        try await executor.submit(transaction: makeTransaction(), endpoints: [endpoint(1), endpoint(2)])
+        let accepting = try await executor.submit(transaction: makeTransaction(), endpoints: [endpoint(1), endpoint(2)])
 
         XCTAssertEqual(mock.recordedSubmissions().map(\.host), ["server1.example.com", "server2.example.com"])
+        XCTAssertEqual(accepting, endpoint(2))
+    }
+
+    func testReturnsNoAcceptingEndpointWhenThereIsNothingToSubmitTo() async throws {
+        let accepting = try await executor.submit(transaction: makeTransaction(), endpoints: [])
+
+        XCTAssertNil(accepting)
+        XCTAssertTrue(mock.recordedSubmissions().isEmpty)
     }
 
     func testThrowsLastErrorWhenAllEndpointsFail() async {

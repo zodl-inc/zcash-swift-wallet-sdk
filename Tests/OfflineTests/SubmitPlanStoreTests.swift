@@ -38,7 +38,7 @@ final class SubmitPlanStoreTests: ZcashTestCase {
         let store = makeStore()
         let txId = Data(repeating: 0x02, count: 32)
 
-        await store.markAwaitingSubmission(txIds: [txId])
+        await store.markAwaitingSubmission(txIds: [txId], lifecycle: await store.currentLifecycle())
 
         let plan = await store.plan(for: txId)
         XCTAssertEqual(plan, StoredSubmitPlan.awaiting)
@@ -48,11 +48,11 @@ final class SubmitPlanStoreTests: ZcashTestCase {
         let store = makeStore()
         let txId = Data(repeating: 0x03, count: 32)
 
-        await store.markAwaitingSubmission(txIds: [txId])
+        await store.markAwaitingSubmission(txIds: [txId], lifecycle: await store.currentLifecycle())
         await store.recordPlan(txId: txId, endpoints: [endpointA, endpointB])
 
         let plan = await store.plan(for: txId)
-        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA, endpointB]))
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA, endpointB], acceptedBy: nil))
     }
 
     func testRecordPlanWithoutPriorAwaitingRowCreatesReadyPlan() async {
@@ -62,7 +62,7 @@ final class SubmitPlanStoreTests: ZcashTestCase {
         await store.recordPlan(txId: txId, endpoints: [endpointA])
 
         let plan = await store.plan(for: txId)
-        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA]))
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA], acceptedBy: nil))
     }
 
     func testMarkAwaitingDoesNotOverwriteRecordedPlan() async {
@@ -70,10 +70,10 @@ final class SubmitPlanStoreTests: ZcashTestCase {
         let txId = Data(repeating: 0x05, count: 32)
 
         await store.recordPlan(txId: txId, endpoints: [endpointA])
-        await store.markAwaitingSubmission(txIds: [txId])
+        await store.markAwaitingSubmission(txIds: [txId], lifecycle: await store.currentLifecycle())
 
         let plan = await store.plan(for: txId)
-        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA]))
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA], acceptedBy: nil))
     }
 
     func testPlansPersistAcrossStoreInstances() async {
@@ -83,7 +83,7 @@ final class SubmitPlanStoreTests: ZcashTestCase {
 
         let secondStore = makeStore()
         let plan = await secondStore.plan(for: txId)
-        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA]))
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA], acceptedBy: nil))
     }
 
     func testAllPlannedTransactionIdsListsEveryRow() async {
@@ -91,7 +91,7 @@ final class SubmitPlanStoreTests: ZcashTestCase {
         let awaitingTxId = Data(repeating: 0x07, count: 32)
         let readyTxId = Data(repeating: 0x08, count: 32)
 
-        await store.markAwaitingSubmission(txIds: [awaitingTxId])
+        await store.markAwaitingSubmission(txIds: [awaitingTxId], lifecycle: await store.currentLifecycle())
         await store.recordPlan(txId: readyTxId, endpoints: [endpointA])
 
         let txIds = await store.allPlannedTransactionIds()
@@ -110,7 +110,7 @@ final class SubmitPlanStoreTests: ZcashTestCase {
         let removed = await store.plan(for: removedTxId)
         XCTAssertNil(removed)
         let kept = await store.plan(for: keptTxId)
-        XCTAssertEqual(kept, StoredSubmitPlan.ready([endpointA]))
+        XCTAssertEqual(kept, StoredSubmitPlan.ready([endpointA], acceptedBy: nil))
     }
 
     func testClearRemovesEverything() async {
@@ -147,7 +147,7 @@ final class SubmitPlanStoreTests: ZcashTestCase {
         let store = SubmitPlanStore(databaseURL: blockedURL, logger: NullLogger())
         let txId = Data(repeating: 0x0D, count: 32)
 
-        await store.markAwaitingSubmission(txIds: [txId])
+        await store.markAwaitingSubmission(txIds: [txId], lifecycle: await store.currentLifecycle())
         await store.recordPlan(txId: txId, endpoints: [endpointA])
 
         // Reads must fail safe: `nil` would mean "legacy transaction" and
@@ -156,6 +156,25 @@ final class SubmitPlanStoreTests: ZcashTestCase {
         XCTAssertEqual(plan, StoredSubmitPlan.storeUnavailable)
         let txIds = await store.allPlannedTransactionIds()
         XCTAssertTrue(txIds.isEmpty)
+    }
+
+    func testFailedCreationBeforeFileExistsReportsStoreUnavailable() async throws {
+        let blockedParent = testGeneralStorageDirectory
+            .appendingPathComponent("blocked-parent-\(UUID().uuidString)")
+        try Data([1]).write(to: blockedParent)          // a regular FILE where the parent directory should be
+        defer {
+            try? FileManager.default.removeItem(at: blockedParent)
+        }
+        let url = blockedParent.appendingPathComponent("submit_plans.db")
+        let store = SubmitPlanStore(databaseURL: url, logger: NullLogger())
+        let txId = Data(repeating: 0x31, count: 32)
+        let lifecycle = await store.currentLifecycle()
+
+        await store.markAwaitingSubmission(txIds: [txId], lifecycle: lifecycle)   // creation fails, latches connectionFailed
+        let plan = await store.plan(for: txId)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertEqual(plan, StoredSubmitPlan.storeUnavailable)
     }
 
     func testWipeDeletesDatabaseFileAndStoreRestartsFresh() async {
@@ -173,7 +192,7 @@ final class SubmitPlanStoreTests: ZcashTestCase {
 
     func testFreshDatabaseIsStampedWithSchemaVersion() async throws {
         let store = makeStore()
-        await store.markAwaitingSubmission(txIds: [Data(repeating: 0x10, count: 32)])
+        await store.markAwaitingSubmission(txIds: [Data(repeating: 0x10, count: 32)], lifecycle: await store.currentLifecycle())
 
         let connection = try Connection(databaseURL.path)
         let version = try connection.scalar("PRAGMA user_version") as? Int64
@@ -200,7 +219,7 @@ final class SubmitPlanStoreTests: ZcashTestCase {
         let store = SubmitPlanStore(databaseURL: nestedURL, logger: NullLogger())
         let txId = Data(repeating: 0x0E, count: 32)
 
-        await store.markAwaitingSubmission(txIds: [txId])
+        await store.markAwaitingSubmission(txIds: [txId], lifecycle: await store.currentLifecycle())
 
         let plan = await store.plan(for: txId)
         XCTAssertEqual(plan, StoredSubmitPlan.awaiting)

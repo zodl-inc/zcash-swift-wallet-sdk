@@ -51,7 +51,8 @@ final class TxResubmissionActionTests: ZcashTestCase {
 
     private func setupAction(
         candidates: [ZcashTransaction.Overview],
-        encoderTransactions: [ZcashTransaction.Overview] = []
+        encoderTransactions: [ZcashTransaction.Overview] = [],
+        submitPlanStoreOverride: SubmitPlanStoring? = nil
     ) -> TxResubmissionAction {
         transactionRepository = TransactionRepositoryMock()
         transactionRepository.findForResubmissionUpToClosure = { _ in candidates }
@@ -61,7 +62,9 @@ final class TxResubmissionActionTests: ZcashTestCase {
 
         mockContainer.mock(type: TransactionRepository.self, isSingleton: true) { _ in self.transactionRepository }
         mockContainer.mock(type: TransactionEncoder.self, isSingleton: true) { _ in self.transactionEncoder }
-        mockContainer.mock(type: SubmitPlanStoring.self, isSingleton: true) { _ in self.submitPlanStore }
+        // A real `SubmitPlanStore` can be substituted for the double, for tests that need the
+        // real read/latch behavior `SubmitPlanStoringMock` does not reproduce.
+        mockContainer.mock(type: SubmitPlanStoring.self, isSingleton: true) { _ in submitPlanStoreOverride ?? self.submitPlanStore }
         mockContainer.mock(type: Logger.self, isSingleton: true) { _ in submissionLifecycleLogger() }
         mockContainer.mock(type: SubmitPlanExecutor.self, isSingleton: true) { _ in
             SubmitPlanExecutor(endpointSubmitter: self.endpointSubmitter, logger: submissionLifecycleLogger())
@@ -89,7 +92,7 @@ final class TxResubmissionActionTests: ZcashTestCase {
         let rawID = Data(repeating: 0x01, count: 32)
         let candidate = makeOverview(rawID: rawID)
         let action = setupAction(candidates: [candidate])
-        await submitPlanStore.markAwaitingSubmission(txIds: [rawID])
+        await submitPlanStore.markAwaitingSubmission(txIds: [rawID], lifecycle: await submitPlanStore.currentLifecycle())
         // Make the repository confirm the candidate is alive so pruning keeps it.
         transactionRepository.findRawIDClosure = { _ in candidate }
 
@@ -112,6 +115,133 @@ final class TxResubmissionActionTests: ZcashTestCase {
 
         XCTAssertEqual(endpointSubmitter.recordedSubmissions().map(\.host), ["a.example.com"])
         XCTAssertTrue(transactionEncoder.submittedTransactions.isEmpty, "Plan transactions must not use the default endpoint")
+    }
+
+    func testAcceptedTransactionIsStillResubmittedThroughItsPlan() async throws {
+        let rawID = Data(repeating: 0x12, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+        let action = setupAction(candidates: [candidate])
+        await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA])
+        await submitPlanStore.markAccepted(txId: rawID, host: "x.example.com:1", lifecycle: await submitPlanStore.currentLifecycle())
+        transactionRepository.findRawIDClosure = { _ in candidate }
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        // A server holding the transaction in its mempool is not a guarantee it
+        // will be mined, so retrying continues exactly as for any ready plan.
+        XCTAssertEqual(endpointSubmitter.recordedSubmissions().map(\.host), ["a.example.com"])
+        XCTAssertTrue(transactionEncoder.submittedTransactions.isEmpty, "Plan transactions must not use the default endpoint")
+    }
+
+    func testResubmissionRecordsTheServerThatAcceptedTheTransaction() async throws {
+        let rawID = Data(repeating: 0x13, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+        let action = setupAction(candidates: [candidate])
+        await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA])
+        transactionRepository.findRawIDClosure = { _ in candidate }
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        let plan = await submitPlanStore.plan(for: rawID)
+        XCTAssertEqual(plan, StoredSubmitPlan.ready([endpointA], acceptedBy: "a.example.com:443"))
+    }
+
+    // MARK: - Release for resubmission
+
+    /// A transaction created through `Broadcaster` but never submitted by the app (`.awaiting`)
+    /// and then released to background resubmission (mirroring
+    /// `Broadcaster.releaseForResubmission(transactions:to:)`, which records the plan the same way
+    /// `recordPlan` does here) is picked up and broadcast through the released endpoint on the
+    /// very next resubmission pass.
+    func testResubmitterBroadcastsAReleasedTransaction() async throws {
+        let rawID = Data(repeating: 0x14, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+        let action = setupAction(candidates: [candidate])
+        transactionRepository.findRawIDClosure = { _ in candidate }
+
+        // Mirrors what `finishCreation` does for a transaction created through `Broadcaster`.
+        await submitPlanStore.markAwaitingSubmission(txIds: [rawID], lifecycle: await submitPlanStore.currentLifecycle())
+        let awaitingPlan = await submitPlanStore.plan(for: rawID)
+        XCTAssertEqual(awaitingPlan, StoredSubmitPlan.awaiting)
+
+        // Mirrors `Broadcaster.releaseForResubmission(transactions:to:)`: records the plan without
+        // attempting network submission, moving the transaction from `.awaiting` to `.ready`.
+        await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA])
+        let releasedPlan = await submitPlanStore.plan(for: rawID)
+        XCTAssertEqual(releasedPlan, StoredSubmitPlan.ready([endpointA], acceptedBy: nil))
+        XCTAssertTrue(endpointSubmitter.recordedSubmissions().isEmpty, "Release must not itself submit")
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        XCTAssertEqual(endpointSubmitter.recordedSubmissions().map(\.host), ["a.example.com"])
+        XCTAssertTrue(transactionEncoder.submittedTransactions.isEmpty, "Released transactions must not use the default endpoint")
+    }
+
+    // MARK: - Wipe race: a late acceptance for a resubmission started before wipe()
+
+    /// A `wipe()` that lands while a background resubmission's network call is parked must drop
+    /// the eventual acceptance, exactly like the equivalent guard on a foreground `submit`
+    /// (`BroadcasterTests.testWipeDuringSubmissionDropsALateAcceptance`).
+    func testWipeParkedDuringResubmissionDropsTheAcceptance() async throws {
+        let rawID = Data(repeating: 0x15, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+        let action = setupAction(candidates: [candidate])
+        transactionRepository.findRawIDClosure = { _ in candidate }
+        await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA])
+
+        let gate = Gate()
+        endpointSubmitter.set(behavior: .gated(gate, then: .succeed), for: endpointA)
+
+        let resubmission = Task {
+            _ = try await action.run(with: makeContext()) { _ in }
+        }
+        await endpointSubmitter.awaitSubmissionStarted(to: endpointA)
+
+        // The plan has already been read as `.ready` and the submission is parked in the
+        // executor; a wipe landing now must not let the eventual acceptance recreate state for a
+        // transaction the caller already asked to forget.
+        await submitPlanStore.wipe()
+        gate.open()
+
+        try await resubmission.value
+
+        XCTAssertEqual(submitPlanStore.wipeCallsCount, 1)
+        let plan = await submitPlanStore.plan(for: rawID)
+        XCTAssertNil(plan, "A wipe landing mid-resubmission must not be undone by a late acceptance")
+    }
+
+    /// Narrower than the above: the wipe lands not during the network round trip but in the
+    /// single actor-hop gap between `plan(for:)` returning its (pre-wipe) `.ready` value and
+    /// `resubmit` acting on it. A lifecycle token captured only after `plan(for:)` returns could
+    /// already reflect the post-wipe generation here, wrongly matching the store's generation at
+    /// `markAccepted` time — which is exactly why `resubmit` captures its token before the read,
+    /// not merely before the network call.
+    func testWipeParkedDuringPlanReadCatchesAWipeInsideTheRead() async throws {
+        let rawID = Data(repeating: 0x16, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+        let action = setupAction(candidates: [candidate])
+        transactionRepository.findRawIDClosure = { _ in candidate }
+        await submitPlanStore.recordPlan(txId: rawID, endpoints: [endpointA])
+
+        let gate = Gate()
+        submitPlanStore.planReadGate = gate
+
+        let resubmission = Task {
+            _ = try await action.run(with: makeContext()) { _ in }
+        }
+
+        // `plan(for:)` has already computed its (pre-wipe) `.ready` result and is parked before
+        // returning it; wipe while that read is still in flight.
+        await submitPlanStore.awaitPlanReadStarted()
+        await submitPlanStore.wipe()
+        gate.open()
+
+        try await resubmission.value
+
+        XCTAssertEqual(submitPlanStore.wipeCallsCount, 1)
+        XCTAssertEqual(endpointSubmitter.recordedSubmissions().map(\.host), ["a.example.com"], "the stale read is still resubmitted")
+        let plan = await submitPlanStore.plan(for: rawID)
+        XCTAssertNil(plan, "A wipe landing while the plan was being read must not be undone by the acceptance that read produced")
     }
 
     func testLegacyTransactionUsesDefaultEncoderSubmit() async throws {
@@ -181,6 +311,45 @@ final class TxResubmissionActionTests: ZcashTestCase {
         XCTAssertTrue(
             transactionEncoder.submittedTransactions.isEmpty,
             "An unreadable plan store must not fall back to the default-endpoint submit"
+        )
+        XCTAssertTrue(endpointSubmitter.recordedSubmissions().isEmpty)
+    }
+
+    /// A submit-plan store whose creation failed must report `.storeUnavailable` to the
+    /// resubmitter, not `nil`: `nil` reads as "legacy transaction unknown to this store" and falls
+    /// through to the default-endpoint submit below, broadcasting through an endpoint the user
+    /// never chose. Uses a real `SubmitPlanStore` (not the double `testStoreUnavailableSkipsResubmission`
+    /// uses above) so the store's actual latch behavior — not just the resubmitter's handling of an
+    /// already-`.storeUnavailable` plan — is under test.
+    func testStoreCreationFailureSkipsResubmissionInsteadOfLegacyBroadcast() async throws {
+        let rawID = Data(repeating: 0x17, count: 32)
+        let candidate = makeOverview(rawID: rawID)
+
+        // A regular FILE where the store's parent directory should be, exactly like
+        // `SubmitPlanStoreTests.testFailedCreationBeforeFileExistsReportsStoreUnavailable`:
+        // creation fails and latches `connectionFailed` before the database file is ever written.
+        let blockedParent = testGeneralStorageDirectory
+            .appendingPathComponent("blocked-parent-\(UUID().uuidString)")
+        try Data([1]).write(to: blockedParent)
+        defer {
+            try? FileManager.default.removeItem(at: blockedParent)
+        }
+        let realStore = SubmitPlanStore(
+            databaseURL: blockedParent.appendingPathComponent("submit_plans.db"),
+            logger: NullLogger()
+        )
+        let action = setupAction(candidates: [candidate], submitPlanStoreOverride: realStore)
+        transactionRepository.findRawIDClosure = { _ in candidate }
+
+        // Mirrors what `finishCreation` does for a transaction created through `Broadcaster`: the
+        // insert fails because the parent directory is blocked, latching `connectionFailed`.
+        await realStore.markAwaitingSubmission(txIds: [rawID], lifecycle: await realStore.currentLifecycle())
+
+        _ = try await action.run(with: makeContext()) { _ in }
+
+        XCTAssertTrue(
+            transactionEncoder.submittedTransactions.isEmpty,
+            "A submit-plan store whose creation failed must not fall back to the default-endpoint submit"
         )
         XCTAssertTrue(endpointSubmitter.recordedSubmissions().isEmpty)
     }

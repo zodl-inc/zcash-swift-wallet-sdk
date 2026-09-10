@@ -181,6 +181,34 @@ class SlipstreamOfflineTests: ZcashTestCase {
         }
     }
 
+    // MARK: - 1b. Submission status is read from the submit-plan store
+
+    /// `transactionSubmissionStatus(for:)` translates what the submit-plan store holds, so a host
+    /// can show a sent transaction as taken by a server instead of as still sending.
+    func testTransactionSubmissionStatusReflectsTheSubmitPlanStore() async throws {
+        let initializer = try makeInitializer()
+        let sync = SlipstreamSynchronizer(initializer: initializer)
+        let store = initializer.container.resolve(SubmitPlanStoring.self)
+        let endpoint = LightWalletEndpoint(address: "a.example.com", port: 443, secure: true)
+        let awaitingTxId = Data(repeating: 0x31, count: 32)
+        let submittedTxId = Data(repeating: 0x32, count: 32)
+        let acceptedTxId = Data(repeating: 0x33, count: 32)
+
+        await store.markAwaitingSubmission(txIds: [awaitingTxId], lifecycle: await store.currentLifecycle())
+        await store.recordPlan(txId: submittedTxId, endpoints: [endpoint])
+        await store.recordPlan(txId: acceptedTxId, endpoints: [endpoint])
+        await store.markAccepted(txId: acceptedTxId, host: "a.example.com:443", lifecycle: await store.currentLifecycle())
+
+        let awaiting = await sync.transactionSubmissionStatus(for: awaitingTxId)
+        XCTAssertEqual(awaiting, TransactionSubmissionStatus.awaiting)
+        let submitted = await sync.transactionSubmissionStatus(for: submittedTxId)
+        XCTAssertEqual(submitted, TransactionSubmissionStatus.submitted)
+        let accepted = await sync.transactionSubmissionStatus(for: acceptedTxId)
+        XCTAssertEqual(accepted, TransactionSubmissionStatus.accepted(host: "a.example.com:443"))
+        let unknown = await sync.transactionSubmissionStatus(for: Data(repeating: 0x34, count: 32))
+        XCTAssertNil(unknown, "A transaction the store never saw has no submission status")
+    }
+
     // MARK: - 2. Dealloc-without-stop: no crash on release without stop()
 
     /// Create a `SlipstreamSynchronizer` and immediately ARC-release it without calling `stop()`.
@@ -603,7 +631,8 @@ class SlipstreamOfflineTests: ZcashTestCase {
             accountsBalances: [:],
             localAccountsBalances: [:],
             fullyScannedHeight: nil,
-            syncSessionID: UUID()
+            syncSessionID: UUID(),
+            isSpendableMasked: false
         )
         XCTAssertEqual(state.internalSyncStatus, .disconnected)
         XCTAssertTrue(state.accountsBalances.isEmpty)
@@ -623,7 +652,8 @@ class SlipstreamOfflineTests: ZcashTestCase {
             accountsBalances: [:],
             localAccountsBalances: [account: localBalance],
             fullyScannedHeight: nil,
-            syncSessionID: UUID()
+            syncSessionID: UUID(),
+            isSpendableMasked: false
         )
 
         XCTAssertTrue(state.accountsBalances.isEmpty)
@@ -665,7 +695,8 @@ class SlipstreamOfflineTests: ZcashTestCase {
             accountsBalances: [account: maskedBalance],
             localAccountsBalances: [account: localBalance],
             fullyScannedHeight: 2_999_990,
-            syncSessionID: UUID()
+            syncSessionID: UUID(),
+            isSpendableMasked: false
         )
 
         XCTAssertEqual(state.accountsBalances, [account: maskedBalance])
@@ -685,7 +716,8 @@ class SlipstreamOfflineTests: ZcashTestCase {
             accountsBalances: [:],
             localAccountsBalances: [:],
             fullyScannedHeight: nil,
-            syncSessionID: UUID()
+            syncSessionID: UUID(),
+            isSpendableMasked: false
         )
         XCTAssertEqual(state.internalSyncStatus, .disconnected)
     }
@@ -704,7 +736,8 @@ class SlipstreamOfflineTests: ZcashTestCase {
             accountsBalances: [:],
             localAccountsBalances: [:],
             fullyScannedHeight: 2_999_990,
-            syncSessionID: UUID()
+            syncSessionID: UUID(),
+            isSpendableMasked: false
         )
         if case let .syncing(progress, spendable) = state.internalSyncStatus {
             XCTAssertEqual(progress, 0.999, accuracy: 1e-5, "warm progress must be the seeded permille")
@@ -731,7 +764,8 @@ class SlipstreamOfflineTests: ZcashTestCase {
             accountsBalances: [:],
             localAccountsBalances: [:],
             fullyScannedHeight: nil,
-            syncSessionID: UUID()
+            syncSessionID: UUID(),
+            isSpendableMasked: false
         )
         XCTAssertTrue(state.isRecovering, "recovery flag must be truthful from the open-time snapshot")
         if case let .syncing(progress, _) = state.internalSyncStatus {
@@ -739,6 +773,80 @@ class SlipstreamOfflineTests: ZcashTestCase {
         } else {
             XCTFail("mid-restore relaunch must emit .syncing, got \(state.internalSyncStatus)")
         }
+    }
+
+    // MARK: - 6e. [MOB-1852] initialState — isSpendableMasked propagation
+
+    /// A warm, seeded snapshot with the mask flag passed as `true` carries `true` onto the
+    /// emitted state. `initialState` does not re-derive the mask — the single predicate lives in
+    /// `walletBalanceSnapshots()` — it only forwards what the caller measured.
+    func testInitialStateWarmIsSpendableMaskedTruePropagates() {
+        let snap = SlipstreamSnapshot(
+            chainTip: 3_000_000, fetchedBlocks: 0, scannedBlocks: 0, enhancedTxs: 0,
+            currentRangeEnd: 0, state: 0,
+            spendableHint: 1, progressPermille: 999
+        )
+        let state = SlipstreamSynchronizer.initialState(
+            snapshot: snap,
+            accountsBalances: [:],
+            localAccountsBalances: [:],
+            fullyScannedHeight: 2_999_990,
+            syncSessionID: UUID(),
+            isSpendableMasked: true
+        )
+        XCTAssertTrue(state.isSpendableMasked, "a masked caller must propagate onto the emitted state")
+    }
+
+    /// The same warm snapshot with the mask flag passed as `false` carries `false`.
+    func testInitialStateWarmIsSpendableMaskedFalsePropagates() {
+        let snap = SlipstreamSnapshot(
+            chainTip: 3_000_000, fetchedBlocks: 0, scannedBlocks: 0, enhancedTxs: 0,
+            currentRangeEnd: 0, state: 0,
+            spendableHint: 1, progressPermille: 999
+        )
+        let state = SlipstreamSynchronizer.initialState(
+            snapshot: snap,
+            accountsBalances: [:],
+            localAccountsBalances: [:],
+            fullyScannedHeight: 2_999_990,
+            syncSessionID: UUID(),
+            isSpendableMasked: false
+        )
+        XCTAssertFalse(state.isSpendableMasked, "an unmasked caller must propagate onto the emitted state")
+    }
+
+    /// The zero-snapshot branch (fresh wallet: no tip, no floor) drops balances entirely, so
+    /// nothing is being hidden there — it must emit `false` even when the caller passes `true`,
+    /// proving the branch does not simply forward the argument.
+    func testInitialStateZeroSnapshotBranchIsSpendableMaskedAlwaysFalse() {
+        let state = SlipstreamSynchronizer.initialState(
+            snapshot: nil,
+            accountsBalances: [:],
+            localAccountsBalances: [:],
+            fullyScannedHeight: nil,
+            syncSessionID: UUID(),
+            isSpendableMasked: true
+        )
+        XCTAssertFalse(state.isSpendableMasked, "the zero-snapshot branch drops balances, so nothing can be masked")
+    }
+
+    /// `SynchronizerState.zero` is the ground state a synchronizer starts from and must not
+    /// claim a mask that was never evaluated.
+    func testSynchronizerStateZeroIsSpendableMaskedFalse() {
+        XCTAssertFalse(SynchronizerState.zero.isSpendableMasked)
+    }
+
+    /// The memberwise initializer defaults the flag to `false` when the caller omits it — this is
+    /// what keeps every pre-existing positional call site in the SDK compiling unchanged.
+    func testSynchronizerStateInitDefaultsIsSpendableMaskedToFalse() {
+        let state = SynchronizerState(
+            syncSessionID: UUID(),
+            accountsBalances: [:],
+            localAccountsBalances: [:],
+            internalSyncStatus: .disconnected,
+            latestBlockHeight: .zero
+        )
+        XCTAssertFalse(state.isSpendableMasked, "omitting the argument must default to false")
     }
 
     // [v2.1 Phase 2] testRecoveryAccountBalance is GONE with the helper: the Direction-B
@@ -975,7 +1083,8 @@ class SlipstreamOfflineTests: ZcashTestCase {
 
     // [v2.1 Phase 2] The boundary/idle timeout constants and the shouldMarkChainTipUpdated
     // suite are GONE with their machinery: summary rationing + tip freshness are engine-owned
-    // (E-1 / E-2 — `snapshot.tipFresh` carries the same semantics, computed at the source).
+    // (E-1 / E-2 — `snapshot.tipFresh` turns 1 only once the refreshed tip's ChainTip-priority
+    // range has been scanned, or the pass reached Done).
 
     // MARK: - 14. B4 stall-watchdog pure helpers (#1755 failure-path hardening)
     //
@@ -983,7 +1092,8 @@ class SlipstreamOfflineTests: ZcashTestCase {
     // "Syncing" — no logs, no error, no counter movement. The watchdog makes such
     // silent stalls VISIBLE: when state==Syncing and the progress-counter signature
     // has not changed for stallWatchdogThresholdSeconds, tickPoll logs ONE loud error
-    // per stall episode. It never restarts anything (policy stays with the app).
+    // per stall episode. What the poll loop then DOES about the stall is the separate
+    // recovery policy covered by SlipstreamStallRecoveryPolicyTests.
 
     /// Syncing + window exceeded → stalled.
     func testIsSyncStalledFiresWhenSyncingPastThreshold() {

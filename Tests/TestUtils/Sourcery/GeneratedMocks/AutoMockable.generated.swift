@@ -632,6 +632,21 @@ class BroadcasterMock: Broadcaster {
         }
     }
 
+    // MARK: - releaseForResubmission
+
+    var releaseForResubmissionTransactionsToCallsCount = 0
+    var releaseForResubmissionTransactionsToCalled: Bool {
+        return releaseForResubmissionTransactionsToCallsCount > 0
+    }
+    var releaseForResubmissionTransactionsToReceivedArguments: (transactions: [CreatedTransaction], endpoints: [LightWalletEndpoint])?
+    var releaseForResubmissionTransactionsToClosure: (([CreatedTransaction], [LightWalletEndpoint]) async -> Void)?
+
+    func releaseForResubmission(transactions: [CreatedTransaction], to endpoints: [LightWalletEndpoint]) async {
+        releaseForResubmissionTransactionsToCallsCount += 1
+        releaseForResubmissionTransactionsToReceivedArguments = (transactions: transactions, endpoints: endpoints)
+        await releaseForResubmissionTransactionsToClosure!(transactions, endpoints)
+    }
+
 }
 class CompactBlockRepositoryMock: CompactBlockRepository {
 
@@ -2401,6 +2416,25 @@ class SynchronizerMock: Synchronizer {
         try await switchToEndpointClosure!(endpoint)
     }
 
+    // MARK: - restartSync
+
+    var restartSyncAtThrowableError: Error?
+    var restartSyncAtCallsCount = 0
+    var restartSyncAtCalled: Bool {
+        return restartSyncAtCallsCount > 0
+    }
+    var restartSyncAtReceivedEndpoint: LightWalletEndpoint?
+    var restartSyncAtClosure: ((LightWalletEndpoint) async throws -> Void)?
+
+    func restartSync(at endpoint: LightWalletEndpoint) async throws {
+        if let error = restartSyncAtThrowableError {
+            throw error
+        }
+        restartSyncAtCallsCount += 1
+        restartSyncAtReceivedEndpoint = endpoint
+        try await restartSyncAtClosure!(endpoint)
+    }
+
     // MARK: - isSeedRelevantToAnyDerivedAccount
 
     var isSeedRelevantToAnyDerivedAccountSeedThrowableError: Error?
@@ -2761,6 +2795,26 @@ class SynchronizerMock: Synchronizer {
         deleteAccountCallsCount += 1
         deleteAccountReceivedAccountUUID = accountUUID
         try await deleteAccountClosure!(accountUUID)
+    }
+
+    // MARK: - transactionSubmissionStatus
+
+    var transactionSubmissionStatusForCallsCount = 0
+    var transactionSubmissionStatusForCalled: Bool {
+        return transactionSubmissionStatusForCallsCount > 0
+    }
+    var transactionSubmissionStatusForReceivedRawID: Data?
+    var transactionSubmissionStatusForReturnValue: TransactionSubmissionStatus?
+    var transactionSubmissionStatusForClosure: ((Data) async -> TransactionSubmissionStatus?)?
+
+    func transactionSubmissionStatus(for rawID: Data) async -> TransactionSubmissionStatus? {
+        transactionSubmissionStatusForCallsCount += 1
+        transactionSubmissionStatusForReceivedRawID = rawID
+        if let closure = transactionSubmissionStatusForClosure {
+            return await closure(rawID)
+        } else {
+            return transactionSubmissionStatusForReturnValue
+        }
     }
 
     // MARK: - migrationAdvanceStep

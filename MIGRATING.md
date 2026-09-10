@@ -107,6 +107,40 @@ func evaluateServerSwitch(
 }
 ```
 
+## `SynchronizerEvent` gained a case — `syncStalled(attempt:gaveUp:)`
+
+`SynchronizerEvent` is a public enum, so an exhaustive `switch` over it stops compiling until the new case is handled:
+`switch must be exhaustive`. Nothing else breaks — `if case`, a `switch` with a `default`, and any code that ignores
+the event are unaffected.
+
+The event reports a sync pass that stopped making progress. `gaveUp == false` means the SDK is restarting the pass
+itself (`attempt` is 1-based, and counts restarts since the engine handle was opened or last switched);
+`gaveUp == true` means it has stopped trying, either because it reached its restart cap or because a restart could not
+bring the pass back up — the second of those also moves the sync status to `.error`. REACTING to it is optional: a case
+with an empty body restores prior behavior, because the SDK's recovery does not depend on the host doing anything.
+
+```swift
+// Before: exhaustive over the four cases the enum had.
+switch event {
+case .minedTransaction(let transaction): show(transaction)
+case .foundTransactions(let transactions, _): show(transactions)
+case .storedUTXOs(let inserted, _): show(inserted)
+case .connectionStateChanged(let state): show(state)
+}
+
+// After: one more case. Ignoring it is a valid choice, but say so explicitly.
+switch event {
+case .minedTransaction(let transaction): show(transaction)
+case .foundTransactions(let transactions, _): show(transactions)
+case .storedUTXOs(let inserted, _): show(inserted)
+case .connectionStateChanged(let state): show(state)
+case .syncStalled(let attempt, let gaveUp):
+    // A wallet that surfaces connection trouble can treat attempt 1 as the SDK
+    // reconnecting by itself and warn the user only from attempt 2, or when it gives up.
+    if gaveUp || attempt > 1 { showReconnecting(gaveUp: gaveUp) }
+}
+```
+
 ## Voting rides `zcash_voting` 3.0 — `VotingPirLayout` gains `polyLen`
 
 `VotingPirLayout`'s memberwise initializer gains a required `polyLen: UInt32` — the YPIR RLWE
@@ -866,6 +900,83 @@ Orchard, Ironwood); transparent balance is never selected and must be shielded f
 `proposeShielding`). Unlike `proposeTransfer`, no `amount` is passed; the fee is already accounted
 for by the returned proposal. Any external conformer of these protocols must implement the new
 method.
+
+## `ZcashError` gains `slipstreamEngineNotQuiescent` — some `SlipstreamSynchronizer` mutations can now refuse
+
+`ZcashError` is a public enum, so an exhaustive `switch` over it stops compiling until the new case
+is handled:
+
+```swift
+// Before: exhaustive over ZcashError's existing cases.
+switch error {
+case .rustCreateToAddress(let error):
+    show(error.message)
+// ... the rest of ZcashError's cases
+}
+
+// After: one more case to add.
+switch error {
+case .rustCreateToAddress(let error):
+    show(error.message)
+// ... the rest of ZcashError's cases
+case .slipstreamEngineNotQuiescent:
+    show("Still finishing the previous step — try again in a moment.")
+}
+```
+
+The new case (`ZRUST0155`) is what `SlipstreamSynchronizer.importAccount`, `deleteAccount`,
+`switchTo(endpoint:)` and `restartSync(at:)` now throw, and what `rewind(_:)` and `wipe()` now
+fail their publisher with, when the engine could not confirm — within its bounded stop budget —
+that its previous pass and its wallet writer had both stopped before the mutation. The wallet is
+left exactly as it was found: nothing partial is written, nothing is deleted, no second handle is
+opened. Where the operation stopped a running pass (`importAccount`, `deleteAccount`,
+`switchTo(endpoint:)`, `rewind(_:)` and `wipe()`), the refusal restarts that pass before the error
+is reported; `restartSync(at:)`, normally called when nothing is running, restarts a pass only if
+one was. The SDK's own stall recovery meets the same refusal when it reopens the engine and reports
+it as `.error(.slipstreamEngineNotQuiescent)` on the state stream alongside
+`syncStalled(attempt:gaveUp: true)`. Retrying is the right response to a writer that is merely
+slow, but the refusal clears only when the engine's own pass actually finishes, never on a timer: a
+pass wedged inside a synchronous step keeps every later attempt refusing until it finishes, which
+may never happen within the current process, and each attempt can take tens of seconds, because the
+stop waits out its pass and writer budgets and the restart that follows a refusal can wait as long
+again. Treat a refusal that persists across a few attempts as one that will not clear, and stop
+retrying.
+
+```swift
+// Before: the mutation either succeeded or threw a rust/network failure.
+try await synchronizer.deleteAccount(accountUUID)
+
+// After: a live writer the engine could not account for is now a distinct, retriable case.
+do {
+    try await synchronizer.deleteAccount(accountUUID)
+} catch ZcashError.slipstreamEngineNotQuiescent {
+    // The account was NOT deleted. Surface a "still busy" message and retry once or twice; a
+    // refusal that persists will not clear (see above).
+} catch {
+    // Existing handling.
+}
+```
+
+`importAccount`, `switchTo(endpoint:)` and `restartSync(at:)` follow the same shape.
+`rewind(_:)` and `wipe()` are Combine APIs, so the same case arrives as a publisher failure rather
+than a thrown error:
+
+```swift
+synchronizer.wipe()
+    .sink(
+        receiveCompletion: { completion in
+            if case .failure(ZcashError.slipstreamEngineNotQuiescent) = completion {
+                // The wallet database was NOT deleted. Retry once or twice; a refusal that
+                // persists will not clear (see above).
+            }
+        },
+        receiveValue: { _ in }
+    )
+    .store(in: &cancellables)
+```
+
+`SlipstreamSynchronizer` is the only affected conformer; `SDKSynchronizer` does not use this engine
+and never throws or fails with this case.
 
 # Migrating from previous versions to v2.8.0-rc.1
 
