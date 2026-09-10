@@ -147,6 +147,11 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   skips the transaction, instead of reading the missing file as a never-written store and
   broadcasting through the default endpoint. `transactionSubmissionStatus(for:)` is unaffected: it
   already reported no status for that case.
+- The state `start()` publishes before its first pass and the `.stopped` state `stop()` publishes
+  now carry `fullyScannedHeight`, like every in-pass state. Previously they omitted it, so it read
+  as 0 next to a real chain tip, and a client sizing "blocks remaining" as
+  `latestBlockHeight − fullyScannedHeight` saw the whole chain as unsynced for the moment before
+  the first in-pass state arrived.
 
 ## Checkpoints
 

@@ -497,8 +497,11 @@ final class SlipstreamLifecycleOwnershipTests: ZcashTestCase {
 
         try await restart.value
 
-        let settled = await waitUntil { await sync.isRunningForTesting() == false }
-        XCTAssertTrue(settled, "the stop queued behind the restart still runs")
+        // `isRunning` cannot stand in for the stop having RETURNED: `stopImpl` clears it before it
+        // awaits `engine.stop()`, so a poll can land while the fake is still between `"stop"` and
+        // `"stop:done"`. The trace is what the assertions below are about, so wait on the trace.
+        let settled = await waitUntil { await Self.lifecycleCalls(engine.calls).last == "stop:done" }
+        XCTAssertTrue(settled, "the stop queued behind the restart still runs, and returns")
 
         let calls = await engine.calls
         let lastStart = try XCTUnwrap(calls.lastIndex(of: "start"), "the restart's own start ran: \(calls)")
