@@ -148,6 +148,24 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   broadcasting through the default endpoint. `transactionSubmissionStatus(for:)` is unaffected: it
   already reported no status for that case.
 
+## Checkpoints
+
+Mainnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3392500.json
+...
+Sources/ZcashLightClientKit/Resources/checkpoints/mainnet/3477500.json
+````
+
+Testnet
+
+````
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4100000.json
+...
+Sources/ZcashLightClientKit/Resources/checkpoints/testnet/4330000.json
+````
+
 # 4.3.0 - 2026-09-08
 
 ## Added
