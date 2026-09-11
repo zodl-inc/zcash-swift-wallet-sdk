@@ -25,6 +25,11 @@
 //! stopped, so the errors these methods return are the ones around the run —
 //! a signer this host cannot build, a report the wire projection refuses, or a
 //! driver task that did not finish.
+//!
+//! Proving one bundle ahead of a run is the exception to that shape: it runs
+//! on a thread this module creates and sizes rather than on the runtime,
+//! because Orchard proving needs a stack neither a runtime worker nor the
+//! host's calling thread is guaranteed to have.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -37,9 +42,18 @@ use super::signer::SeedSpendAuthSigner;
 use super::store::VotingDatabaseHandle;
 use super::wallet_access::SdkWalletDbOpener;
 use super::wire::{
-    BallotIntentDto, BundleLayoutDto, DrivePolicyDto, EligibilityDto, HostOverridesDto,
-    SessionBindingDto, SessionEventDto, SessionInputsDto, ShareTrackingPolicyDto, SignerDto,
+    BallotIntentDto, BundleLayoutDto, DelegationProgressDto, DrivePolicyDto, EligibilityDto,
+    HostOverridesDto, KeystoneSignatureBatchResultDto, KeystoneSignedBundleDto,
+    KeystoneSigningRequestDto, PirPrecomputeDto, ProofStatusDto, SessionBindingDto,
+    SessionEventDto, SessionInputsDto, ShareTrackingPolicyDto, SignerDto,
 };
+
+/// Stack the delegation proving thread is created with.
+///
+/// Orchard proof generation needs far more stack than a thread is given by
+/// default, and the thread a host calls in on is the host's own, whose size
+/// this SDK does not set — so the proof runs on a thread this module sizes.
+const PROOF_THREAD_STACK_BYTES: usize = 64 << 20;
 
 /// The C function a host installs to receive one run's events, or `None` to
 /// run without an event stream.
@@ -417,6 +431,131 @@ impl VotingSession {
         })
     }
 
+    /// Persists one bundle's witnesses and padded secrets and warms its PIR
+    /// rows.
+    ///
+    /// The one delegation step worth running ahead of a drive: a bundle whose
+    /// rows are already warm proves without waiting on the PIR fleet, and the
+    /// report says how much of the warmth was already there. PIR traffic takes
+    /// the shared direct transport whatever route this session opened on
+    /// (spec D12).
+    pub(super) fn precompute_pir(&self, bundle_index: u32) -> anyhow::Result<PirPrecomputeDto> {
+        let report = self
+            .pipeline
+            .precompute_pir(bundle_index, &self.pir)
+            .ffi()?;
+        Ok(PirPrecomputeDto {
+            bundle_index: report.bundle_index,
+            cached: report.report.cached,
+            fetched: report.report.fetched,
+            // The round's layout as the precompute saw it, so one report is
+            // enough for a host to say "bundle 2 of 5".
+            bundle_count: report.layout.bundle_count,
+        })
+    }
+
+    /// Generates this bundle's proof, or reports the persisted one it reused,
+    /// streaming the pipeline's stages to `sink` as it goes.
+    ///
+    /// Runs on a thread of its own with a
+    /// [64 MiB stack](PROOF_THREAD_STACK_BYTES) and blocks the calling thread
+    /// until that one joins — minutes for a proof this call has to generate.
+    /// Not spawned on the shared runtime: proving is CPU work that would hold
+    /// a worker for its whole duration, and a worker's stack is the runtime's
+    /// to size rather than this call's.
+    ///
+    /// A spawned thread must own what it touches, so the pipeline and the
+    /// fleet go in as `Arc` clones and the sink — which is `Copy` — goes in by
+    /// value; nothing is borrowed from the session across the join.
+    pub(super) fn precompute_delegation_proof(
+        self: &Arc<Self>,
+        bundle_index: u32,
+        sink: EventSink,
+    ) -> anyhow::Result<ProofStatusDto> {
+        let pipeline = Arc::clone(&self.pipeline);
+        let pir = Arc::clone(&self.pir);
+        let status = std::thread::Builder::new()
+            .name("zcash-voting-proof".to_string())
+            .stack_size(PROOF_THREAD_STACK_BYTES)
+            .spawn(move || {
+                let reporter = DelegationProgressCallbackReporter { sink, bundle_index };
+                pipeline.ensure_proof(bundle_index, &pir, &reporter)
+            })
+            // A thread the OS refused and a proof that panicked are both this
+            // SDK's problem rather than a decision the host can make
+            // differently, so both cross as `internal`; a panic payload is not
+            // worth rendering into the message.
+            .map_err(|e| internal(format!("voting proof thread did not start: {e}")))?
+            .join()
+            .map_err(|_| internal("voting proof thread panicked"))?
+            .ffi()?;
+        Ok(match status {
+            zcash_voting::delegate::DelegationProofStatus::Generated => ProofStatusDto::Generated,
+            zcash_voting::delegate::DelegationProofStatus::Reused => ProofStatusDto::Reused,
+        })
+    }
+
+    /// The redacted PCZTs a Keystone device signs, one per named bundle and in
+    /// the order named (spec D8).
+    ///
+    /// A bundle the pipeline cannot build a request for fails the whole call
+    /// rather than dropping out of the batch: the host asked for the set of
+    /// QRs that covers a round, and a quietly shorter one would read as a
+    /// complete set with a bundle that never needed signing.
+    pub(super) fn keystone_signing_requests(
+        &self,
+        bundle_indices: &[u32],
+    ) -> anyhow::Result<Vec<KeystoneSigningRequestDto>> {
+        require_distinct_bundles(bundle_indices)?;
+        bundle_indices
+            .iter()
+            .map(|bundle_index| {
+                Ok(KeystoneSigningRequestDto::from(
+                    self.pipeline.keystone_request(*bundle_index).ffi()?,
+                ))
+            })
+            .collect()
+    }
+
+    /// Lifts the signatures off the PCZTs a Keystone device returned and
+    /// stores them for this round.
+    ///
+    /// Each signed PCZT is verified against the request this wallet built for
+    /// that bundle — the signature is taken from the action the request named,
+    /// and paired with the sighash and `rk` the request carried — so a PCZT
+    /// from another bundle or another round is refused instead of stored.
+    /// Rebuilding the requests here rather than trusting the host to hand them
+    /// back is what makes that check the wallet's own.
+    ///
+    /// The write is one atomic idempotent batch, so a retry after a QR session
+    /// that was interrupted halfway reports what was already there rather than
+    /// failing on it.
+    pub(super) fn store_keystone_signatures(
+        &self,
+        signed: Vec<KeystoneSignedBundleDto>,
+    ) -> anyhow::Result<KeystoneSignatureBatchResultDto> {
+        let bundle_indices = signed
+            .iter()
+            .map(|entry| entry.bundle_index)
+            .collect::<Vec<_>>();
+        require_distinct_bundles(&bundle_indices)?;
+        let inputs = signed
+            .iter()
+            .map(|entry| {
+                let request = self.pipeline.keystone_request(entry.bundle_index).ffi()?;
+                super::signer::keystone_signature_input(&request, &entry.signed_pczt).ffi()
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let stored = self
+            .database
+            .store_keystone_signatures_batch(&self.round_id, &inputs)
+            .ffi()?;
+        Ok(KeystoneSignatureBatchResultDto {
+            inserted: stored.inserted,
+            already_present: stored.already_present,
+        })
+    }
+
     /// Drives this round to quiescence, reporting every driver event to
     /// `sink` as it goes.
     ///
@@ -687,6 +826,93 @@ impl zcash_voting::ShareTrackingReporter for ShareTrackingCallbackReporter {
         self.sink.emit(&SessionEventDto::ShareTracking {
             event: zcash_voting::wire::ShareTrackingEventView::from(event),
         });
+    }
+}
+
+/// Projects one bundle's delegation-pipeline progress onto the host's sink.
+///
+/// The bundle index comes from the call rather than from the event: the
+/// pipeline reports a stage, and which bundle it belongs to is what this
+/// session asked it to prove.
+struct DelegationProgressCallbackReporter {
+    sink: EventSink,
+    bundle_index: u32,
+}
+
+impl zcash_voting::DelegationProgressReporter for DelegationProgressCallbackReporter {
+    fn on_progress(&self, progress: zcash_voting::delegate::DelegationProgress) {
+        // An event that fails to serialize is dropped inside the sink, as in
+        // the drivers' reporters above: the stream is an observation of the
+        // proof, and the status this call returns is what the host acts on.
+        self.sink.emit(&SessionEventDto::DelegationProgress {
+            progress: DelegationProgressDto {
+                bundle_index: self.bundle_index,
+                stage: progress_stage(&progress).to_string(),
+                fraction: progress_fraction(&progress),
+            },
+        });
+    }
+}
+
+/// The wire name of a delegation progress stage: the crate's variant in
+/// snake_case.
+///
+/// Spelled out rather than derived, because `DelegationProgress` is the
+/// crate's own enum and carries no `Serialize`; writing the names here is also
+/// what pins them as the strings Swift matches on. The enum is
+/// `#[non_exhaustive]`, so a stage a newer crate reports and this SDK does not
+/// name crosses as `unknown` rather than being dropped — a host shows an
+/// unnamed step rather than a stalled one.
+pub(super) fn progress_stage(
+    progress: &zcash_voting::delegate::DelegationProgress,
+) -> &'static str {
+    use zcash_voting::delegate::DelegationProgress;
+
+    match progress {
+        DelegationProgress::SelectingNotes => "selecting_notes",
+        DelegationProgress::PcztBuilding => "pczt_building",
+        DelegationProgress::PcztBuilt => "pczt_built",
+        DelegationProgress::ProofStarting => "proof_starting",
+        DelegationProgress::WaitingForExistingProof => "waiting_for_existing_proof",
+        DelegationProgress::ProofProgress(_) => "proof_progress",
+        DelegationProgress::ProofComplete => "proof_complete",
+        DelegationProgress::SigningPayload => "signing_payload",
+        DelegationProgress::PayloadReady => "payload_ready",
+        _ => "unknown",
+    }
+}
+
+/// How far into itself a stage that measures its own progress is, and `None`
+/// for one that does not: only proof generation reports a fraction.
+pub(super) fn progress_fraction(
+    progress: &zcash_voting::delegate::DelegationProgress,
+) -> Option<f64> {
+    match progress {
+        zcash_voting::delegate::DelegationProgress::ProofProgress(fraction) => Some(*fraction),
+        _ => None,
+    }
+}
+
+/// Refuses a Keystone batch that names no bundle, or names one twice.
+///
+/// Both are the host's own mistake and neither has a sensible outcome: an
+/// empty batch would build nothing and store nothing, and a repeated index
+/// would either hand the host the same QR twice or offer the store two
+/// signatures for one bundle. Checked before the pipeline prepares anything,
+/// so the refusal costs no wallet read.
+fn require_distinct_bundles(bundle_indices: &[u32]) -> anyhow::Result<()> {
+    if bundle_indices.is_empty() {
+        return Err(invalid_input("a Keystone batch names at least one bundle"));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(bundle_indices.len());
+    match bundle_indices
+        .iter()
+        .find(|bundle_index| !seen.insert(**bundle_index))
+    {
+        Some(duplicate) => Err(invalid_input(format!(
+            "bundle {duplicate} is named twice in one Keystone batch"
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -1048,6 +1274,122 @@ mod tests {
             assert!(
                 event["event"].is_object(),
                 "a share_tracking event carries the driver event: {json}"
+            );
+        }
+    }
+
+    /// One Keystone-signed bundle, with PCZT bytes no signature can come out
+    /// of: every assertion below refuses the batch before it reads them.
+    fn signed_bundle(bundle_index: u32) -> crate::voting::wire::KeystoneSignedBundleDto {
+        crate::voting::wire::KeystoneSignedBundleDto {
+            bundle_index,
+            signed_pczt: vec![0u8; 4],
+        }
+    }
+
+    /// A batch names at least one bundle and never names one twice — in
+    /// either direction of the Keystone flow. Both are the host's mistake and
+    /// both are refused before the pipeline prepares anything.
+    #[test]
+    fn keystone_batches_reject_empty_and_duplicate_indices() {
+        let (_store, _dir, session) = open_session(0x41);
+        let refusals = [
+            session.keystone_signing_requests(&[]).unwrap_err(),
+            session.keystone_signing_requests(&[0, 1, 0]).unwrap_err(),
+            session.store_keystone_signatures(vec![]).unwrap_err(),
+            session
+                .store_keystone_signatures(vec![signed_bundle(0), signed_bundle(0)])
+                .unwrap_err(),
+        ];
+        for err in &refusals {
+            assert_eq!(error_kind(err), "invalid_input");
+        }
+    }
+
+    /// A round with no bundle rows has no request to build: the pipeline
+    /// prepares the bundle first, and the fixture's wallet holds no note to
+    /// prepare it from. What must hold is that the refusal is a condition the
+    /// host can act on rather than an SDK invariant it can do nothing with.
+    #[test]
+    fn keystone_request_without_setup_is_a_typed_error() {
+        let (_store, _dir, session) = open_session(0x42);
+        let err = session.keystone_signing_requests(&[0]).unwrap_err();
+        assert!(matches!(
+            error_kind(&err).as_str(),
+            "no_spendable_notes" | "insufficient_eligibility"
+        ));
+    }
+
+    /// PIR precompute prepares the bundle before it warms a single row, so an
+    /// empty wallet stops it at note selection — which is also how this test
+    /// knows no endpoint was dialled: a fleet that had been contacted would
+    /// report its own transport failure instead.
+    #[test]
+    fn precompute_pir_without_bundles_is_a_typed_error() {
+        let (_store, _dir, session) = open_session(0x43);
+        let err = session.precompute_pir(0).unwrap_err();
+        assert!(matches!(
+            error_kind(&err).as_str(),
+            "no_spendable_notes" | "insufficient_eligibility"
+        ));
+    }
+
+    #[test]
+    fn delegation_progress_maps_variants_to_snake_case() {
+        use zcash_voting::delegate::DelegationProgress;
+
+        assert_eq!(
+            progress_stage(&DelegationProgress::WaitingForExistingProof),
+            "waiting_for_existing_proof"
+        );
+        assert_eq!(
+            progress_stage(&DelegationProgress::ProofProgress(0.25)),
+            "proof_progress"
+        );
+        assert_eq!(
+            progress_fraction(&DelegationProgress::ProofProgress(0.25)),
+            Some(0.25)
+        );
+        assert_eq!(progress_fraction(&DelegationProgress::ProofComplete), None);
+    }
+
+    /// The proving thread's failure path, which nothing else here covers: a
+    /// bundle this round never set up. The pipeline refuses it while reading
+    /// the wallet, so no endpoint is dialled, and what must hold is that the
+    /// failure crosses the join as the typed envelope rather than as a panic
+    /// or a hang.
+    ///
+    /// The stage the pipeline reports before it reads the wallet is what
+    /// exercises the reporter, so the events are asserted as the JSON Swift
+    /// decodes.
+    #[test]
+    fn precompute_delegation_proof_without_bundles_is_a_typed_error() {
+        let (_store, _dir, session) = open_session(0x44);
+        let session = Arc::new(session);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let err = session
+            .precompute_delegation_proof(0, EventSink::collecting(&seen))
+            .unwrap_err();
+        // The empty wallet's own refusal, which is also what says the fleet
+        // was never reached: a dialled endpoint would have failed as its own
+        // transport kind instead.
+        assert!(matches!(
+            error_kind(&err).as_str(),
+            "no_spendable_notes" | "insufficient_eligibility"
+        ));
+
+        let events = collected(&seen);
+        assert!(
+            !events.is_empty(),
+            "the proof step reported no progress at all"
+        );
+        for json in &events {
+            let event: serde_json::Value = serde_json::from_str(json).expect("event JSON");
+            assert_eq!(event["kind"], "delegation_progress");
+            assert_eq!(event["progress"]["bundle_index"], 0);
+            assert!(
+                event["progress"]["stage"].is_string(),
+                "a delegation_progress event names its stage: {json}"
             );
         }
     }

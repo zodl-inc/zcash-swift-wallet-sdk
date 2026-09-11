@@ -437,7 +437,9 @@ pub(super) enum ProofStatusDto {
 ///
 /// `stage` is one of: `selecting_notes`, `pczt_building`, `pczt_built`,
 /// `proof_starting`, `waiting_for_existing_proof`, `proof_progress`,
-/// `proof_complete`, `signing_payload`, `payload_ready`.
+/// `proof_complete`, `signing_payload`, `payload_ready` — or `unknown` for a
+/// stage a newer `zcash_voting` reports that this SDK does not name yet, since
+/// the crate's progress enum is `#[non_exhaustive]`.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub(super) struct DelegationProgressDto {
     pub bundle_index: u32,
