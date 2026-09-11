@@ -87,8 +87,11 @@ unsafe impl Sync for EventSink {}
 
 impl EventSink {
     /// A sink that discards every event.
-    // Consumed by the session FFI, which lands in a later change.
-    #[allow(dead_code)]
+    ///
+    /// Test-only: the C surface builds every sink from the host's callback,
+    /// which is itself optional, so nothing in production asks for an empty
+    /// one by name.
+    #[cfg(test)]
     pub(super) fn none() -> Self {
         EventSink {
             callback: None,
@@ -103,8 +106,6 @@ impl EventSink {
     /// `callback`, when present, must be safe to call with `context` from any
     /// thread and from several threads at once, and `context` must stay valid
     /// until the run this sink is passed to has returned.
-    // Consumed by the session FFI, which lands in a later change.
-    #[allow(dead_code)]
     pub(super) unsafe fn new(callback: EventCallback, context: *mut std::ffi::c_void) -> Self {
         EventSink { callback, context }
     }
@@ -165,13 +166,10 @@ impl EventSink {
 /// One open voting round: the crate objects that drive it, plus the inputs
 /// they were built from.
 ///
-/// Deliberately not `Debug`: it holds the round's voting hotkey secret, and a
-/// derived formatter would print it. `SeedSpendAuthSigner` is not `Debug` for
-/// the same reason.
-// Constructed by the session FFI, which lands in a later change. The per-field
-// allows below say which later change reads each field, so this one can go when
-// the FFI lands without the rest turning into warnings.
-#[allow(dead_code)]
+/// Deliberately not `Debug`: the executor's round binding and the delegation
+/// pipeline each hold the round's voting hotkey secret, and a derived
+/// formatter would reach it through them. `SeedSpendAuthSigner` is not `Debug`
+/// for the same reason.
 pub struct VotingSession {
     /// A wallet-scoped handle on the sidecar, taken once at open.
     ///
@@ -211,19 +209,8 @@ pub struct VotingSession {
     network_id: u32,
     /// The round this session is bound to, as canonical lowercase hex.
     round_id: String,
-    /// The round's voting hotkey secret, when one was bound.
-    ///
-    /// Held separately from the executor's copy because the delegation stages
-    /// reconstruct the hotkey on the proving thread; `Zeroizing` so neither
-    /// copy outlives the session in memory.
-    // No reader yet: the executor and the delegation pipeline each took their
-    // own copy at open, and every step so far goes through one of them.
-    #[allow(dead_code)]
-    hotkey_secret: Option<Zeroizing<Vec<u8>>>,
 }
 
-// Consumed by the session FFI, which lands in a later change.
-#[allow(dead_code)]
 impl VotingSession {
     /// Opens a session for one round over `store`'s sidecar.
     ///
@@ -344,7 +331,7 @@ impl VotingSession {
                     num_options: entry.num_options,
                 })
                 .collect(),
-            hotkey_secret: binding.hotkey_secret.clone().map(Zeroizing::new),
+            hotkey_secret: binding.hotkey_secret.map(Zeroizing::new),
         })
         .ffi()?
         // Vote-tree sync is not chain or helper traffic, so it keeps the
@@ -363,7 +350,6 @@ impl VotingSession {
             round_id: round_params.vote_round_id,
             network: store.network,
             network_id: store.network_id,
-            hotkey_secret: binding.hotkey_secret.map(Zeroizing::new),
             inputs,
         })
     }
@@ -696,6 +682,10 @@ impl VotingSession {
     }
 
     /// The round this session is bound to.
+    // No caller outside the tests: every step here reaches the round through
+    // the field, and the C surface hands Swift the round id inside the plan
+    // and the reports rather than on its own.
+    #[allow(dead_code)]
     pub(super) fn round_id(&self) -> &str {
         &self.round_id
     }

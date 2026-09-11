@@ -39,8 +39,6 @@ pub(super) enum SdkRoute {
     Tor(Box<TorRoute>),
 }
 
-// Consumed by session setup, which lands in a later change.
-#[allow(dead_code)]
 impl SdkRoute {
     /// The direct HTTP/HTTPS route.
     pub(super) fn direct() -> Self {
@@ -329,8 +327,6 @@ impl RouteHttp for TorRoute {
 ///
 /// PIR and vote-tree traffic keeps the shared direct transport instead
 /// ([`super::runtime::direct_transport`], spec D12).
-// Consumed by session setup, which lands in a later change.
-#[allow(dead_code)]
 pub(super) fn routed_transport(route: SdkRoute) -> Arc<HyperTransport<SdkRoute>> {
     Arc::new(HyperTransport::with_route(route))
 }

@@ -22,12 +22,15 @@ use super::store::{self, VotingDatabaseHandle};
 
 /// Borrow the handle behind a raw pointer, or fail with typed JSON.
 ///
+/// Shared with [`super::session_ffi`], which opens sessions over the same
+/// handle and must refuse a null one the same way.
+///
 /// # Safety
 ///
 /// If non-null, `db` must point to a live `VotingDatabaseHandle` returned by
 /// [`zcashlc_voting_db_open`] and not yet freed. The returned reference must
 /// not outlive it.
-unsafe fn handle_from_ptr<'a>(
+pub(super) unsafe fn handle_from_ptr<'a>(
     db: *mut VotingDatabaseHandle,
 ) -> anyhow::Result<&'a VotingDatabaseHandle> {
     unsafe { db.as_ref() }.ok_or_else(|| invalid_input("VotingDatabaseHandle is null"))

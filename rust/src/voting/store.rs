@@ -42,14 +42,10 @@ pub struct VotingDatabaseHandle {
     wallet_id: Mutex<Option<String>>,
     /// The voting identity of `network_id`, fixed once at open time because
     /// `zcash_voting` persists each round's network.
-    // Read by the session, which lands in a later change.
-    #[allow(dead_code)]
     pub(super) network: zcash_voting::Network,
     /// The SDK's numeric network id, kept so wallet-database and key
     /// derivation calls resolve the same (possibly custom) chain the handle
     /// was opened for.
-    // Read by the session, which lands in a later change.
-    #[allow(dead_code)]
     pub(super) network_id: u32,
 }
 

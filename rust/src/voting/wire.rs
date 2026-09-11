@@ -78,8 +78,6 @@ pub(super) struct RoundParamsDto {
 }
 
 impl RoundParamsDto {
-    // Consumed by the session FFI, which lands in a later change.
-    #[allow(dead_code)]
     pub(super) fn into_params(self) -> zcash_voting::VotingRoundParams {
         zcash_voting::VotingRoundParams {
             vote_round_id: self.vote_round_id,
@@ -101,8 +99,6 @@ pub(super) struct PirLayoutDto {
 }
 
 impl PirLayoutDto {
-    // Consumed by the session FFI, which lands in a later change.
-    #[allow(dead_code)]
     pub(super) fn into_layout(self) -> zcash_voting::config::PirLayout {
         zcash_voting::config::PirLayout {
             pir_depth: self.pir_depth,
@@ -114,8 +110,6 @@ impl PirLayoutDto {
 }
 
 /// Everything needed to open a round session.
-// Consumed by the session FFI, which lands in a later change.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub(super) struct SessionInputsDto {
     pub account_uuid: String,
@@ -134,8 +128,6 @@ pub(super) struct SessionInputsDto {
 }
 
 /// One roster proposal: its id and the number of selectable options.
-// Consumed by the session FFI, which lands in a later change.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub(super) struct RosterEntryDto {
     pub proposal_id: u32,
@@ -144,8 +136,6 @@ pub(super) struct RosterEntryDto {
 
 /// The authenticated roster plus an optional stored hotkey secret to bind a
 /// session to a previously generated hotkey.
-// Consumed by the session FFI, which lands in a later change.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub(super) struct SessionBindingDto {
     pub roster: Vec<RosterEntryDto>,
@@ -154,9 +144,6 @@ pub(super) struct SessionBindingDto {
 }
 
 /// A voter's decision for one proposal, internally tagged by `"decision"`.
-// Consumed by `BallotIntentDto`, which is consumed by the session FFI in a
-// later change.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub(super) enum DecisionDto {
@@ -165,8 +152,6 @@ pub(super) enum DecisionDto {
 }
 
 /// One ballot decision to record before casting.
-// Consumed by the session FFI, which lands in a later change.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub(super) struct BallotIntentDto {
     pub proposal_id: u32,
@@ -175,8 +160,6 @@ pub(super) struct BallotIntentDto {
 }
 
 impl BallotIntentDto {
-    // Consumed by the session FFI, which lands in a later change.
-    #[allow(dead_code)]
     pub(super) fn into_intent(self) -> zcash_voting::BallotIntent {
         zcash_voting::BallotIntent {
             proposal_id: self.proposal_id,
@@ -190,8 +173,6 @@ impl BallotIntentDto {
 
 /// Which signer backs a session: none yet, an in-process software seed, or a
 /// Keystone hardware signer whose signatures are already stored.
-// Consumed by the session FFI, which lands in a later change.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum SignerDto {
@@ -206,9 +187,6 @@ pub(super) enum SignerDto {
 /// How the round driver paces itself between steps and isolates failures.
 ///
 /// Mirrors `zcash_voting::FailureIsolation`'s variants.
-// Consumed by `DrivePolicyDto`, which is consumed by the session FFI in a
-// later change.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum FailureIsolationDto {
@@ -217,9 +195,6 @@ pub(super) enum FailureIsolationDto {
 }
 
 /// What a run's progress total is measured against.
-// Consumed by `DrivePolicyDto`, which is consumed by the session FFI in a
-// later change.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ProgressBaselineDto {
@@ -230,8 +205,6 @@ pub(super) enum ProgressBaselineDto {
 /// Swift-tunable overrides for [`zcash_voting::RoundDrivePolicy`], plus the
 /// SDK-only `max_proof_concurrency` cap. Every field defaults independently
 /// when absent from JSON.
-// Consumed by the session FFI, which lands in a later change.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub(super) struct DrivePolicyDto {
     #[serde(default)]
@@ -252,8 +225,6 @@ impl DrivePolicyDto {
     // Defaults: repoll 2s, bundle concurrency 2, skip_bundle, 512 dispatches,
     // run baseline, proof concurrency 1.
     //
-    // Consumed by the session FFI, which lands in a later change.
-    #[allow(dead_code)]
     // The struct-literal form clippy suggests inlines two `match` expressions
     // into one expression, which reads worse than default-then-override.
     #[allow(clippy::field_reassign_with_default)]
@@ -284,8 +255,6 @@ impl DrivePolicyDto {
 /// Swift-tunable per-round overrides applied on top of the stored round
 /// config. Each field is independently absent (no override), explicitly
 /// cleared, or set: see [`Self::ceremony_start_seconds`].
-// Consumed by the session FFI, which lands in a later change.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub(super) struct HostOverridesDto {
     #[serde(default)]
@@ -299,8 +268,6 @@ pub(super) struct HostOverridesDto {
 }
 
 /// Swift-tunable overrides for [`zcash_voting::ShareTrackingDrivePolicy`].
-// Consumed by the session FFI, which lands in a later change.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub(super) struct ShareTrackingPolicyDto {
     #[serde(default)]
@@ -315,9 +282,6 @@ impl ShareTrackingPolicyDto {
     // Defaults: failure retry 15s, 240 consecutive failures, no pass budget —
     // matching `zcash_voting::ShareTrackingDrivePolicy::default()` exactly
     // (its `timing` field is left at the crate's own default throughout).
-    //
-    // Consumed by the session FFI, which lands in a later change.
-    #[allow(dead_code)]
     pub(super) fn into_policy(self) -> zcash_voting::ShareTrackingDrivePolicy {
         zcash_voting::ShareTrackingDrivePolicy {
             failure_retry: std::time::Duration::from_secs_f64(
@@ -336,8 +300,6 @@ impl ShareTrackingPolicyDto {
 /// `available_parallelism`), this SDK's default keeps `max_active_heavy_jobs`
 /// at 1 (spec D6): CPU workers may run wide, but only one heavy proof/keygen
 /// job is admitted at a time unless Swift raises it explicitly.
-// Consumed by the session FFI, which lands in a later change.
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
 pub(super) struct ProvingPolicyDto {
     #[serde(default)]
@@ -347,8 +309,6 @@ pub(super) struct ProvingPolicyDto {
 }
 
 impl ProvingPolicyDto {
-    // Consumed by the session FFI, which lands in a later change.
-    #[allow(dead_code)]
     pub(super) fn into_policy(self) -> zcash_voting::ProvingPolicy {
         use std::num::NonZeroUsize;
         let available = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
@@ -390,8 +350,6 @@ impl From<zcash_voting::storage::RoundSummary> for RoundSummaryDto {
 }
 
 /// Delegation bundle layout after quantizing eligible notes.
-// Consumed by the session FFI, which lands in a later change.
-#[allow(dead_code)]
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub(super) struct BundleLayoutDto {
     pub bundle_count: u32,
@@ -402,8 +360,6 @@ pub(super) struct BundleLayoutDto {
 }
 
 /// Voting eligibility computed for the wallet's snapshot notes.
-// Consumed by the session FFI, which lands in a later change.
-#[allow(dead_code)]
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub(super) struct EligibilityDto {
     pub distinct_note_count: u64,
@@ -413,8 +369,6 @@ pub(super) struct EligibilityDto {
 }
 
 /// Progress of PIR precompute for one delegation bundle.
-// Consumed by the session FFI, which lands in a later change.
-#[allow(dead_code)]
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub(super) struct PirPrecomputeDto {
     pub bundle_index: u32,
@@ -424,8 +378,6 @@ pub(super) struct PirPrecomputeDto {
 }
 
 /// Whether a proof was freshly generated or reused from the shared cache.
-// Consumed by the session FFI, which lands in a later change.
-#[allow(dead_code)]
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ProofStatusDto {
@@ -448,8 +400,6 @@ pub(super) struct DelegationProgressDto {
 }
 
 /// One bundle's voting PCZT, redacted for signing by a Keystone device.
-// Consumed by the session FFI, which lands in a later change.
-#[allow(dead_code)]
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub(super) struct KeystoneSigningRequestDto {
     pub bundle_index: u32,
@@ -483,8 +433,6 @@ impl From<zcash_voting::delegate::KeystoneSigningRequest> for KeystoneSigningReq
 }
 
 /// A Keystone-signed bundle PCZT returned from the QR scanning flow.
-// Consumed by the session FFI, which lands in a later change.
-#[allow(dead_code)]
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
 pub(super) struct KeystoneSignedBundleDto {
     pub bundle_index: u32,
@@ -493,8 +441,6 @@ pub(super) struct KeystoneSignedBundleDto {
 }
 
 /// Outcome of storing a batch of Keystone signatures.
-// Consumed by the store FFI, which lands in a later change.
-#[allow(dead_code)]
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub(super) struct KeystoneSignatureBatchResultDto {
     pub inserted: u32,
@@ -525,8 +471,6 @@ impl From<zcash_voting::wire::KeystoneSignatureRecord> for KeystoneSignatureReco
 }
 
 /// One event from a session's live event stream, internally tagged by `"kind"`.
-// Consumed by the session FFI, which lands in a later change.
-#[allow(dead_code)]
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum SessionEventDto {
