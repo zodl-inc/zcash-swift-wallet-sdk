@@ -60,6 +60,44 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   method has a default implementation that does nothing, so custom `Broadcaster` conformers
   without submit-plan bookkeeping keep compiling unchanged.
 
+### Coinholder voting on zcash_voting 4.0
+
+- The voting API is now a round session. `VotingRoundSession` — opened through
+  `Synchronizer.makeVotingRoundSession(backend:inputs:binding:route:epoch:)` — plans a round,
+  records the ballot, lays out bundles, precomputes, proves, signs, submits, delivers helper shares
+  and confirms them, and answers with a `VotingRoundRunReport` saying where it stopped and why. The
+  step-by-step `VotingRustBackend` calls a host used to sequence itself are gone, so a voting host
+  is rewritten around the session rather than adjusted; `MIGRATING.md` carries the call sequence and
+  the replacement for each removed call. `VotingRustBackend` keeps only the sidecar: opening it,
+  binding it to a wallet, the reads a round list is rendered from, and the maintenance calls made
+  outside a round.
+- New on the surviving `VotingRustBackend` surface, alongside the session:
+  `roundPlan(roundId:proposalIds:)` and `pendingShareRounds()` (the reads a round list and a
+  share-tracking schedule are built from), `resetVoteTree(roundId:)`,
+  `deleteRound(roundId:discardingRecovery:)`, `clearBallotIntents(roundId:proposalIds:)`,
+  `keystoneSignatures(roundId:)`, `configureProving(_:)`, and
+  `validateRoundId(_:)`, which reports whether a string is a canonical round id without needing a
+  database or a session. `retryBlockedCombinedCast(roundId:bundleIndex:)` forgets a bundle's
+  combined-cast rejection streak and answers whether there was one: the wallet stops re-proving a
+  delegation the chain keeps refusing, and this is the voter's explicit "the cause is fixed", so it
+  belongs behind a deliberate retry rather than an automatic one. `VotingRoundSession.eligibility()`
+  answers a `VotingEligibilityReport` — distinct note count, eligible weight, whether this account
+  can vote at all, and the value a privacy trim would drop — without persisting anything, so a
+  screen can say "you cannot vote in this round" before a round row exists.
+- `Synchronizer` gained `makeVotingRoundSession(backend:inputs:binding:route:epoch:)`, with the
+  matching `ClosureSynchronizer` and `CombineSynchronizer` counterparts. `VotingTransportRoute`
+  names the route the session's chain and helper traffic takes for its whole life: `.tor` fails
+  closed, throwing `ZcashError.torNotEnabled` when Tor is off and `ZcashError.torClientUnavailable`
+  when the conformer has no Tor client at all, and never falls back to a direct connection. All
+  three protocols carry a default implementation that opens `.direct` sessions and refuses `.tor`,
+  so existing conformers and test doubles keep compiling unchanged. PIR and vote-tree traffic take
+  the direct transport on either route, because a PIR query names no voter.
+- A run's live events are a best-effort narration and may be dropped under load: the
+  `VotingRoundRunReport` a call returns, not the `VotingRoundDriveEvent` stream, is the authoritative
+  account of what a run did. Events are delivered one at a time on a serial queue per session, and
+  every event of a call arrives before that call returns. The closure must not block that queue, and
+  must not wait on the call that is emitting into it.
+
 ## Changed
 
 - `SlipstreamSynchronizer.importAccount`, `deleteAccount`, `switchTo(endpoint:)` and
@@ -113,15 +151,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Coinholder voting on zcash_voting 4.0
 
-- The voting API is now a round session. `VotingRoundSession` — opened through
-  `Synchronizer.makeVotingRoundSession(backend:inputs:binding:route:epoch:)` — plans a round,
-  records the ballot, lays out bundles, precomputes, proves, signs, submits, delivers helper shares
-  and confirms them, and answers with a `VotingRoundRunReport` saying where it stopped and why. The
-  step-by-step `VotingRustBackend` calls a host used to sequence itself are gone, so a voting host
-  is rewritten around the session rather than adjusted; `MIGRATING.md` carries the call sequence and
-  the replacement for each removed call. `VotingRustBackend` keeps only the sidecar: opening it,
-  binding it to a wallet, the reads a round list is rendered from, and the maintenance calls made
-  outside a round.
 - Voting runs on `zcash_voting` 4.0 with its `lrz` backend, tracked as a git revision until 4.0.0 is
   published; building the Rust core from source now requires Rust 1.91. The 4.0 delegation circuit
   is not the 3.x one, so **this SDK can only vote on a chain that has been upgraded to the 4.0
@@ -144,6 +173,32 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   faults. `VotingRustBackendError` keeps `databaseAlreadyOpen` and `databaseNotOpen` and gains
   `sessionClosed` and `sessionBusy`, which are the wrapper's own refusals before any call is made;
   an exhaustive `switch` over it stops compiling until those two are handled.
+- Members that kept their name and changed: `listRounds()` answers the new `VotingRoundSummary`,
+  whose `phase` is a `String` rather than the removed `VotingRoundPhase` enum and which gained
+  `walletId` and `network` — a `switch` over the old enum is replaced by a comparison against the
+  crate's phase strings, or better by `VotingRoundPlan.primaryAction`. `syncVoteTree(roundId:nodeUrl:)`
+  is now `async` and no longer blocks the caller's thread or the backend's other calls.
+  `deleteSkippedBundles(roundId:keepCount:)` returns `UInt64` instead of `UInt32`.
+  `setupBundles(roundId:notes:)` is `VotingRoundSession.setupBundles()`, `async` and returning
+  `VotingBundleLayout` instead of `VotingBundleSetupResult`. `resetSessionState(roundId:)` and the
+  new `resetVoteTree(roundId:)` refuse an empty round id rather than resetting every round's cached
+  tree state. `VotingKeystoneSignatureRecord`'s `sig`, `sighash` and `randomizedKey` are `Data`
+  instead of `[UInt8]`.
+- `warmProvingCaches()` returns at once and warms in the background instead of warming on the
+  calling thread, and the new `configureProving(_:)` must run **before** it: warming starts the
+  proving pool, and starting it fixes the policy, after which `configureProving(_:)` returns `false`
+  for any policy that disagrees with the one already in force and leaves the running pool alone. A
+  host that cares which policy is live must treat `false` as "mine was not applied".
+- Voting hotkey generation (`generateHotkey(networkId:)`, `hotkey(fromStoredSecret:networkId:)`),
+  the software signer, and `open(path:networkId:)` now accept the regtest network id and resolve
+  their voting identity through the registered custom network's base network — a modified-mainnet
+  chain votes with mainnet hotkeys and address HRPs. An unconfigured custom network is rejected at
+  the call rather than silently treated as regtest.
+
+## Removed
+
+### Coinholder voting on zcash_voting 4.0
+
 - Removed from `VotingRustBackend` (45 methods): `addSentServers`, `buildAndProveDelegation`,
   `buildPczt`, `clearKeystoneSignature`, `clearRecoveryState`, `clearRound`, `commitVote`,
   `computeShareNullifier`, `confirmVoteSubmission`, `extractPcztSighash`, `extractSpendAuthSig`,
@@ -190,53 +245,6 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `VotingWireEncryptedShare` and `VotingWitnessData`. The wire and witness types are gone because
   those payloads no longer cross the boundary; `VotingNoteInfo` is gone because the session selects
   notes from the wallet itself, so a host no longer assembles a note list to vote with.
-- Members that kept their name and changed: `listRounds()` answers the new `VotingRoundSummary`,
-  whose `phase` is a `String` rather than the removed `VotingRoundPhase` enum and which gained
-  `walletId` and `network` — a `switch` over the old enum is replaced by a comparison against the
-  crate's phase strings, or better by `VotingRoundPlan.primaryAction`. `syncVoteTree(roundId:nodeUrl:)`
-  is now `async` and no longer blocks the caller's thread or the backend's other calls.
-  `deleteSkippedBundles(roundId:keepCount:)` returns `UInt64` instead of `UInt32`.
-  `setupBundles(roundId:notes:)` is `VotingRoundSession.setupBundles()`, `async` and returning
-  `VotingBundleLayout` instead of `VotingBundleSetupResult`. `resetSessionState(roundId:)` and the
-  new `resetVoteTree(roundId:)` refuse an empty round id rather than resetting every round's cached
-  tree state. `VotingKeystoneSignatureRecord`'s `sig`, `sighash` and `randomizedKey` are `Data`
-  instead of `[UInt8]`.
-- New on the surviving `VotingRustBackend` surface, alongside the session:
-  `roundPlan(roundId:proposalIds:)` and `pendingShareRounds()` (the reads a round list and a
-  share-tracking schedule are built from), `resetVoteTree(roundId:)`,
-  `deleteRound(roundId:discardingRecovery:)`, `clearBallotIntents(roundId:proposalIds:)`,
-  `keystoneSignatures(roundId:)`, `configureProving(_:)`, and
-  `validateRoundId(_:)`, which reports whether a string is a canonical round id without needing a
-  database or a session. `retryBlockedCombinedCast(roundId:bundleIndex:)` forgets a bundle's
-  combined-cast rejection streak and answers whether there was one: the wallet stops re-proving a
-  delegation the chain keeps refusing, and this is the voter's explicit "the cause is fixed", so it
-  belongs behind a deliberate retry rather than an automatic one. `VotingRoundSession.eligibility()`
-  answers a `VotingEligibilityReport` — distinct note count, eligible weight, whether this account
-  can vote at all, and the value a privacy trim would drop — without persisting anything, so a
-  screen can say "you cannot vote in this round" before a round row exists.
-- `warmProvingCaches()` returns at once and warms in the background instead of warming on the
-  calling thread, and the new `configureProving(_:)` must run **before** it: warming starts the
-  proving pool, and starting it fixes the policy, after which `configureProving(_:)` returns `false`
-  for any policy that disagrees with the one already in force and leaves the running pool alone. A
-  host that cares which policy is live must treat `false` as "mine was not applied".
-- `Synchronizer` gained `makeVotingRoundSession(backend:inputs:binding:route:epoch:)`, with the
-  matching `ClosureSynchronizer` and `CombineSynchronizer` counterparts. `VotingTransportRoute`
-  names the route the session's chain and helper traffic takes for its whole life: `.tor` fails
-  closed, throwing `ZcashError.torNotEnabled` when Tor is off and `ZcashError.torClientUnavailable`
-  when the conformer has no Tor client at all, and never falls back to a direct connection. All
-  three protocols carry a default implementation that opens `.direct` sessions and refuses `.tor`,
-  so existing conformers and test doubles keep compiling unchanged. PIR and vote-tree traffic take
-  the direct transport on either route, because a PIR query names no voter.
-- Voting hotkey generation (`generateHotkey(networkId:)`, `hotkey(fromStoredSecret:networkId:)`),
-  the software signer, and `open(path:networkId:)` now accept the regtest network id and resolve
-  their voting identity through the registered custom network's base network — a modified-mainnet
-  chain votes with mainnet hotkeys and address HRPs. An unconfigured custom network is rejected at
-  the call rather than silently treated as regtest.
-- A run's live events are a best-effort narration and may be dropped under load: the
-  `VotingRoundRunReport` a call returns, not the `VotingRoundDriveEvent` stream, is the authoritative
-  account of what a run did. Events are delivered one at a time on a serial queue per session, and
-  every event of a call arrives before that call returns. The closure must not block that queue, and
-  must not wait on the call that is emitting into it.
 
 ## Fixed
 
