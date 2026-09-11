@@ -2,8 +2,6 @@
 //! Swift can branch on typed kinds instead of message text.
 use zcash_voting::{VotingError, VotingErrorView};
 
-// Consumed by every voting FFI entry point, which land in later changes.
-#[allow(dead_code)]
 pub(super) fn voting_error(error: VotingError) -> anyhow::Error {
     let view = VotingErrorView::from(&error);
     match serde_json::to_string(&view) {
@@ -12,24 +10,18 @@ pub(super) fn voting_error(error: VotingError) -> anyhow::Error {
     }
 }
 
-// Consumed by every voting FFI entry point, which land in later changes.
-#[allow(dead_code)]
 pub(super) fn invalid_input(message: impl Into<String>) -> anyhow::Error {
     voting_error(VotingError::InvalidInput {
         message: message.into(),
     })
 }
 
-// Consumed by every voting FFI entry point, which land in later changes.
-#[allow(dead_code)]
 pub(super) fn internal(message: impl Into<String>) -> anyhow::Error {
     voting_error(VotingError::Internal {
         message: message.into(),
     })
 }
 
-// Consumed by every voting FFI entry point, which land in later changes.
-#[allow(dead_code)]
 pub(super) trait VotingResultExt<T> {
     fn ffi(self) -> anyhow::Result<T>;
 }

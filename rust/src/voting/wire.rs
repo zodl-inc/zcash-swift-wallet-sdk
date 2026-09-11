@@ -366,8 +366,6 @@ impl ProvingPolicyDto {
 }
 
 /// Compact round info for the store FFI's round listing.
-// Consumed by the store FFI, which lands in a later change.
-#[allow(dead_code)]
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub(super) struct RoundSummaryDto {
     pub round_id: String,
@@ -502,8 +500,6 @@ pub(super) struct KeystoneSignatureBatchResultDto {
 }
 
 /// One stored Keystone signature, for `KeystoneSignatureSource::Stored` reuse.
-// Consumed by the store FFI, which lands in a later change.
-#[allow(dead_code)]
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub(super) struct KeystoneSignatureRecordDto {
     pub bundle_index: u32,
@@ -513,6 +509,17 @@ pub(super) struct KeystoneSignatureRecordDto {
     pub sighash: Vec<u8>,
     #[serde(with = "b64")]
     pub rk: Vec<u8>,
+}
+
+impl From<zcash_voting::wire::KeystoneSignatureRecord> for KeystoneSignatureRecordDto {
+    fn from(record: zcash_voting::wire::KeystoneSignatureRecord) -> Self {
+        KeystoneSignatureRecordDto {
+            bundle_index: record.bundle_index,
+            sig: record.sig,
+            sighash: record.sighash,
+            rk: record.rk,
+        }
+    }
 }
 
 /// One event from a session's live event stream, internally tagged by `"kind"`.
