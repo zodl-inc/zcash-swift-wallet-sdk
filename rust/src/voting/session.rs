@@ -17,18 +17,136 @@
 //! Traffic splits by kind (spec D12): chain and helper requests go through the
 //! route chosen at open — Tor or direct, never falling back — while PIR and
 //! vote-tree requests use the process-wide direct transport.
+//!
+//! A run — [`VotingSession::run`] or [`VotingSession::track_shares`] — is
+//! driven on the shared runtime instead of on the calling thread, and streams
+//! what it observes to the host through an [`EventSink`] as it goes. Neither
+//! driver fails: both return a report whose quiescence says why the round
+//! stopped, so the errors these methods return are the ones around the run —
+//! a signer this host cannot build, a report the wire projection refuses, or a
+//! driver task that did not finish.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use zeroize::Zeroizing;
 
 use super::errors::{VotingResultExt, internal, invalid_input};
 use super::route::SdkRoute;
+use super::signer::SeedSpendAuthSigner;
 use super::store::VotingDatabaseHandle;
 use super::wallet_access::SdkWalletDbOpener;
 use super::wire::{
-    BallotIntentDto, BundleLayoutDto, EligibilityDto, SessionBindingDto, SessionInputsDto,
+    BallotIntentDto, BundleLayoutDto, DrivePolicyDto, EligibilityDto, HostOverridesDto,
+    SessionBindingDto, SessionEventDto, SessionInputsDto, ShareTrackingPolicyDto, SignerDto,
 };
+
+/// The C function a host installs to receive one run's events, or `None` to
+/// run without an event stream.
+///
+/// Each call carries one `SessionEventDto` as UTF-8 JSON. The bytes are
+/// borrowed for the duration of the call only, so a host that keeps them must
+/// copy them.
+pub(super) type EventCallback =
+    Option<unsafe extern "C" fn(context: *mut std::ffi::c_void, json: *const u8, json_len: usize)>;
+
+/// Where a run's events go: the host's callback and the context it named.
+///
+/// `Copy`, because the drivers want one of these in the spawned task and
+/// another inside the reporter they report through, and there is nothing here
+/// to share.
+#[derive(Clone, Copy)]
+pub(super) struct EventSink {
+    callback: EventCallback,
+    context: *mut std::ffi::c_void,
+}
+
+// SAFETY: a sink is a function pointer and an opaque host pointer, and Rust
+// cannot know what the latter points at, so both obligations are the host's
+// and [`EventSink::new`] states them: the context must stay valid for the
+// whole run, and the callback must be safe to call from any thread at any
+// time. The round driver reports from several bundle tasks at once, so
+// concurrent calls are the normal case rather than an edge; the SDK's Swift
+// wrapper serializes them.
+unsafe impl Send for EventSink {}
+unsafe impl Sync for EventSink {}
+
+impl EventSink {
+    /// A sink that discards every event.
+    // Consumed by the session FFI, which lands in a later change.
+    #[allow(dead_code)]
+    pub(super) fn none() -> Self {
+        EventSink {
+            callback: None,
+            context: std::ptr::null_mut(),
+        }
+    }
+
+    /// A sink over the host's `callback`, called with `context`.
+    ///
+    /// # Safety
+    ///
+    /// `callback`, when present, must be safe to call with `context` from any
+    /// thread and from several threads at once, and `context` must stay valid
+    /// until the run this sink is passed to has returned.
+    // Consumed by the session FFI, which lands in a later change.
+    #[allow(dead_code)]
+    pub(super) unsafe fn new(callback: EventCallback, context: *mut std::ffi::c_void) -> Self {
+        EventSink { callback, context }
+    }
+
+    /// Serializes `event` and hands it to the host.
+    ///
+    /// A sink without a callback drops it, and so does an event that fails to
+    /// serialize: the stream is an observation of a run, and the run's report
+    /// — which carries the same plan, failures and outcomes — is what the host
+    /// acts on.
+    ///
+    /// Does nothing but serialize and call, because the round driver reports
+    /// from concurrent bundle tasks and a reporter that blocked would hold one
+    /// of them up.
+    pub(super) fn emit(&self, event: &SessionEventDto) {
+        let Some(callback) = self.callback else {
+            return;
+        };
+        let Ok(json) = serde_json::to_string(event) else {
+            return;
+        };
+        // SAFETY: the callback and the context are the host's own, given to
+        // `new` under its contract; the JSON is borrowed for this call only.
+        unsafe { callback(self.context, json.as_ptr(), json.len()) };
+    }
+
+    /// A sink that appends every event's JSON to `collected`.
+    ///
+    /// Test-only. The context is `collected`'s target rather than a clone of
+    /// the `Arc`, so a caller must keep its own clone alive for as long as the
+    /// sink can be called — which is what lets the test read the events back
+    /// after the run.
+    #[cfg(test)]
+    fn collecting(collected: &Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+        unsafe extern "C" fn collect(
+            context: *mut std::ffi::c_void,
+            json: *const u8,
+            json_len: usize,
+        ) {
+            // SAFETY: `collecting` set the context to a live `Arc`'s target,
+            // which its caller holds for the whole run, and `json` is the
+            // emitted string's bytes.
+            let collected = unsafe { &*context.cast::<std::sync::Mutex<Vec<String>>>() };
+            let json = unsafe { std::slice::from_raw_parts(json, json_len) };
+            collected
+                .lock()
+                .expect("collected events")
+                .push(String::from_utf8_lossy(json).into_owned());
+        }
+
+        EventSink {
+            callback: Some(collect),
+            context: Arc::as_ptr(collected).cast::<std::ffi::c_void>().cast_mut(),
+        }
+    }
+}
 
 /// One open voting round: the crate objects that drive it, plus the inputs
 /// they were built from.
@@ -45,9 +163,8 @@ pub struct VotingSession {
     ///
     /// The executor and the pipeline each freeze their own handle over the
     /// same connection, so this one is never the thing they persist through;
-    /// it is the session's own read handle.
-    // Consumed by the round driver, which lands in a later change.
-    #[allow(dead_code)]
+    /// it is the session's own read handle, and the one share tracking drives
+    /// the round's shares over.
     database: Arc<zcash_voting::storage::VotingDb>,
     /// Runs the round's steps. Owns the round binding — id, network, roster
     /// and hotkey secret — which is why planning goes through it rather than
@@ -60,32 +177,23 @@ pub struct VotingSession {
     pipeline: Arc<zcash_voting::DelegationPipeline<SdkWalletDbOpener>>,
     /// The PIR fleet delegation precompute queries, over the shared direct
     /// transport (spec D12).
-    // Consumed by the round driver, which lands in a later change.
-    #[allow(dead_code)]
     pir: Arc<zcash_voting::PirFleet>,
     /// The helper client, kept beside the executor's clone: the two share one
     /// health tracker, so share tracking observes what the round's deliveries
     /// learned about each helper.
-    // Consumed by share tracking, which lands in a later change.
-    #[allow(dead_code)]
     helper_client: zcash_voting::HelperClient,
     /// Cancellation and the host operation epoch, shared with every bounded
     /// pass this session starts.
     control: zcash_voting::ChainSubmissionControl,
     /// The inputs this session was opened with, kept because a step needs the
     /// ones the crate does not capture at construction: the helper fleet, the
-    /// vote-tree nodes and the round's timing.
-    // Consumed by the round driver, which lands in a later change.
-    #[allow(dead_code)]
+    /// vote-tree nodes and the round's timing. A run reads them through
+    /// [`HostInputs`], which applies that call's overrides on top.
     inputs: SessionInputsDto,
     /// The voting identity of the store this session was opened from.
-    // Consumed by the round driver, which lands in a later change.
-    #[allow(dead_code)]
     network: zcash_voting::Network,
     /// The SDK's numeric network id, kept so wallet-database and key
     /// derivation calls resolve the same (possibly custom) chain.
-    // Consumed by the software signer, which lands in a later change.
-    #[allow(dead_code)]
     network_id: u32,
     /// The round this session is bound to, as canonical lowercase hex.
     round_id: String,
@@ -94,7 +202,8 @@ pub struct VotingSession {
     /// Held separately from the executor's copy because the delegation stages
     /// reconstruct the hotkey on the proving thread; `Zeroizing` so neither
     /// copy outlives the session in memory.
-    // Consumed by the round driver, which lands in a later change.
+    // No reader yet: the executor and the delegation pipeline each took their
+    // own copy at open, and every step so far goes through one of them.
     #[allow(dead_code)]
     hotkey_secret: Option<Zeroizing<Vec<u8>>>,
 }
@@ -308,6 +417,124 @@ impl VotingSession {
         })
     }
 
+    /// Drives this round to quiescence, reporting every driver event to
+    /// `sink` as it goes.
+    ///
+    /// Blocks the calling thread for the whole run — minutes on a round with
+    /// proofs to generate — but runs the driver on the shared runtime rather
+    /// than here: calls arrive from Swift threads, never from a runtime
+    /// worker, and the driver hands its planning reads off the worker with
+    /// `block_in_place`, which only a multi-thread runtime allows.
+    ///
+    /// `signer` decides what the run may do with delegation. Without one, the
+    /// driver reports the bundles that owe a signature instead of dispatching
+    /// them; with a software seed, the seed goes into [`SeedSpendAuthSigner`]
+    /// and nowhere else, and its `Zeroizing` buffer is wiped when this run's
+    /// delegation inputs drop with the spawned task (spec D9).
+    ///
+    /// The driver itself never fails: a run that could do nothing says why
+    /// through the report's quiescence. What can fail is either side of it —
+    /// a signer this host cannot build, a driver task that did not finish, and
+    /// a report the wire projection refuses.
+    pub(super) fn run(
+        self: &Arc<Self>,
+        overrides: HostOverridesDto,
+        signer: SignerDto,
+        policy: DrivePolicyDto,
+        sink: EventSink,
+    ) -> anyhow::Result<zcash_voting::wire::RoundRunReportView> {
+        let session = Arc::clone(self);
+        let (drive_policy, max_proof_concurrency) = policy.into_policy();
+        // `.clone()` rather than `Arc::clone`: the unsizing coercion to the
+        // trait object happens at this binding, and `Arc::clone`'s argument
+        // would have to already be one.
+        let driver: Arc<dyn zcash_voting::DelegationDriver> = self.pipeline.clone();
+        let delegation = match signer {
+            SignerDto::None => None,
+            SignerDto::Software { seed } => {
+                Some(zcash_voting::DelegationSigner::Software(Arc::new(
+                    // `SeedSpendAuthSigner::new` rejects a seed it cannot derive
+                    // from with a bare message, so it is re-wrapped here: every
+                    // failure this call returns has to reach Swift as the typed
+                    // envelope the rest of the session uses. The network checks it
+                    // delegates report `invalid_input` themselves, so the kind is
+                    // the same either way.
+                    SeedSpendAuthSigner::new(seed, self.network_id, self.network)
+                        .map_err(|e| invalid_input(e.to_string()))?,
+                )))
+            }
+            SignerDto::KeystoneStored => Some(zcash_voting::DelegationSigner::Keystone(
+                zcash_voting::KeystoneSignatureSource::Stored,
+            )),
+        }
+        .map(|signer| zcash_voting::DelegationStepInputs {
+            driver,
+            signer,
+            pir: Arc::clone(&self.pir),
+        });
+
+        let report = super::runtime::runtime()
+            .block_on(super::runtime::runtime().spawn(async move {
+                let host = SessionHost {
+                    inputs: HostInputs {
+                        session: Arc::clone(&session),
+                        overrides,
+                    },
+                    delegation,
+                    max_proof_concurrency,
+                };
+                let reporter = CallbackReporter { sink };
+                zcash_voting::RoundDriver::new(&session.executor)
+                    .with_policy(drive_policy)
+                    .run(&host, &session.control, &reporter)
+                    .await
+            }))
+            .map_err(|e| internal(format!("voting run task failed: {e}")))?;
+        zcash_voting::wire::RoundRunReportView::try_from(report).ffi()
+    }
+
+    /// Drives this round's unconfirmed helper shares to confirmation,
+    /// reporting every pass to `sink`.
+    ///
+    /// Spawned like [`Self::run`] and for the same reasons, and like it the
+    /// driver never fails: a run that owed nothing, ran out of passes or found
+    /// the vote already closed says so through the report's quiescence.
+    ///
+    /// A round admits one tracking run at a time. A second started while a
+    /// live one holds the round returns at once with `already_driving`; one
+    /// started while a cancelled run is on its way out waits for it to release
+    /// the round and takes it over.
+    pub(super) fn track_shares(
+        self: &Arc<Self>,
+        overrides: HostOverridesDto,
+        policy: ShareTrackingPolicyDto,
+        sink: EventSink,
+    ) -> anyhow::Result<zcash_voting::wire::ShareTrackingRunReportView> {
+        let session = Arc::clone(self);
+        let policy = policy.into_policy();
+
+        let report = super::runtime::runtime()
+            .block_on(super::runtime::runtime().spawn(async move {
+                let host = ShareTrackingHost {
+                    inputs: HostInputs {
+                        session: Arc::clone(&session),
+                        overrides,
+                    },
+                };
+                let reporter = ShareTrackingCallbackReporter { sink };
+                zcash_voting::ShareTrackingDriver::new(
+                    &session.database,
+                    &session.helper_client,
+                    &session.round_id,
+                )
+                .with_policy(policy)
+                .run(&host, &session.control, &reporter)
+                .await
+            }))
+            .map_err(|e| internal(format!("share tracking task failed: {e}")))?;
+        Ok(zcash_voting::wire::ShareTrackingRunReportView::from(report))
+    }
+
     /// Cancels every bounded pass this session's control governs.
     ///
     /// Permanent: a cancelled session is finished, not paused. Work already
@@ -325,6 +552,141 @@ impl VotingSession {
     /// The round this session is bound to.
     pub(super) fn round_id(&self) -> &str {
         &self.round_id
+    }
+}
+
+/// Unix seconds now, or 0 on a host whose clock predates the epoch.
+///
+/// Read on every host context rather than captured once per run: a round can
+/// take minutes, a proof can cross the last-moment or vote-end boundary, and
+/// the step that follows must plan against the clock it actually runs under.
+/// The fallback is deliberate — no round's timing window contains 0, so a
+/// broken clock plans as if outside the window instead of stopping the run.
+fn now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.as_secs())
+        .unwrap_or(0)
+}
+
+/// The host inputs one run reads: the session's own, with that call's
+/// overrides applied.
+///
+/// Overrides replace, never merge, and only where present: a field the host
+/// set stands in for the session's value for this run, and one it left absent
+/// keeps the session's. JSON cannot say "clear this" — an explicit `null`
+/// deserializes as absent — so a round whose timing must be gone is opened
+/// without it rather than overridden here.
+///
+/// Every accessor clones and returns; none of them touches the sidecar or any
+/// lock the drivers hold, because the drivers call this between dispatches and
+/// a context that waited on a step's own lock would deadlock the run.
+struct HostInputs {
+    session: Arc<VotingSession>,
+    overrides: HostOverridesDto,
+}
+
+impl HostInputs {
+    fn configured_helper_urls(&self) -> Vec<String> {
+        self.overrides
+            .helper_urls
+            .clone()
+            .unwrap_or_else(|| self.session.inputs.helper_urls.clone())
+    }
+
+    fn vote_tree_node_urls(&self) -> Vec<String> {
+        self.overrides
+            .vote_tree_node_urls
+            .clone()
+            .unwrap_or_else(|| self.session.inputs.vote_tree_node_urls.clone())
+    }
+
+    fn ceremony_start_seconds(&self) -> Option<u64> {
+        self.overrides
+            .ceremony_start_seconds
+            .unwrap_or(self.session.inputs.ceremony_start_seconds)
+    }
+
+    fn vote_end_time_seconds(&self) -> Option<u64> {
+        self.overrides
+            .vote_end_time_seconds
+            .unwrap_or(self.session.inputs.vote_end_time_seconds)
+    }
+}
+
+/// The round driver's host: the session's inputs, plus what only a drive
+/// needs.
+struct SessionHost {
+    inputs: HostInputs,
+    /// The delegation inputs this run signs with, or `None` when the host
+    /// named no signer.
+    delegation: Option<zcash_voting::DelegationStepInputs>,
+    max_proof_concurrency: usize,
+}
+
+impl zcash_voting::RoundHostSource for SessionHost {
+    fn host_context(&self) -> zcash_voting::RoundHostContext {
+        zcash_voting::RoundHostContext {
+            configured_helper_urls: self.inputs.configured_helper_urls(),
+            now_seconds: now_seconds(),
+            ceremony_start_seconds: self.inputs.ceremony_start_seconds(),
+            vote_end_time_seconds: self.inputs.vote_end_time_seconds(),
+            vote_tree_node_urls: self.inputs.vote_tree_node_urls(),
+            delegation: self.delegation.clone(),
+            // Fresh submissions only: the driver upgrades work the sidecar
+            // already holds to exact-tree recovery itself, so naming a policy
+            // for that case here would state a decision the crate makes.
+            chain_policy: zcash_voting::ChainAdvancePolicy::default(),
+            max_proof_concurrency: self.max_proof_concurrency,
+        }
+    }
+}
+
+/// The share-tracking driver's host: the helper fleet and the round's end,
+/// which is all a pass reads.
+struct ShareTrackingHost {
+    inputs: HostInputs,
+}
+
+impl zcash_voting::ShareTrackingHostSource for ShareTrackingHost {
+    fn host_context(&self) -> zcash_voting::ShareTrackingHostContext {
+        zcash_voting::ShareTrackingHostContext {
+            configured_helper_urls: self.inputs.configured_helper_urls(),
+            now_seconds: now_seconds(),
+            vote_end_time_seconds: self.inputs.vote_end_time_seconds(),
+        }
+    }
+}
+
+/// Projects the round driver's events onto the host's sink.
+struct CallbackReporter {
+    sink: EventSink,
+}
+
+impl zcash_voting::RoundDriveReporter for CallbackReporter {
+    fn report(&self, event: zcash_voting::RoundDriveEvent) {
+        // An event the wire projection refuses is dropped rather than failing
+        // the run: the stream is an observation, and the run report — which
+        // carries the same plan, failures and chain outcomes — remains the
+        // authoritative account of what happened.
+        if let Ok(event) = zcash_voting::wire::RoundDriveEventView::try_from(event) {
+            self.sink.emit(&SessionEventDto::RoundDrive {
+                event: Box::new(event),
+            });
+        }
+    }
+}
+
+/// Projects the share-tracking driver's events onto the host's sink.
+struct ShareTrackingCallbackReporter {
+    sink: EventSink,
+}
+
+impl zcash_voting::ShareTrackingReporter for ShareTrackingCallbackReporter {
+    fn report(&self, event: zcash_voting::ShareTrackingEvent) {
+        self.sink.emit(&SessionEventDto::ShareTracking {
+            event: zcash_voting::wire::ShareTrackingEventView::from(event),
+        });
     }
 }
 
@@ -512,5 +874,181 @@ mod tests {
         assert_eq!(session.control.operation_epoch(), 7);
         session.cancel();
         assert!(session.control.is_cancelled());
+    }
+
+    /// Every JSON string a run has handed the collecting sink so far.
+    fn collected(seen: &Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> {
+        seen.lock().expect("collected events").clone()
+    }
+
+    /// A sink with no callback drops events rather than calling through a
+    /// null function pointer.
+    #[test]
+    fn event_sink_without_a_callback_drops_events() {
+        EventSink::none().emit(&SessionEventDto::DelegationProgress {
+            progress: crate::voting::wire::DelegationProgressDto {
+                bundle_index: 0,
+                stage: "proof_starting".to_string(),
+                fraction: None,
+            },
+        });
+    }
+
+    /// A cancelled session drives nothing: no plan is read and no endpoint is
+    /// dialled, and the run says why it stopped rather than failing.
+    #[test]
+    fn run_on_cancelled_control_quiesces_cancelled_without_network() {
+        let (_store, _dir, session) = open_session(0x31);
+        let session = Arc::new(session);
+        session.cancel();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let report = session
+            .run(
+                HostOverridesDto::default(),
+                SignerDto::None,
+                DrivePolicyDto::default(),
+                EventSink::collecting(&seen),
+            )
+            .expect("a cancelled run still reports");
+        assert_eq!(
+            serde_json::to_value(report.quiescence.kind).unwrap(),
+            "cancelled"
+        );
+        assert!(
+            collected(&seen).is_empty(),
+            "a cancelled run reports no event"
+        );
+    }
+
+    /// A seed the signer cannot derive from stops the call before anything is
+    /// spawned, and reaches Swift as the typed envelope every other session
+    /// failure uses rather than as a bare message.
+    #[test]
+    fn run_with_a_software_seed_too_short_to_derive_is_a_typed_error() {
+        let (_store, _dir, session) = open_session(0x35);
+        let session = Arc::new(session);
+        let err = session
+            .run(
+                HostOverridesDto::default(),
+                SignerDto::Software { seed: vec![0u8; 8] },
+                DrivePolicyDto::default(),
+                EventSink::none(),
+            )
+            .unwrap_err();
+        assert_eq!(error_kind(&err), "invalid_input");
+    }
+
+    /// A fresh round with an undecided ballot: nothing is dispatchable, and the
+    /// ballot is what the voter can still act on, so it outranks the bundle
+    /// setup the round also owes. Nothing here reaches an endpoint.
+    ///
+    /// The events the run emitted are asserted as JSON rather than as views:
+    /// what Swift decodes is the envelope, so this is where the
+    /// `SessionEventDto::RoundDrive` shape is pinned down.
+    #[test]
+    fn run_on_an_undecided_ballot_quiesces_needs_ballot_and_streams_events() {
+        let (_store, _dir, session) = open_session(0x32);
+        let session = Arc::new(session);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let report = session
+            .run(
+                HostOverridesDto::default(),
+                SignerDto::None,
+                DrivePolicyDto::default(),
+                EventSink::collecting(&seen),
+            )
+            .expect("a round with no bundles still reports");
+        assert_eq!(
+            serde_json::to_value(report.quiescence.kind).unwrap(),
+            "needs_ballot"
+        );
+        // The fixture roster, undecided: both proposals are the host's to
+        // resolve before anything can be cast.
+        assert_eq!(report.quiescence.open_proposals, vec![1, 2]);
+
+        let events = collected(&seen);
+        assert!(!events.is_empty(), "the run reported no event at all");
+        for json in &events {
+            let event: serde_json::Value = serde_json::from_str(json).expect("event JSON");
+            assert_eq!(event["kind"], "round_drive");
+            assert!(
+                event["event"].is_object(),
+                "a round_drive event carries the driver event: {json}"
+            );
+        }
+        // The driver plans before it selects, so the first thing a host sees
+        // is the plan the run will select from.
+        let first: serde_json::Value = serde_json::from_str(&events[0]).expect("event JSON");
+        assert_eq!(first["event"]["kind"], "plan_refreshed");
+    }
+
+    /// The same round once the ballot is terminal: the plan now owes bundle
+    /// rows the run cannot create itself, which is the brief's expected
+    /// handoff. Driven through a sink with no callback, which must be a no-op
+    /// rather than a null call.
+    #[test]
+    fn run_with_a_decided_ballot_and_no_bundles_quiesces_needs_bundle_setup() {
+        let (_store, _dir, session) = open_session(0x34);
+        // Creates the round row (its `ensure_round` runs first) and then
+        // refuses note selection on the empty wallet.
+        session.setup_bundles().unwrap_err();
+        session
+            .set_ballot_intents(vec![
+                crate::voting::wire::BallotIntentDto {
+                    proposal_id: 1,
+                    decision: crate::voting::wire::DecisionDto::Choice { option: 0 },
+                },
+                crate::voting::wire::BallotIntentDto {
+                    proposal_id: 2,
+                    decision: crate::voting::wire::DecisionDto::Skipped,
+                },
+            ])
+            .expect("a terminal ballot over the bound roster");
+        let session = Arc::new(session);
+        let report = session
+            .run(
+                HostOverridesDto::default(),
+                SignerDto::None,
+                DrivePolicyDto::default(),
+                EventSink::none(),
+            )
+            .expect("a round owing bundle setup still reports");
+        assert_eq!(
+            serde_json::to_value(report.quiescence.kind).unwrap(),
+            "needs_bundle_setup"
+        );
+    }
+
+    /// A round the sidecar holds no share for is quiescent on the first pass,
+    /// and says so without reaching a helper.
+    #[test]
+    fn track_shares_with_nothing_pending_quiesces_immediately() {
+        let (_store, _dir, session) = open_session(0x33);
+        let session = Arc::new(session);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let report = session
+            .track_shares(
+                HostOverridesDto::default(),
+                ShareTrackingPolicyDto::default(),
+                EventSink::collecting(&seen),
+            )
+            .expect("tracking a round with no shares still reports");
+        assert_eq!(
+            serde_json::to_value(report.quiescence.kind).unwrap(),
+            "nothing_to_track"
+        );
+        // One pass, which found the round owing nothing and stopped: a second
+        // would mean the driver waited on a helper it had no share for.
+        assert_eq!(report.passes, 1);
+        let events = collected(&seen);
+        assert!(!events.is_empty(), "the pass reported no event at all");
+        for json in &events {
+            let event: serde_json::Value = serde_json::from_str(json).expect("event JSON");
+            assert_eq!(event["kind"], "share_tracking");
+            assert!(
+                event["event"].is_object(),
+                "a share_tracking event carries the driver event: {json}"
+            );
+        }
     }
 }
