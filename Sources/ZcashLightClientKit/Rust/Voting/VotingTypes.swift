@@ -5,35 +5,6 @@
 
 import Foundation
 
-// MARK: - Round State
-
-/// Phase of a voting round.
-public enum VotingRoundPhase: UInt32, Codable, Sendable {
-    case initialized = 0
-    case hotkeyGenerated = 1
-    case delegationConstructed = 2
-    case delegationProved = 3
-    case voteReady = 4
-}
-
-/// State of a voting round.
-public struct VotingRoundState: Sendable {
-    public let roundId: String
-    public let phase: VotingRoundPhase
-    public let snapshotHeight: UInt64
-    public let hotkeyAddress: String?
-    public let delegatedWeight: UInt64?
-    public let proofGenerated: Bool
-}
-
-/// Summary of a voting round for list display.
-public struct VotingRoundSummary: Sendable {
-    public let roundId: String
-    public let phase: VotingRoundPhase
-    public let snapshotHeight: UInt64
-    public let createdAt: UInt64
-}
-
 // MARK: - Hotkey
 
 /// A voting hotkey: the secret the wallet delegates voting power to, together
@@ -56,529 +27,9 @@ public struct VotingHotkey: Sendable, Undescribable {
     public let addressIndex: UInt32
 }
 
-// MARK: - Bundle Setup
-
-/// Result of setting up vote bundles.
-public struct VotingBundleSetupResult: Sendable {
-    public let bundleCount: UInt32
-    public let eligibleWeight: UInt64
-    /// Notes the canonical bundling policy discarded, and which are therefore
-    /// not represented in `eligibleWeight`. A non-zero value here means the
-    /// wallet holds voting notes that will not be voted with.
-    public let droppedCount: UInt32
-}
-
-// MARK: - Vote Record
-
-/// Record of a vote for a specific proposal/bundle.
-public struct VotingVoteRecord: Sendable {
-    public let proposalId: UInt32
-    public let bundleIndex: UInt32
-    public let choice: UInt32
-    public let submitted: Bool
-}
-
-// MARK: - Note Info (JSON)
-
-/// Note information for voting eligibility.
-///
-/// Conforms to `Undescribable` because `rho` and `rseed` are Orchard note
-/// secrets: printing a note recovers the material needed to re-derive the note,
-/// so reflection-based description must not expose them.
-public struct VotingNoteInfo: Codable, Sendable, Undescribable {
-    public let commitment: [UInt8]
-    public let nullifier: [UInt8]
-    public let value: UInt64
-    public let position: UInt64
-    public let diversifier: [UInt8]
-    public let rho: [UInt8]
-    public let rseed: [UInt8]
-    public let scope: UInt32
-    public let ufvkStr: String
-
-    enum CodingKeys: String, CodingKey {
-        case commitment, nullifier, value, position, diversifier, rho, rseed, scope
-        case ufvkStr = "ufvk_str"
-    }
-
-    public init(
-        commitment: [UInt8],
-        nullifier: [UInt8],
-        value: UInt64,
-        position: UInt64,
-        diversifier: [UInt8],
-        rho: [UInt8],
-        rseed: [UInt8],
-        scope: UInt32,
-        ufvkStr: String
-    ) {
-        self.commitment = commitment
-        self.nullifier = nullifier
-        self.value = value
-        self.position = position
-        self.diversifier = diversifier
-        self.rho = rho
-        self.rseed = rseed
-        self.scope = scope
-        self.ufvkStr = ufvkStr
-    }
-}
-
-// MARK: - Voting PCZT (JSON)
-
-/// Result of building a voting PCZT.
-///
-/// Conforms to `Undescribable` because it carries the spend-authorization
-/// randomizer `alpha` alongside the `rseed` values and padded note secrets of
-/// the actions it authorizes; those are signing and note secrets, not wire data.
-public struct VotingPczt: Codable, Sendable, Undescribable {
-    public let pcztBytes: [UInt8]
-    /// Randomized verification key (`rk` on the wire).
-    public let randomizedKey: [UInt8]
-    public let alpha: [UInt8]
-    public let nfSigned: [UInt8]
-    public let cmxNew: [UInt8]
-    public let govNullifiers: [[UInt8]]
-    public let van: [UInt8]
-    public let vanCommRand: [UInt8]
-    public let dummyNullifiers: [[UInt8]]
-    public let rhoSigned: [UInt8]
-    public let paddedCmx: [[UInt8]]
-    public let rseedSigned: [UInt8]
-    public let rseedOutput: [UInt8]
-    public let actionBytes: [UInt8]
-    public let actionIndex: UInt32
-    /// Each element is [rho, rseed].
-    public let paddedNoteSecrets: [[[UInt8]]]
-    public let pcztSighash: [UInt8]
-
-    enum CodingKeys: String, CodingKey {
-        case pcztBytes = "pczt_bytes"
-        case randomizedKey = "rk"
-        case alpha
-        case nfSigned = "nf_signed"
-        case cmxNew = "cmx_new"
-        case govNullifiers = "gov_nullifiers"
-        case van
-        case vanCommRand = "van_comm_rand"
-        case dummyNullifiers = "dummy_nullifiers"
-        case rhoSigned = "rho_signed"
-        case paddedCmx = "padded_cmx"
-        case rseedSigned = "rseed_signed"
-        case rseedOutput = "rseed_output"
-        case actionBytes = "action_bytes"
-        case actionIndex = "action_index"
-        case paddedNoteSecrets = "padded_note_secrets"
-        case pcztSighash = "pczt_sighash"
-    }
-}
-
-// MARK: - Witness Data (JSON)
-
-/// Merkle witness data for a note.
-public struct VotingWitnessData: Codable, Sendable {
-    public let noteCommitment: [UInt8]
-    public let position: UInt64
-    public let root: [UInt8]
-    public let authPath: [[UInt8]]
-
-    enum CodingKeys: String, CodingKey {
-        case noteCommitment = "note_commitment"
-        case position, root
-        case authPath = "auth_path"
-    }
-
-    public init(
-        noteCommitment: [UInt8],
-        position: UInt64,
-        root: [UInt8],
-        authPath: [[UInt8]]
-    ) {
-        self.noteCommitment = noteCommitment
-        self.position = position
-        self.root = root
-        self.authPath = authPath
-    }
-}
-
-// MARK: - Share Delegation (JSON)
-
-/// Record of a share delegation sent to helper servers.
-public struct VotingShareDelegation: Codable, Equatable, Sendable {
-    public let roundId: String
-    public let bundleIndex: UInt32
-    public let proposalId: UInt32
-    public let shareIndex: UInt32
-    public let sentToURLs: [String]
-    public let nullifier: String
-    public let confirmed: Bool
-    public let submitAt: UInt64
-    public let createdAt: UInt64
-
-    enum CodingKeys: String, CodingKey {
-        case roundId = "round_id"
-        case bundleIndex = "bundle_index"
-        case proposalId = "proposal_id"
-        case shareIndex = "share_index"
-        case sentToURLs = "sent_to_urls"
-        case nullifier
-        case confirmed
-        case submitAt = "submit_at"
-        case createdAt = "created_at"
-    }
-}
-
-// MARK: - Delegation Proof Result (JSON)
-
-/// Result of building and proving a delegation.
-public struct VotingDelegationProofResult: Codable, Sendable {
-    public let proof: [UInt8]
-    public let publicInputs: [[UInt8]]
-    public let nfSigned: [UInt8]
-    public let cmxNew: [UInt8]
-    public let govNullifiers: [[UInt8]]
-    public let vanComm: [UInt8]
-    /// Randomized verification key (`rk` on the wire).
-    public let randomizedKey: [UInt8]
-
-    enum CodingKeys: String, CodingKey {
-        case proof
-        case publicInputs = "public_inputs"
-        case nfSigned = "nf_signed"
-        case cmxNew = "cmx_new"
-        case govNullifiers = "gov_nullifiers"
-        case vanComm = "van_comm"
-        case randomizedKey = "rk"
-    }
-}
-
-// MARK: - Delegation PIR Precompute Result (JSON)
-
-/// Result of precomputing and caching PIR proofs needed by delegation proving.
-public struct VotingDelegationPirPrecomputeResult: Codable, Sendable {
-    public let cachedCount: UInt32
-    public let fetchedCount: UInt32
-
-    enum CodingKeys: String, CodingKey {
-        case cachedCount = "cached_count"
-        case fetchedCount = "fetched_count"
-    }
-}
-
-// MARK: - Delegation Submission (JSON)
-
-/// The chain-ready delegation submission body, in `zcash_voting`'s own wire
-/// encoding.
-///
-/// The FFI returns `zcash_voting::wire::DelegationSubmissionWire` serialized by
-/// the crate, so the field names and the base64 encoding are the crate's and the
-/// SDK reshapes nothing. Two consequences for callers: `tx1Effects` — the
-/// versioned Ironwood TX1 effecting data the vote chain requires, and whose
-/// absence is the `400: tx1 effects must be 821 bytes, got 0` rejection — is
-/// present without anyone assembling it, and the legacy `sighash` field is gone
-/// from the wire. The signer's sighash still exists; it simply never belonged in
-/// the submission body, because the server derives the signing digest itself.
-///
-/// Mirrors `zcash_voting::wire::DelegationSubmissionWire` (crate `src/wire.rs`);
-/// the `CodingKeys` carry the crate's serde field names where the Swift names
-/// differ (`signed_note_nullifier`, `van_cmx`).
-public struct VotingDelegationSubmission: Codable, Sendable {
-    /// Randomized verification key (`rk` on the wire), base64.
-    public let randomizedKey: String
-    /// SpendAuth signature over the PCZT sighash, base64.
-    public let spendAuthSig: String
-    /// Versioned Ironwood TX1 effecting data, base64 (821 bytes decoded).
-    public let tx1Effects: String
-    public let nfSigned: String
-    public let cmxNew: String
-    public let govComm: String
-    public let govNullifiers: [String]
-    public let proof: String
-    public let voteRoundId: String
-
-    enum CodingKeys: String, CodingKey {
-        case randomizedKey = "rk"
-        case spendAuthSig = "spend_auth_sig"
-        case tx1Effects = "tx1_effects"
-        case nfSigned = "signed_note_nullifier"
-        case cmxNew = "cmx_new"
-        case govComm = "van_cmx"
-        case govNullifiers = "gov_nullifiers"
-        case proof
-        case voteRoundId = "vote_round_id"
-    }
-}
-
-// MARK: - Vote Commit (JSON)
-
-/// The result of committing one cast vote: the signed commitment fields destined
-/// for the vote chain, and the encrypted shares the vote proof binds.
-///
-/// Helper-server payloads are deliberately not here. A commit made before the
-/// vote's tree position is confirmed can only produce provisional payloads,
-/// and provisional payloads must never be sent to a helper server. Build
-/// helper payloads with
-/// ``VotingRustBackend/recoverWireJson(commitmentBundleJson:proposalId:shareIndex:voteCommitmentTreePosition:submitAt:)``
-/// after ``VotingRustBackend/confirmVoteSubmission(roundId:bundleIndex:proposalId:txHash:eventsJson:)``.
-///
-/// Every field here is wire data — it is published on chain — so the commit
-/// result carries no secret the wallet must retain. The signing secrets used to
-/// produce it stay inside `zcash_voting`.
-///
-/// Mirrors the FFI's `JsonVoteCommit` (`rust/src/voting/json.rs`), the JSON
-/// shape of `zcash_voting::vote::VoteCommit` (crate `src/vote.rs`) minus its
-/// provisional `share_payloads`; the `CodingKeys` carry that JSON's field
-/// names (`r_vpk`, `enc_shares`) where the Swift names differ.
-public struct VotingVoteCommit: Codable, Sendable {
-    public let proposalId: UInt32
-    public let vanNullifier: [UInt8]
-    public let voteAuthorityNoteNew: [UInt8]
-    public let voteCommitment: [UInt8]
-    public let proof: [UInt8]
-    public let anchorHeight: UInt32
-    /// Randomizer for the vote public key (`r_vpk` on the wire).
-    public let voteKeyRandomizer: [UInt8]
-    public let voteAuthSig: [UInt8]
-    public let encShares: [VotingWireEncryptedShare]
-
-    enum CodingKeys: String, CodingKey {
-        case proposalId = "proposal_id"
-        case vanNullifier = "van_nullifier"
-        case voteAuthorityNoteNew = "vote_authority_note_new"
-        case voteCommitment = "vote_commitment"
-        case proof
-        case anchorHeight = "anchor_height"
-        case voteKeyRandomizer = "r_vpk"
-        case voteAuthSig = "vote_auth_sig"
-        case encShares = "enc_shares"
-    }
-}
-
-// MARK: - Wire Encrypted Share (JSON)
-
-/// Wire-safe encrypted share — only the public ciphertext components.
-///
-/// Decoded straight from `zcash_voting::types::WireEncryptedShare`, which
-/// base64-encodes both ciphertext components, so `ciphertext1` and `ciphertext2`
-/// are base64 strings rather than byte arrays. Secrets (`plaintext_value`,
-/// `randomness`) stay inside Rust and never cross the FFI boundary.
-public struct VotingWireEncryptedShare: Codable, Sendable {
-    /// First ciphertext component (`c1` on the wire), base64.
-    public let ciphertext1: String
-    /// Second ciphertext component (`c2` on the wire), base64.
-    public let ciphertext2: String
-    public let shareIndex: UInt32
-
-    enum CodingKeys: String, CodingKey {
-        case ciphertext1 = "c1"
-        case ciphertext2 = "c2"
-        case shareIndex = "share_index"
-    }
-
-    public init(ciphertext1: String, ciphertext2: String, shareIndex: UInt32) {
-        self.ciphertext1 = ciphertext1
-        self.ciphertext2 = ciphertext2
-        self.shareIndex = shareIndex
-    }
-}
-
-// MARK: - Delegation Inputs (JSON)
-
-/// Inputs needed for delegation construction.
-public struct VotingDelegationInputs: Codable, Sendable {
-    public let fvkBytes: [UInt8]
-    public let gDNewX: [UInt8]
-    public let pkDNewX: [UInt8]
-    public let hotkeyRawAddress: [UInt8]
-    public let seedFingerprint: [UInt8]
-
-    enum CodingKeys: String, CodingKey {
-        case fvkBytes = "fvk_bytes"
-        case gDNewX = "g_d_new_x"
-        case pkDNewX = "pk_d_new_x"
-        case hotkeyRawAddress = "hotkey_raw_address"
-        case seedFingerprint = "seed_fingerprint"
-    }
-}
-
-// MARK: - VAN Witness (JSON)
-
-/// VAN Merkle witness for voting ZKP.
-public struct VotingVanWitness: Codable, Sendable {
-    public let authPath: [[UInt8]]
-    public let position: UInt32
-    public let anchorHeight: UInt32
-
-    enum CodingKeys: String, CodingKey {
-        case authPath = "auth_path"
-        case position
-        case anchorHeight = "anchor_height"
-    }
-}
-
-// MARK: - Keystone signature record (JSON)
-
-/// A persisted Keystone-produced PCZT signature for a delegation bundle.
-public struct VotingKeystoneSignatureRecord: Codable, Sendable, Equatable {
-    public let bundleIndex: UInt32
-    public let sig: [UInt8]
-    public let sighash: [UInt8]
-    /// Randomized verification key (`rk` on the wire).
-    public let randomizedKey: [UInt8]
-
-    enum CodingKeys: String, CodingKey {
-        case bundleIndex = "bundle_index"
-        case sig
-        case sighash
-        case randomizedKey = "rk"
-    }
-
-    public init(
-        bundleIndex: UInt32,
-        sig: [UInt8],
-        sighash: [UInt8],
-        randomizedKey: [UInt8]
-    ) {
-        self.bundleIndex = bundleIndex
-        self.sig = sig
-        self.sighash = sighash
-        self.randomizedKey = randomizedKey
-    }
-}
-
-// MARK: - Delegation key inputs
-
-/// The wallet-side material `zcash_voting` needs to reconstruct the delegation
-/// keys for one bundle.
-///
-/// `hotkeyStoredSecret` is the ``VotingHotkey/storedSecret`` the application
-/// persisted. The hotkey's Orchard address, address index and network are all
-/// derived from it, so no separate hotkey address is supplied. The network
-/// itself comes from the database handle these inputs are used with, so it is
-/// not carried here where it could drift from the one the round was opened for.
-///
-/// Conforms to `Undescribable` because `hotkeyStoredSecret` is the voting
-/// hotkey's key material.
-public struct VotingDelegationKeyInputs: Sendable, Undescribable {
-    public let fvk: [UInt8]
-    public let hotkeyStoredSecret: [UInt8]
-    public let seedFingerprint: [UInt8]
-    public let accountIndex: UInt32
-    public let roundName: String
-
-    public init(
-        fvk: [UInt8],
-        hotkeyStoredSecret: [UInt8],
-        seedFingerprint: [UInt8],
-        accountIndex: UInt32,
-        roundName: String
-    ) {
-        self.fvk = fvk
-        self.hotkeyStoredSecret = hotkeyStoredSecret
-        self.seedFingerprint = seedFingerprint
-        self.accountIndex = accountIndex
-        self.roundName = roundName
-    }
-}
-
-// MARK: - Build PCZT parameters
-
-/// Parameters required to build a voting PCZT for a delegation bundle.
-public struct VotingBuildPcztParams: Sendable {
-    public let roundId: String
-    public let bundleIndex: UInt32
-    public let notes: [VotingNoteInfo]
-    public let keys: VotingDelegationKeyInputs
-    public let consensusBranchId: UInt32
-
-    public init(
-        roundId: String,
-        bundleIndex: UInt32,
-        notes: [VotingNoteInfo],
-        keys: VotingDelegationKeyInputs,
-        consensusBranchId: UInt32
-    ) {
-        self.roundId = roundId
-        self.bundleIndex = bundleIndex
-        self.notes = notes
-        self.keys = keys
-        self.consensusBranchId = consensusBranchId
-    }
-}
-
-// MARK: - Delegation proving parameters
-
-/// Parameters required to build and prove the delegation ZKP for a bundle.
-public struct VotingDelegationProofParams: Sendable {
-    public let roundId: String
-    public let bundleIndex: UInt32
-    public let notes: [VotingNoteInfo]
-    public let keys: VotingDelegationKeyInputs
-
-    public init(
-        roundId: String,
-        bundleIndex: UInt32,
-        notes: [VotingNoteInfo],
-        keys: VotingDelegationKeyInputs
-    ) {
-        self.roundId = roundId
-        self.bundleIndex = bundleIndex
-        self.notes = notes
-        self.keys = keys
-    }
-}
-
-// MARK: - PIR proof input
-
-/// Inputs to `VotingRustBackend.validatePirProof(_:)`.
-public struct VotingPirProof: Sendable, Equatable {
-    public let root: [UInt8]
-    public let nfBounds: [UInt8]
-    public let leafPosition: UInt32
-    public let path: [UInt8]
-    public let nullifier: [UInt8]
-    public let expectedRoot: [UInt8]
-
-    public init(
-        root: [UInt8],
-        nfBounds: [UInt8],
-        leafPosition: UInt32,
-        path: [UInt8],
-        nullifier: [UInt8],
-        expectedRoot: [UInt8]
-    ) {
-        self.root = root
-        self.nfBounds = nfBounds
-        self.leafPosition = leafPosition
-        self.path = path
-        self.nullifier = nullifier
-        self.expectedRoot = expectedRoot
-    }
-}
-
-// MARK: - Stored commitment bundle
-
-/// A previously-stored vote commitment bundle and its position in the
-/// vote-commitment tree.
-///
-/// Returned by `VotingRustBackend.getCommitmentBundle(...)`.
-public struct VotingStoredCommitmentBundle: Sendable, Equatable {
-    /// The recovery bundle JSON `zcash_voting` wrote when the vote was
-    /// committed. It is opaque to the SDK: only `zcash_voting` produces and
-    /// consumes it.
-    public let bundleJson: String
-    /// Position of the vote commitment within the vote commitment tree.
-    public let voteCommitmentTreePosition: UInt64
-}
-
 // MARK: - PIR layout
 
-/// PIR tree geometry advertised by the round's resolved dynamic voting config.
-///
-/// Mirrors `zcash_voting::config::PirLayout` field for field. `zcash_voting`
-/// runs the config/server layout handshake with these values and fails closed
-/// before issuing any private query when the server disagrees, so they must come
-/// from a resolved dynamic config rather than being assumed or compiled in.
+/// The PIR fleet shape a round is served with.
 public struct VotingPirLayout: Equatable, Sendable {
     public let pirDepth: UInt32
     public let tier0Layers: UInt32
@@ -610,155 +61,540 @@ public struct VotingPirLayout: Equatable, Sendable {
     }
 }
 
-// MARK: - Vote confirmation (JSON)
-
-/// The positions a mined cast-vote transaction confirmed.
-///
-/// Decoded from `zcash_voting::wire::VoteConfirmation`. Both positions are read
-/// out of the chain's confirmation events by the crate, which also writes them
-/// to the voting database in the same transaction that returns them — so this
-/// value and the persisted state can never disagree.
-public struct VotingVoteConfirmation: Codable, Sendable, Equatable {
-    /// The confirmed transaction hash, echoed back from the events.
-    public let txHash: String
-    /// Confirmed vote-authority-note leaf position.
-    public let vanLeafPosition: UInt32
-    /// Confirmed position of the vote commitment within the vote commitment
-    /// tree. This is the value to late-bind into helper-share payloads.
-    public let voteCommitmentTreePosition: UInt64
-
-    enum CodingKeys: String, CodingKey {
-        case txHash = "tx_hash"
-        case vanLeafPosition = "van_leaf_position"
-        case voteCommitmentTreePosition = "vc_tree_position"
+/// The layout crosses the FFI inside ``VotingSessionInputs``, under the crate's
+/// own field names.
+extension VotingPirLayout: Encodable {
+    private enum CodingKeys: String, CodingKey {
+        case pirDepth = "pir_depth"
+        case tier0Layers = "tier0_layers"
+        case tier1Layers = "tier1_layers"
+        case polyLen = "poly_len"
     }
 }
 
-// MARK: - Delegation signature (JSON)
+// MARK: - Round session inputs
 
-/// A SpendAuth signature this wallet produced for one delegation bundle, with
-/// the sighash it covers.
+/// Parameters for a voting round, sourced from the vote chain.
 ///
-/// Both values go straight into
-/// ``VotingRustBackend/getDelegationSubmission(roundId:bundleIndex:signature:sighash:)``.
-/// The sighash is not informational: `zcash_voting` checks it against the one it
-/// stored when the bundle's PCZT was set up and rejects the submission if they
-/// disagree, so pass back the value that came out with the signature rather than
-/// one recomputed elsewhere.
-public struct VotingDelegationSignature: Codable, Sendable, Equatable {
-    /// The 64-byte detached RedPallas SpendAuth signature.
-    public let signature: [UInt8]
-    /// The 32-byte ZIP-244 sighash the signature covers.
-    public let sighash: [UInt8]
-
-    enum CodingKeys: String, CodingKey {
-        case signature = "sig"
-        case sighash
-    }
-}
-
-// MARK: - Recovered delegation restore
-
-/// One bundle of a delegation recovered from a wiped voting database.
-///
-/// Carries the recovered VAN blinding factor, so it conforms to
-/// `Undescribable`: it cannot escape through `print`, interpolation, or
-/// reflection.
-public struct RecoveredDelegationBundle: Encodable, Equatable, Sendable, Undescribable {
-    public let bundleIndex: UInt32
-    /// Bundle weight in zatoshi.
-    public let totalNoteValue: UInt64
-    /// The 32-byte VAN blinding factor.
-    public let vanCommRand: [UInt8]
-    /// The 32-byte VAN commitment the recovered row carried. The restore
-    /// refuses a bundle whose blinding and weight do not open it.
-    public let van: [UInt8]
-    /// Lowercase hex SHA-256 of the signed delegation transaction.
-    public let delegationTxHash: String
-
-    public init(
-        bundleIndex: UInt32,
-        totalNoteValue: UInt64,
-        vanCommRand: [UInt8],
-        van: [UInt8],
-        delegationTxHash: String
-    ) {
-        self.bundleIndex = bundleIndex
-        self.totalNoteValue = totalNoteValue
-        self.vanCommRand = vanCommRand
-        self.van = van
-        self.delegationTxHash = delegationTxHash
-    }
-
-    enum CodingKeys: String, CodingKey {
-        case bundleIndex = "bundle_index"
-        case totalNoteValue = "total_note_value"
-        case vanCommRand = "van_comm_rand"
-        case van
-        case delegationTxHash = "delegation_tx_hash"
-    }
-}
-
-/// Everything `restoreRecoveredDelegation` needs. Carries the hotkey and the
-/// blinding factors, so it is deliberately not printable. The hotkey is not
-/// part of the JSON encoding: its stored secret crosses the FFI as its own
-/// buffer, unwrapped only inside `VotingRustBackend`.
-public struct RecoveredDelegationRestoreRequest: Encodable, Sendable, Undescribable {
-    public let roundId: String
+/// The byte fields encode as standard, padded base64, which is what the Rust
+/// side's `b64` serde module reads.
+public struct VotingRoundParameters: Equatable, Sendable, Encodable {
+    public let voteRoundId: String
     public let snapshotHeight: UInt64
-    public let eaPublicKey: [UInt8]
-    public let ncRoot: [UInt8]
-    public let nullifierImtRoot: [UInt8]
-    public let voteChainId: String
-    /// The wallet's voting hotkey. Every VAN is recomputed from its address.
-    public let hotkey: VotingHotkey
-    public let bundles: [RecoveredDelegationBundle]
-    public let sessionJson: String?
+    public let eaPk: Data
+    public let ncRoot: Data
+    public let nullifierImtRoot: Data
 
     public init(
-        roundId: String,
+        voteRoundId: String,
         snapshotHeight: UInt64,
-        eaPublicKey: [UInt8],
-        ncRoot: [UInt8],
-        nullifierImtRoot: [UInt8],
-        voteChainId: String,
-        hotkey: VotingHotkey,
-        bundles: [RecoveredDelegationBundle],
-        sessionJson: String?
+        eaPk: Data,
+        ncRoot: Data,
+        nullifierImtRoot: Data
     ) {
-        self.roundId = roundId
+        self.voteRoundId = voteRoundId
         self.snapshotHeight = snapshotHeight
-        self.eaPublicKey = eaPublicKey
+        self.eaPk = eaPk
         self.ncRoot = ncRoot
         self.nullifierImtRoot = nullifierImtRoot
-        self.voteChainId = voteChainId
-        self.hotkey = hotkey
-        self.bundles = bundles
-        self.sessionJson = sessionJson
     }
 
-    /// `hotkey` is deliberately absent, so synthesized encoding never writes
-    /// its secret into the JSON document.
-    enum CodingKeys: String, CodingKey {
-        case roundId = "round_id"
+    private enum CodingKeys: String, CodingKey {
+        case voteRoundId = "vote_round_id"
         case snapshotHeight = "snapshot_height"
-        case eaPublicKey = "ea_pk"
+        case eaPk = "ea_pk"
         case ncRoot = "nc_root"
         case nullifierImtRoot = "nullifier_imt_root"
-        case voteChainId = "vote_chain_id"
-        case bundles
-        case sessionJson = "session_json"
     }
 }
 
-/// What `restoreRecoveredDelegation` did.
-public enum RecoveredDelegationRestoreResult: String, Decodable, Equatable, Sendable {
-    /// The round was cleared and the delegation imported.
-    case restored
-    /// The round already held exactly this delegation; nothing was written.
-    case alreadyRestored = "already_restored"
+/// The route a round session's chain and helper traffic takes.
+///
+/// Chosen once, when the session is opened, and kept for the session's whole
+/// life. ``tor`` fails closed: a session that cannot have the Tor route is
+/// refused rather than opened on a direct connection, so a voter who asked for
+/// Tor never ends up announcing themselves over plain HTTP. PIR and vote-tree
+/// traffic take the crate's direct transport either way, because a PIR query
+/// names no voter and its volume does not belong on Tor.
+///
+/// The runtime the ``tor`` route needs belongs to the synchronizer rather than
+/// to the caller, which is why a route is named here instead of a client being
+/// handed over — see `Synchronizer.makeVotingRoundSession(backend:inputs:binding:route:epoch:)`.
+public enum VotingTransportRoute: Sendable, Equatable {
+    case direct
+    case tor
 }
 
-struct RecoveredDelegationRestoreReply: Decodable {
-    let outcome: RecoveredDelegationRestoreResult
+/// Everything needed to open a round session.
+///
+/// The endpoints are the ones the session uses for its whole life: chain and
+/// helper traffic follow the route chosen when the session is opened, while PIR
+/// and vote-tree traffic always use the crate's direct transport.
+public struct VotingSessionInputs: Equatable, Sendable, Encodable {
+    public let accountUUID: String
+    public let walletDbPath: String
+    public let roundParams: VotingRoundParameters
+    public let roundName: String
+    public let anchorTreeState: Data
+    public let chainEndpoints: [String]
+    public let voteTreeNodeUrls: [String]
+    public let helperUrls: [String]
+    public let pirEndpoints: [String]
+    public let pirLayout: VotingPirLayout
+    /// Absent when the round announces no ceremony start.
+    public let ceremonyStartSeconds: UInt64?
+    /// Absent when the round announces no end; once it passes, a run stops
+    /// scheduling new work.
+    public let voteEndTimeSeconds: UInt64?
+
+    public init(
+        accountUUID: String,
+        walletDbPath: String,
+        roundParams: VotingRoundParameters,
+        roundName: String,
+        anchorTreeState: Data,
+        chainEndpoints: [String],
+        voteTreeNodeUrls: [String],
+        helperUrls: [String],
+        pirEndpoints: [String],
+        pirLayout: VotingPirLayout,
+        ceremonyStartSeconds: UInt64? = nil,
+        voteEndTimeSeconds: UInt64? = nil
+    ) {
+        self.accountUUID = accountUUID
+        self.walletDbPath = walletDbPath
+        self.roundParams = roundParams
+        self.roundName = roundName
+        self.anchorTreeState = anchorTreeState
+        self.chainEndpoints = chainEndpoints
+        self.voteTreeNodeUrls = voteTreeNodeUrls
+        self.helperUrls = helperUrls
+        self.pirEndpoints = pirEndpoints
+        self.pirLayout = pirLayout
+        self.ceremonyStartSeconds = ceremonyStartSeconds
+        self.voteEndTimeSeconds = voteEndTimeSeconds
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case accountUUID = "account_uuid"
+        case walletDbPath = "wallet_db_path"
+        case roundParams = "round_params"
+        case roundName = "round_name"
+        case anchorTreeState = "anchor_tree_state"
+        case chainEndpoints = "chain_endpoints"
+        case voteTreeNodeUrls = "vote_tree_node_urls"
+        case helperUrls = "helper_urls"
+        case pirEndpoints = "pir_endpoints"
+        case pirLayout = "pir_layout"
+        case ceremonyStartSeconds = "ceremony_start_seconds"
+        case voteEndTimeSeconds = "vote_end_time_seconds"
+    }
+}
+
+/// One roster proposal: its id and the number of selectable options.
+public struct VotingProposalRosterEntry: Equatable, Sendable, Encodable {
+    public let proposalId: UInt32
+    public let numOptions: UInt32
+
+    public init(proposalId: UInt32, numOptions: UInt32) {
+        self.proposalId = proposalId
+        self.numOptions = numOptions
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case proposalId = "proposal_id"
+        case numOptions = "num_options"
+    }
+}
+
+/// The authenticated roster a session votes against, plus the stored hotkey
+/// secret when the session must bind to a hotkey generated earlier.
+///
+/// Conforms to `Undescribable` because `hotkeySecret` is the voting hotkey's
+/// key material.
+public struct VotingSessionBinding: Equatable, Sendable, Encodable, Undescribable {
+    public let roster: [VotingProposalRosterEntry]
+    /// Absent for a round that has not bound a hotkey yet.
+    public let hotkeySecret: Data?
+
+    public init(roster: [VotingProposalRosterEntry], hotkeySecret: Data? = nil) {
+        self.roster = roster
+        self.hotkeySecret = hotkeySecret
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case roster
+        case hotkeySecret = "hotkey_secret"
+    }
+}
+
+// MARK: - Ballot
+
+/// A voter's decision for one proposal.
+public enum VotingBallotDecision: Equatable, Sendable {
+    /// Vote for `option`, a zero-based index into the proposal's options.
+    case choice(UInt32)
+    /// Record that the proposal is deliberately left undecided.
+    case skipped
+}
+
+/// One ballot decision to record before casting.
+///
+/// Encodes flat, the way the crate's internally tagged decision reads it:
+/// `{"proposal_id":3,"decision":"choice","option":1}` or
+/// `{"proposal_id":4,"decision":"skipped"}`.
+public struct VotingBallotIntent: Equatable, Sendable, Encodable {
+    public let proposalId: UInt32
+    public let decision: VotingBallotDecision
+
+    public init(proposalId: UInt32, decision: VotingBallotDecision) {
+        self.proposalId = proposalId
+        self.decision = decision
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case proposalId = "proposal_id"
+        case decision
+        case option
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(proposalId, forKey: .proposalId)
+        switch decision {
+        case .choice(let option):
+            try container.encode("choice", forKey: .decision)
+            try container.encode(option, forKey: .option)
+        case .skipped:
+            try container.encode("skipped", forKey: .decision)
+        }
+    }
+}
+
+// MARK: - Signer
+
+/// Which signer backs a run.
+///
+/// Conforms to `Undescribable` because ``software(seed:)`` carries wallet seed
+/// bytes. The seed reaches Rust only for the duration of the call it is passed
+/// to, and is zeroized there.
+public enum VotingDelegationSigner: Equatable, Sendable, Encodable, Undescribable {
+    /// No signing material: a run plans and reports, and stops where a
+    /// signature would be needed.
+    case none
+    /// An in-process software signer for `seed`.
+    ///
+    /// The seed is carried to Rust as base64 inside this value's JSON, and
+    /// that carrier — the encoder's bytes on this side, serde's decoded string
+    /// on the other — is ordinary heap memory that lives until the call
+    /// returns and is freed without being wiped. Only what Rust's signer holds
+    /// is zeroized. Nothing on iOS pages that memory to disk, but a host that
+    /// keeps the seed for longer than one `run` is widening a window this SDK
+    /// closes as soon as it can.
+    case software(seed: [UInt8])
+    /// A Keystone device whose signatures for this round are already stored.
+    case keystoneStored
+
+    private enum CodingKeys: String, CodingKey {
+        case kind
+        case seed
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .none:
+            try container.encode("none", forKey: .kind)
+        case .software(let seed):
+            try container.encode("software", forKey: .kind)
+            try container.encode(Data(seed), forKey: .seed)
+        case .keystoneStored:
+            try container.encode("keystone_stored", forKey: .kind)
+        }
+    }
+}
+
+// MARK: - Policies
+
+/// What a failing step does to the rest of a run.
+public enum VotingFailureIsolation: String, Equatable, Sendable, Encodable {
+    /// Skip the failed bundle and keep driving the others.
+    case skipBundle = "skip_bundle"
+    /// Stop the whole run at the first failure.
+    case stopRound = "stop_round"
+}
+
+/// What a run's progress tally is measured against.
+public enum VotingProgressBaseline: String, Equatable, Sendable, Encodable {
+    /// Everything the run itself started owing.
+    case run
+    /// Only the proposals the voter chose.
+    case selectedChoices = "selected_choices"
+}
+
+/// How the round driver paces itself between steps and isolates failures.
+///
+/// ``default`` is this SDK's tuning rather than the crate's: two bundles in
+/// flight, one proof at a time. A phone that admits two Orchard proofs at once
+/// is the memory-pressure kill the SDK cannot recover from, so raising
+/// `maxProofConcurrency` is the host's call, never a default.
+public struct VotingRoundDrivePolicy: Equatable, Sendable, Encodable {
+    public let pendingRepollSeconds: Double
+    public let maxBundleConcurrency: Int
+    public let failureIsolation: VotingFailureIsolation
+    public let maxDispatches: Int
+    public let progressBaseline: VotingProgressBaseline
+    public let maxProofConcurrency: Int
+
+    /// The documented defaults: 2s repoll, two bundles, skip the failed bundle,
+    /// 512 dispatches, run baseline, one proof at a time.
+    public static let `default` = VotingRoundDrivePolicy()
+
+    public init(
+        pendingRepollSeconds: Double = 2,
+        maxBundleConcurrency: Int = 2,
+        failureIsolation: VotingFailureIsolation = .skipBundle,
+        maxDispatches: Int = 512,
+        progressBaseline: VotingProgressBaseline = .run,
+        maxProofConcurrency: Int = 1
+    ) {
+        self.pendingRepollSeconds = pendingRepollSeconds
+        self.maxBundleConcurrency = maxBundleConcurrency
+        self.failureIsolation = failureIsolation
+        self.maxDispatches = maxDispatches
+        self.progressBaseline = progressBaseline
+        self.maxProofConcurrency = maxProofConcurrency
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case pendingRepollSeconds = "pending_repoll_seconds"
+        case maxBundleConcurrency = "max_bundle_concurrency"
+        case failureIsolation = "failure_isolation"
+        case maxDispatches = "max_dispatches"
+        case progressBaseline = "progress_baseline"
+        case maxProofConcurrency = "max_proof_concurrency"
+    }
+}
+
+/// How the share-tracking driver paces its passes.
+public struct VotingShareTrackingPolicy: Equatable, Sendable, Encodable {
+    public let failureRetrySeconds: Double
+    public let maxConsecutiveFailures: UInt32
+    /// A pass budget for a bounded foreground run; absent means no budget.
+    public let maxPasses: UInt32?
+
+    /// The documented defaults: 15s retry, 240 consecutive failures, no budget.
+    public static let `default` = VotingShareTrackingPolicy()
+
+    public init(
+        failureRetrySeconds: Double = 15,
+        maxConsecutiveFailures: UInt32 = 240,
+        maxPasses: UInt32? = nil
+    ) {
+        self.failureRetrySeconds = failureRetrySeconds
+        self.maxConsecutiveFailures = maxConsecutiveFailures
+        self.maxPasses = maxPasses
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case failureRetrySeconds = "failure_retry_seconds"
+        case maxConsecutiveFailures = "max_consecutive_failures"
+        case maxPasses = "max_passes"
+    }
+}
+
+/// How wide the proving pool runs.
+///
+/// An absent `cpuWorkerCount` lets Rust size the pool to the device's available
+/// parallelism; `maxActiveHeavyJobs` stays at 1 unless the host raises it.
+public struct VotingProvingPolicy: Equatable, Sendable, Encodable {
+    public let cpuWorkerCount: Int?
+    public let maxActiveHeavyJobs: Int
+
+    /// The documented defaults: device parallelism, one heavy job.
+    public static let `default` = VotingProvingPolicy()
+
+    public init(cpuWorkerCount: Int? = nil, maxActiveHeavyJobs: Int = 1) {
+        self.cpuWorkerCount = cpuWorkerCount
+        self.maxActiveHeavyJobs = maxActiveHeavyJobs
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case cpuWorkerCount = "cpu_worker_count"
+        case maxActiveHeavyJobs = "max_active_heavy_jobs"
+    }
+}
+
+/// Per-run overrides applied on top of the round's stored configuration.
+///
+/// An outer `nil` leaves the stored value alone: the key is left out of the
+/// JSON entirely. The inner `nil` of the two optional-of-optional fields cannot
+/// be expressed to Rust — the FFI reads a JSON `null` as "no override" rather
+/// than as "clear this value" — so `.some(nil)` is encoded as absent too, and
+/// clearing a stored ceremony start or vote end is not something a host can ask
+/// for through this type.
+public struct VotingHostOverrides: Equatable, Sendable, Encodable {
+    public let helperUrls: [String]?
+    public let voteTreeNodeUrls: [String]?
+    public let ceremonyStartSeconds: UInt64??
+    public let voteEndTimeSeconds: UInt64??
+
+    /// Override nothing.
+    public static let none = VotingHostOverrides()
+
+    public init(
+        helperUrls: [String]? = nil,
+        voteTreeNodeUrls: [String]? = nil,
+        ceremonyStartSeconds: UInt64?? = nil,
+        voteEndTimeSeconds: UInt64?? = nil
+    ) {
+        self.helperUrls = helperUrls
+        self.voteTreeNodeUrls = voteTreeNodeUrls
+        self.ceremonyStartSeconds = ceremonyStartSeconds
+        self.voteEndTimeSeconds = voteEndTimeSeconds
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case helperUrls = "helper_urls"
+        case voteTreeNodeUrls = "vote_tree_node_urls"
+        case ceremonyStartSeconds = "ceremony_start_seconds"
+        case voteEndTimeSeconds = "vote_end_time_seconds"
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(helperUrls, forKey: .helperUrls)
+        try container.encodeIfPresent(voteTreeNodeUrls, forKey: .voteTreeNodeUrls)
+        if case .some(.some(let seconds)) = ceremonyStartSeconds {
+            try container.encode(seconds, forKey: .ceremonyStartSeconds)
+        }
+        if case .some(.some(let seconds)) = voteEndTimeSeconds {
+            try container.encode(seconds, forKey: .voteEndTimeSeconds)
+        }
+    }
+}
+
+// MARK: - Keystone input
+
+/// One bundle's PCZT as a Keystone device signed it.
+public struct VotingKeystoneSignedBundle: Equatable, Sendable, Encodable {
+    public let bundleIndex: UInt32
+    public let signedPczt: Data
+
+    public init(bundleIndex: UInt32, signedPczt: Data) {
+        self.bundleIndex = bundleIndex
+        self.signedPczt = signedPczt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case bundleIndex = "bundle_index"
+        case signedPczt = "signed_pczt"
+    }
+}
+
+// MARK: - Error
+
+/// Stable category of a ``VotingError``.
+///
+/// ``other`` covers every category a newer `zcash_voting` may add: an
+/// unrecognised category string decodes to it rather than failing the decode.
+public enum VotingErrorKind: String, Equatable, Sendable, Decodable {
+    case invalidInput = "invalid_input"
+    case keystoneSignatureConflict = "keystone_signature_conflict"
+    case proofFailed = "proof_failed"
+    case busy
+    case storage
+    case `internal`
+    case insufficientEligibility = "insufficient_eligibility"
+    case noSpendableNotes = "no_spendable_notes"
+    case setupAlreadyPersisted = "setup_already_persisted"
+    case delegationPcztUnavailable = "delegation_pczt_unavailable"
+    case dbBusy = "db_busy"
+    case pirUnavailable = "pir_unavailable"
+    case delegationTargetMismatch = "delegation_target_mismatch"
+    case delegationAlreadyBroadcast = "delegation_already_broadcast"
+    case other
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = VotingErrorKind(rawValue: raw) ?? .other
+    }
+}
+
+/// A failure from the voting FFI, in the crate's own wire shape.
+///
+/// The structured fields carry the payload of the kinds that have one:
+/// `bundleIndex` for the bundle-scoped kinds, `httpStatus` and `endpoint` for
+/// ``VotingErrorKind/pirUnavailable``. `retryable` says whether the same call
+/// can be repeated as it stands; it is the crate's answer, not an inference
+/// from `kind`.
+public struct VotingError: Error, Equatable, Sendable, Decodable, LocalizedError {
+    public let kind: VotingErrorKind
+    public let retryable: Bool
+    public let message: String
+    public let bundleIndex: UInt32?
+    public let httpStatus: UInt16?
+    public let endpoint: String?
+
+    /// The crate's own message, which is written to be read by a person, so a
+    /// host with nothing more specific to show can show it.
+    public var errorDescription: String? {
+        message
+    }
+
+    /// A voting failure this SDK raised itself, in the shape the crate uses.
+    ///
+    /// The wrapper refuses a few calls before they reach the FFI — an argument
+    /// whose meaning would silently widen on the way through, say — and a host
+    /// branching on ``kind`` should not have to tell those apart from the
+    /// crate's own refusals.
+    public init(
+        kind: VotingErrorKind,
+        retryable: Bool = false,
+        message: String,
+        bundleIndex: UInt32? = nil,
+        httpStatus: UInt16? = nil,
+        endpoint: String? = nil
+    ) {
+        self.kind = kind
+        self.retryable = retryable
+        self.message = message
+        self.bundleIndex = bundleIndex
+        self.httpStatus = httpStatus
+        self.endpoint = endpoint
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case kind
+        case retryable
+        case message
+        case bundleIndex = "bundle_index"
+        case httpStatus = "http_status"
+        case endpoint
+    }
+
+    /// Reads the FFI's last error text as a ``VotingError``.
+    ///
+    /// The voting FFI records failures as the crate's JSON envelope, but not
+    /// every failure crossing the boundary comes from the crate — a panic
+    /// message or a plain string can reach here too. Anything that does not
+    /// decode is kept verbatim as a non-retryable ``VotingErrorKind/other``,
+    /// so no error text is lost to a decode failure.
+    public static func fromLastErrorMessage(_ message: String) -> VotingError {
+        guard
+            let data = message.data(using: .utf8),
+            let decoded = try? JSONDecoder().decode(VotingError.self, from: data)
+        else {
+            return VotingError(
+                kind: .other,
+                retryable: false,
+                message: message,
+                bundleIndex: nil,
+                httpStatus: nil,
+                endpoint: nil
+            )
+        }
+
+        return decoded
+    }
 }

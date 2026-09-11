@@ -193,6 +193,14 @@ public protocol CombineSynchronizer {
 
     func estimateBirthdayHeight(for date: Date) -> SinglePublisher<BlockHeight, Error>
 
+    func makeVotingRoundSession(
+        backend: VotingRustBackend,
+        inputs: VotingSessionInputs,
+        binding: VotingSessionBinding,
+        route: VotingTransportRoute,
+        epoch: UInt64
+    ) -> SinglePublisher<VotingRoundSession, Error>
+
     func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error>
 
     var broadcaster: Broadcaster { get }

@@ -2619,6 +2619,30 @@ class SynchronizerMock: Synchronizer {
         }
     }
 
+    // MARK: - makeVotingRoundSession
+
+    var makeVotingRoundSessionBackendInputsBindingRouteEpochThrowableError: Error?
+    var makeVotingRoundSessionBackendInputsBindingRouteEpochCallsCount = 0
+    var makeVotingRoundSessionBackendInputsBindingRouteEpochCalled: Bool {
+        return makeVotingRoundSessionBackendInputsBindingRouteEpochCallsCount > 0
+    }
+    var makeVotingRoundSessionBackendInputsBindingRouteEpochReceivedArguments: (backend: VotingRustBackend, inputs: VotingSessionInputs, binding: VotingSessionBinding, route: VotingTransportRoute, epoch: UInt64)?
+    var makeVotingRoundSessionBackendInputsBindingRouteEpochReturnValue: VotingRoundSession!
+    var makeVotingRoundSessionBackendInputsBindingRouteEpochClosure: ((VotingRustBackend, VotingSessionInputs, VotingSessionBinding, VotingTransportRoute, UInt64) async throws -> VotingRoundSession)?
+
+    func makeVotingRoundSession(backend: VotingRustBackend, inputs: VotingSessionInputs, binding: VotingSessionBinding, route: VotingTransportRoute, epoch: UInt64) async throws -> VotingRoundSession {
+        if let error = makeVotingRoundSessionBackendInputsBindingRouteEpochThrowableError {
+            throw error
+        }
+        makeVotingRoundSessionBackendInputsBindingRouteEpochCallsCount += 1
+        makeVotingRoundSessionBackendInputsBindingRouteEpochReceivedArguments = (backend: backend, inputs: inputs, binding: binding, route: route, epoch: epoch)
+        if let closure = makeVotingRoundSessionBackendInputsBindingRouteEpochClosure {
+            return try await closure(backend, inputs, binding, route, epoch)
+        } else {
+            return makeVotingRoundSessionBackendInputsBindingRouteEpochReturnValue
+        }
+    }
+
     // MARK: - debugDatabase
 
     var debugDatabaseSqlCallsCount = 0

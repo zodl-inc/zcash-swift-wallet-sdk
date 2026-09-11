@@ -8,16 +8,22 @@ import libzcashlc
 
 // MARK: - Error
 
-/// Error type for voting Rust backend operations.
+/// What the voting wrapper refuses on its own, before any FFI call is made.
+///
+/// Everything the crate refuses crosses the boundary as ``VotingError``, which
+/// carries the kind a host branches on. These cases have no crate answer to
+/// carry, because there was no call to make: the database is not open or is
+/// already open, or the session is closed or already driving its round.
 public enum VotingRustBackendError: LocalizedError, Equatable {
     /// The voting database is already open.
     case databaseAlreadyOpen
     /// The voting database is not open.
     case databaseNotOpen
-    /// A Rust error occurred.
-    case rustError(String)
-    /// Invalid data was received.
-    case invalidData(String)
+    /// The session is closed. A closed session is finished rather than paused:
+    /// further work on that round needs a new session.
+    case sessionClosed
+    /// A run or a share-tracking run is already in flight on this session.
+    case sessionBusy
 
     public var errorDescription: String? {
         switch self {
@@ -25,10 +31,10 @@ public enum VotingRustBackendError: LocalizedError, Equatable {
             return "Voting database is already open."
         case .databaseNotOpen:
             return "Voting database is not open."
-        case .rustError(let message):
-            return "Voting backend error: \(message)"
-        case .invalidData(let message):
-            return "Invalid data: \(message)"
+        case .sessionClosed:
+            return "Voting round session is closed."
+        case .sessionBusy:
+            return "Voting round session is already driving this round."
         }
     }
 }
@@ -37,16 +43,38 @@ public enum VotingRustBackendError: LocalizedError, Equatable {
 
 /// Wraps the voting `libzcashlc` C FFI surface.
 ///
-/// Manages an opaque `VotingDatabaseHandle` pointer for the database-bound
-/// methods. Stateless / static FFI (e.g. `computeShareNullifier`) is exposed
-/// as type methods so callers do not need to open a database.
+/// Two halves. The store half is this type: an opaque `VotingDatabaseHandle`
+/// over the sidecar database, the reads a host renders a round list from, and
+/// the maintenance calls it makes outside a round. The round half is
+/// ``VotingRoundSession``, opened through ``makeSession(inputs:binding:torRuntime:epoch:)``,
+/// which owns everything that reads the wallet, proves, or reaches the network.
 ///
-/// Thread safety: handle access is serialized by an `NSLock`. Database-bound
-/// FFI calls hold the lock for their full duration so `close()` cannot free the
-/// handle while Rust is using it.
+/// Stateless FFI — hotkeys, key extraction, the proving policy — is exposed as
+/// type methods, so a caller that has no database can still use it.
+///
+/// Errors: every failing FFI call throws the crate's own ``VotingError``, built
+/// from the typed JSON the FFI leaves in its last-error slot. The wrapper's own
+/// refusals — no handle, a handle already open — throw
+/// ``VotingRustBackendError``.
+///
+/// Thread safety: handle access is serialized by an `NSLock`. The sidecar reads
+/// and writes hold it for their whole duration — they are queries, and holding
+/// it is what keeps ``close()`` from freeing the handle underneath one. The one
+/// store call that reaches the network, ``syncVoteTree(roundId:nodeUrl:)``,
+/// does not: it runs its FFI call on the voting surface's own threads with the
+/// lock released, so a round listing or a close is never stuck behind a tree
+/// sync. Everything else that blocks for longer than a query belongs to a
+/// session.
 public final class VotingRustBackend: @unchecked Sendable {
     private let lock = NSLock()
     private var handle: OpaquePointer?
+    /// The handles a ``close()`` could not free because a sync was still using
+    /// one. The last sync to finish frees them all: a backend closed and
+    /// reopened while a sync runs parks a second handle, and neither of them
+    /// may be lost.
+    private var handlesAwaitingFree: [OpaquePointer] = []
+    /// The blocking vote-tree syncs running right now.
+    private let calls = VotingBlockingCalls()
 
     public init() {}
 
@@ -54,11 +82,20 @@ public final class VotingRustBackend: @unchecked Sendable {
         if let handle {
             zcashlc_voting_db_free(handle)
         }
+        // A parked handle outlives its `close()` only while the sync using it
+        // runs, and that sync holds this backend — so reaching here with one
+        // parked should not happen. It is freed rather than trusted to: the
+        // alternative is a leaked sidecar connection nothing can reach.
+        for parked in handlesAwaitingFree {
+            zcashlc_voting_db_free(parked)
+        }
     }
 
     // MARK: - Database lifecycle
 
     /// Open the voting database at `path` for `networkId`.
+    ///
+    /// An existing schema-13 sidecar is migrated in place as it opens.
     ///
     /// The network is fixed for the lifetime of the handle: every
     /// database-bound call takes its voting identity from `networkId` rather
@@ -67,7 +104,7 @@ public final class VotingRustBackend: @unchecked Sendable {
     /// its voting identity from the registered base network, and opening fails
     /// if that network has not been configured yet.
     ///
-    /// Throws `VotingRustBackendError.databaseAlreadyOpen` if the backend
+    /// Throws ``VotingRustBackendError/databaseAlreadyOpen`` if the backend
     /// already holds an open handle.
     public func open(path: String, networkId: UInt32) throws {
         lock.lock()
@@ -81,521 +118,289 @@ public final class VotingRustBackend: @unchecked Sendable {
         guard let ptr = pathBytes.withUnsafeBufferPointer({ buf in
             zcashlc_voting_db_open(buf.baseAddress, UInt(buf.count), networkId)
         }) else {
-            throw VotingRustBackendError.rustError(
-                Self.staticLastErrorMessage(fallback: "`voting_db_open` failed")
-            )
+            throw Self.votingError(fallback: "`voting_db_open` failed")
         }
         handle = ptr
     }
 
     /// Close the voting database, freeing the underlying handle.
     ///
-    /// Idempotent: calling `close()` on an already-closed backend is a no-op.
+    /// Idempotent: closing an already-closed backend is a no-op. A session
+    /// opened from this handle keeps its own reference to the sidecar and
+    /// stays usable, but closing the sessions first is the order that leaves
+    /// nothing driving a round the host has stopped listening to.
+    ///
+    /// The backend is closed to new calls the moment this returns: every
+    /// database-bound call throws ``VotingRustBackendError/databaseNotOpen``
+    /// from here on. It does not wait for a
+    /// ``syncVoteTree(roundId:nodeUrl:)`` still in flight — this call does not
+    /// block, and a sync cannot be interrupted — so the handle, and with it the
+    /// sidecar connection, is freed when that sync returns instead of here. A
+    /// host that means to delete the sidecar file, rather than just stop using
+    /// it, should let the sync it started finish first.
     public func close() {
         lock.lock()
         defer { lock.unlock() }
 
-        if let dbh = handle {
+        guard let dbh = handle else { return }
+
+        // Cleared before the free decision, so a call racing this one is
+        // refused as closed whichever side of the free it lands on.
+        handle = nil
+        if calls.isIdle {
             zcashlc_voting_db_free(dbh)
-            handle = nil
+        } else {
+            handlesAwaitingFree.append(dbh)
         }
     }
-}
 
-// MARK: - Wallet identity
-
-extension VotingRustBackend {
-    /// Set the wallet identifier for all subsequent voting operations.
+    /// Bind the handle to a wallet identifier, scoping every later operation.
     ///
-    /// Must be called after `open(path:)` and before any round operations.
+    /// Must be called after ``open(path:networkId:)`` and before any round
+    /// operation, including opening a session: the sidecar holds several
+    /// wallets' rounds, and an unscoped read is refused rather than answered
+    /// for the wrong wallet. Call it again to follow a wallet switch.
     public func setWalletId(_ walletId: String) throws {
-        let walletIdBytes = [UInt8](walletId.utf8)
-
         try withHandle { dbh in
-            let result = walletIdBytes.withUnsafeBufferPointer { buf in
-                zcashlc_voting_set_wallet_id(dbh, buf.baseAddress, UInt(buf.count))
+            let bytes = [UInt8](walletId.utf8)
+            let status = bytes.withUnsafeBufferPointer { buffer in
+                zcashlc_voting_set_wallet_id(dbh, buffer.baseAddress, UInt(buffer.count))
             }
-
-            guard result == 0 else {
-                throw VotingRustBackendError.rustError(lastErrorMessage(fallback: "`set_wallet_id` failed"))
+            guard status == 0 else {
+                throw Self.votingError(fallback: "`voting_set_wallet_id` failed")
             }
         }
     }
-}
 
-// MARK: - Delegation (PIR precompute)
+    // MARK: - Round store
 
-extension VotingRustBackend {
-    /// Resolve the round's PIR endpoint, fetch the IMT non-membership proofs
-    /// needed for the delegation ZKP, and cache them in the voting database.
-    ///
-    /// This performs the network PIR lookup only, proof construction happens
-    ///  elsewhere.
-    ///
-    /// `pirEndpoints` are probed in parallel via `pirResolver`. The first
-    /// endpoint whose served snapshot height equals `expectedSnapshotHeight`
-    /// exactly is used. See `PirSnapshotResolver` for the failure semantics.
-    ///
-    /// `pirLayout` must come from the round's resolved dynamic voting config.
-    /// `zcash_voting` fails the config/server layout handshake closed before any
-    /// private query, and rejects the `.unknown` default outright.
-    public func precomputeDelegationPir(
-        roundId: String,
-        bundleIndex: UInt32,
-        notes: [VotingNoteInfo],
-        pirEndpoints: [String],
-        expectedSnapshotHeight: UInt64,
-        pirLayout: VotingPirLayout = .unknown,
-        pirResolver: PirSnapshotResolver = PirSnapshotResolver()
-    ) async throws -> VotingDelegationPirPrecomputeResult {
-        try requireOpenDatabase()
-
-        // PirSnapshotResolver expects `BlockHeight` (Int); voting snapshot
-        // heights are `UInt64` everywhere else in the voting types, so convert
-        // at the boundary. Snapshot heights well within Int.max in practice.
-        let pirServerUrl = try await pirResolver.resolve(
-            endpoints: pirEndpoints,
-            expectedSnapshotHeight: BlockHeight(expectedSnapshotHeight)
-        )
-
-        let roundIdBytes = [UInt8](roundId.utf8)
-        let notesJson = try JSONEncoder().encode(notes)
-        let notesBytes = [UInt8](notesJson)
-        let urlBytes = [UInt8](pirServerUrl.utf8)
-
-        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                notesBytes.withUnsafeBufferPointer { notesBuf in
-                    urlBytes.withUnsafeBufferPointer { urlBuf in
-                        zcashlc_voting_precompute_delegation_pir(
-                            dbh,
-                            ridBuf.baseAddress,
-                            UInt(ridBuf.count),
-                            bundleIndex,
-                            notesBuf.baseAddress,
-                            UInt(notesBuf.count),
-                            urlBuf.baseAddress,
-                            UInt(urlBuf.count),
-                            pirLayout.pirDepth,
-                            pirLayout.tier0Layers,
-                            pirLayout.tier1Layers,
-                            pirLayout.polyLen
-                        )
-                    }
-                }
+    /// Every round of the bound wallet.
+    public func listRounds() throws -> [VotingRoundSummary] {
+        try withHandle { dbh in
+            try Self.decodingJSON(fallback: "`voting_list_rounds` failed") {
+                zcashlc_voting_list_rounds(dbh)
             }
-
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`precompute_delegation_pir` failed")
-                )
-            }
-            return ptr
         }
-        defer { zcashlc_free_boxed_slice(ptr) }
-        return try decodeJSON(from: ptr)
     }
-}
 
-// MARK: - Vote-tree sync
-
-extension VotingRustBackend {
-    /// Sync the vote commitment tree from a chain node.
+    /// The plan for one round against an authenticated proposal roster.
     ///
-    /// Returns the latest synced block height.
-    public func syncVoteTree(roundId: String, nodeUrl: String) throws -> UInt32 {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        let urlBytes = [UInt8](nodeUrl.utf8)
+    /// `proposalIds` is the roster the host authenticated; the plan is made
+    /// against it, so a proposal the host cannot vouch for cannot be planned
+    /// for. A round the sidecar has never seen is not an error: it plans as an
+    /// idle round that owes a draft.
+    public func roundPlan(roundId: String, proposalIds: [UInt32]) throws -> VotingRoundPlan {
+        let roster = try Self.encodeJSON(proposalIds, describing: "proposal ids")
+        return try withRoundId(roundId, bytes: roster) { dbh, id, idLen, roster, rosterLen in
+            try Self.decodingJSON(fallback: "`voting_round_plan` failed") {
+                zcashlc_voting_round_plan(dbh, id, idLen, roster, rosterLen)
+            }
+        }
+    }
 
-        return try withHandle { dbh in
-            let result = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                urlBytes.withUnsafeBufferPointer { urlBuf in
+    /// Rounds of the bound wallet with helper-share work still outstanding.
+    ///
+    /// This is what says whether the host still owes share tracking, so it is
+    /// the query to make on entering the voting flow and on foreground while
+    /// anything is pending.
+    public func pendingShareRounds() throws -> [VotingPendingShareRound] {
+        try withHandle { dbh in
+            try Self.decodingJSON(fallback: "`voting_pending_share_rounds` failed") {
+                zcashlc_voting_pending_share_rounds(dbh)
+            }
+        }
+    }
+
+    /// Sync a round's vote-commitment tree from `nodeUrl`, returning the height
+    /// it synced to.
+    ///
+    /// The one store call that reaches the network, and it blocks for the whole
+    /// sync, so it runs its FFI call on the voting surface's own threads rather
+    /// than on the caller's executor — and without the backend lock, which
+    /// would otherwise hold up every other call on this handle, ``close()``
+    /// included, for the duration of a network round trip. The handle stays
+    /// valid while it runs: a close during a sync frees the handle when the
+    /// sync returns.
+    public func syncVoteTree(roundId: String, nodeUrl: String) async throws -> UInt32 {
+        let id = [UInt8](roundId.utf8)
+        let url = [UInt8](nodeUrl.utf8)
+
+        let height = try await runBlocking { dbh -> Int64 in
+            let synced = id.withUnsafeBufferPointer { idBytes in
+                url.withUnsafeBufferPointer { urlBytes in
                     zcashlc_voting_sync_vote_tree(
                         dbh,
-                        ridBuf.baseAddress,
-                        UInt(ridBuf.count),
-                        urlBuf.baseAddress,
-                        UInt(urlBuf.count)
+                        idBytes.baseAddress,
+                        UInt(idBytes.count),
+                        urlBytes.baseAddress,
+                        UInt(urlBytes.count)
                     )
                 }
             }
 
-            guard result >= 0 else {
-                throw VotingRustBackendError.rustError(lastErrorMessage(fallback: "`sync_vote_tree` failed"))
+            // Read here rather than after the await: the FFI's last-error slot
+            // is per-thread, and this is the thread that made the call.
+            guard synced >= 0 else {
+                throw Self.votingError(fallback: "`voting_sync_vote_tree` failed")
             }
-            return UInt32(result)
+            return synced
+        }
+
+        guard let synced = UInt32(exactly: height) else {
+            throw VotingError(
+                kind: .internal,
+                message: "vote tree synced to height \(height), which is not a block height"
+            )
+        }
+        return synced
+    }
+
+    /// Drop the cached vote-tree state for one round.
+    ///
+    /// An empty `roundId` is the crate's wallet-wide reset, which forgets every
+    /// round's cached tree state, so it is refused here as invalid input: a
+    /// host asking about one round never means every round, and the FFI cannot
+    /// tell the two apart once the empty id has crossed.
+    public func resetVoteTree(roundId: String) throws {
+        try requireNamedRound(roundId, calling: "resetVoteTree")
+        try withRoundId(roundId) { dbh, id, idLen in
+            let status = zcashlc_voting_reset_vote_tree(dbh, id, idLen)
+            guard status == 0 else {
+                throw Self.votingError(fallback: "`voting_reset_vote_tree` failed")
+            }
         }
     }
 
-    /// Generate a Vote Authority Note (VAN) Merkle witness for the given
-    /// bundle at `anchorHeight`.
-    public func generateVanWitness(
-        roundId: String,
-        bundleIndex: UInt32,
-        anchorHeight: UInt32
-    ) throws -> VotingVanWitness {
-        let roundIdBytes = [UInt8](roundId.utf8)
-
-        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { buf in
-                zcashlc_voting_generate_van_witness(
-                    dbh,
-                    buf.baseAddress,
-                    UInt(buf.count),
-                    bundleIndex,
-                    anchorHeight
-                )
-            }
-
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(lastErrorMessage(fallback: "`generate_van_witness` failed"))
-            }
-            return ptr
-        }
-        defer { zcashlc_free_boxed_slice(ptr) }
-        return try decodeJSON(from: ptr)
-    }
-
-    /// Reset the in-memory tree client for a round, forcing the next
-    /// `syncVoteTree` call to start from a fresh client.
+    /// Return a round to a re-runnable state after an interrupted setup.
     ///
-    /// Pass an empty `roundId` to reset all rounds.
-    public func resetTreeClient(roundId: String = "") throws {
-        let roundIdBytes = [UInt8](roundId.utf8)
-
-        try withHandle { dbh in
-            let result = roundIdBytes.withUnsafeBufferPointer { buf in
-                zcashlc_voting_reset_tree_client(dbh, buf.baseAddress, UInt(buf.count))
-            }
-
-            guard result == 0 else {
-                throw VotingRustBackendError.rustError(lastErrorMessage(fallback: "`reset_tree_client` failed"))
+    /// Drops cached tree state and clears locally prepared *unsigned*
+    /// delegation setup; proved or submitted bundles, imported capabilities and
+    /// stored signatures survive. An empty `roundId` is refused for the same
+    /// reason as in ``resetVoteTree(roundId:)``: the crate would read it as a
+    /// wallet-wide tree reset rather than as work on one round.
+    public func resetSessionState(roundId: String) throws {
+        try requireNamedRound(roundId, calling: "resetSessionState")
+        try withRoundId(roundId) { dbh, id, idLen in
+            let status = zcashlc_voting_reset_session_state(dbh, id, idLen)
+            guard status == 0 else {
+                throw Self.votingError(fallback: "`voting_reset_session_state` failed")
             }
         }
     }
-}
 
-// MARK: - Delegation witnesses
-
-extension VotingRustBackend {
-    /// Generate Merkle inclusion witnesses for a bundle's notes and cache them
-    /// in the voting database.
-    public func generateNoteWitnesses(
-        roundId: String,
-        bundleIndex: UInt32,
-        walletDbPath: String,
-        notes: [VotingNoteInfo],
-        networkId: UInt32
-    ) throws -> [VotingWitnessData] {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        let walletPathBytes = [UInt8](walletDbPath.utf8)
-        let notesJson = try JSONEncoder().encode(notes)
-        let notesBytes = [UInt8](notesJson)
-
-        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                walletPathBytes.withUnsafeBufferPointer { pathBuf in
-                    notesBytes.withUnsafeBufferPointer { notesBuf in
-                        zcashlc_voting_generate_note_witnesses(
-                            dbh,
-                            ridBuf.baseAddress,
-                            UInt(ridBuf.count),
-                            bundleIndex,
-                            pathBuf.baseAddress,
-                            UInt(pathBuf.count),
-                            notesBuf.baseAddress,
-                            UInt(notesBuf.count),
-                            networkId
-                        )
-                    }
-                }
+    /// Delete one round.
+    ///
+    /// With `discardingRecovery == false` the call refuses once part of the
+    /// round has reached the network. Passing `true` abandons such a round on
+    /// purpose, giving up the state that could recover its voting weight, so it
+    /// belongs behind a decision the voter made.
+    public func deleteRound(roundId: String, discardingRecovery: Bool) throws {
+        try withRoundId(roundId) { dbh, id, idLen in
+            let status = zcashlc_voting_delete_round(dbh, id, idLen, discardingRecovery)
+            guard status == 0 else {
+                throw Self.votingError(fallback: "`voting_delete_round` failed")
             }
-
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`generate_note_witnesses` failed")
-                )
-            }
-            return ptr
-        }
-        defer { zcashlc_free_boxed_slice(ptr) }
-        return try decodeJSON(from: ptr)
-    }
-}
-
-// MARK: - Vote casting
-
-extension VotingRustBackend {
-    /// Build, sign, and persist the cast-vote commitment for one proposal.
-    ///
-    /// This is the single entry point for casting a vote. It replaces the former
-    /// four-call sequence — build the commitment, encrypt the shares, sign the
-    /// cast vote, then build the share payloads — because `zcash_voting` now
-    /// owns that orchestration and made the intermediate steps private. The
-    /// returned ``VotingVoteCommit`` carries everything the caller previously
-    /// assembled by hand.
-    ///
-    /// The call is idempotent: repeating it for the same round, bundle and
-    /// proposal returns the persisted recovery bundle rather than re-proving.
-    ///
-    /// `hotkeyStoredSecret` is the ``VotingHotkey/storedSecret`` the application
-    /// persisted, not wallet seed material. `networkId` must match the network
-    /// the round was initialized with, because the vote is signed for the
-    /// network the hotkey belongs to.
-    ///
-    /// The proof callback may be invoked from Rust worker threads. Do not call
-    /// back into this backend from `progress`: the database handle lock is held
-    /// while the FFI call is active, so re-entering the backend will deadlock.
-    ///
-    /// Safety: keep `progress` thread-safe, non-blocking, and limited to
-    /// reporting state outside this backend.
-    ///
-    /// Holds the interactive proving QoS boost while the proof itself runs.
-    // swiftlint:disable:next function_parameter_count
-    public func commitVote(
-        roundId: String,
-        bundleIndex: UInt32,
-        hotkeyStoredSecret: [UInt8],
-        proposalId: UInt32,
-        choice: UInt32,
-        numOptions: UInt32,
-        voteCommitmentTreePosition: UInt64,
-        vanWitness: VotingVanWitness,
-        singleShare: Bool,
-        progress: (@Sendable (Double) -> Void)? = nil
-    ) async throws -> VotingVoteCommit {
-        try requireOpenDatabase()
-
-        let draft = VoteCommitDraft(
-            roundId: roundId,
-            bundleIndex: bundleIndex,
-            hotkeyStoredSecret: hotkeyStoredSecret,
-            proposalId: proposalId,
-            choice: choice,
-            numOptions: numOptions,
-            voteCommitmentTreePosition: voteCommitmentTreePosition,
-            vanWitness: vanWitness,
-            singleShare: singleShare
-        )
-
-        // Boost only the proving itself: holding the pool-wide override across
-        // the cheap validation above would promote unrelated pool work (e.g. an
-        // overlapping background prove sweep) while nothing interactive runs yet.
-        return try await Self.withInteractiveProvingBoost {
-            try await Task.detached(priority: .userInitiated) { [self] in
-                try syncCommitVote(draft, progress: progress)
-            }.value
         }
     }
 
-    /// Record the transaction that carried a vote on chain.
-    ///
-    /// `txHash` is required: submission is recorded by persisting the
-    /// transaction, so that a restarted wallet resumes polling for it instead of
-    /// rebuilding the vote.
-    public func markVoteSubmitted(
-        roundId: String,
-        bundleIndex: UInt32,
-        proposalId: UInt32,
-        txHash: String
-    ) throws {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        let txHashBytes = [UInt8](txHash.utf8)
+    /// Drop bundle rows at index `>= keepCount`, returning how many were
+    /// deleted.
+    public func deleteSkippedBundles(roundId: String, keepCount: UInt32) throws -> UInt64 {
+        let deleted = try withRoundId(roundId) { dbh, id, idLen in
+            zcashlc_voting_delete_skipped_bundles(dbh, id, idLen, keepCount)
+        }
 
-        try withHandle { dbh in
-            let result = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                txHashBytes.withUnsafeBufferPointer { txBuf in
-                    zcashlc_voting_mark_vote_submitted(
+        guard deleted >= 0 else {
+            throw Self.votingError(fallback: "`voting_delete_skipped_bundles` failed")
+        }
+        return UInt64(deleted)
+    }
+
+    /// Forget a bundle's combined-cast rejection streak, answering whether
+    /// there was one to forget.
+    public func retryBlockedCombinedCast(roundId: String, bundleIndex: UInt32) throws -> Bool {
+        let cleared = try withRoundId(roundId) { dbh, id, idLen in
+            zcashlc_voting_retry_blocked_combined_cast(dbh, id, idLen, bundleIndex)
+        }
+
+        guard cleared >= 0 else {
+            throw Self.votingError(fallback: "`voting_retry_blocked_combined_cast` failed")
+        }
+        return cleared == 1
+    }
+
+    /// Clear the stored ballot intents of the named proposals.
+    ///
+    /// The crate has no batch form, so the ids are cleared one at a time: a
+    /// proposal whose vote the chain lifecycle already owns fails the call with
+    /// the proposals before it already cleared. Re-running is safe — clearing
+    /// an intent that is not there is not an error — so the remedy is to drop
+    /// the offending id and call again.
+    public func clearBallotIntents(roundId: String, proposalIds: [UInt32]) throws {
+        let ids = try Self.encodeJSON(proposalIds, describing: "proposal ids")
+        try withRoundId(roundId, bytes: ids) { dbh, id, idLen, proposals, proposalsLen in
+            let status = zcashlc_voting_clear_ballot_intents(dbh, id, idLen, proposals, proposalsLen)
+            guard status == 0 else {
+                throw Self.votingError(fallback: "`voting_clear_ballot_intents` failed")
+            }
+        }
+    }
+
+    /// The Keystone signatures stored for a round.
+    public func keystoneSignatures(roundId: String) throws -> [VotingKeystoneSignatureRecord] {
+        try withRoundId(roundId) { dbh, id, idLen in
+            try Self.decodingJSON(fallback: "`voting_get_keystone_signatures` failed") {
+                zcashlc_voting_get_keystone_signatures(dbh, id, idLen)
+            }
+        }
+    }
+
+    // MARK: - Sessions
+
+    /// Open a session for one round over this backend's sidecar.
+    ///
+    /// `torRuntime` selects the route the session's chain and helper traffic
+    /// takes for its whole life: `nil` is the direct HTTP route, and a runtime
+    /// is used through an isolated client taken during this call, so the
+    /// round's circuits are not linkable to the rest of the wallet's Tor use. A
+    /// session opened on Tor never falls back to a direct connection. PIR and
+    /// vote-tree traffic take the shared direct transport either way, because a
+    /// PIR query names no voter and its volume does not belong on Tor.
+    ///
+    /// The runtime is borrowed for this call only; the caller keeps ownership
+    /// of it. Nothing here reaches the network: every failure is a decision
+    /// about the arguments, and the wallet id must already be set.
+    func makeSession(
+        inputs: VotingSessionInputs,
+        binding: VotingSessionBinding,
+        torRuntime: OpaquePointer?,
+        epoch: UInt64
+    ) throws -> VotingRoundSession {
+        let inputsJSON = try Self.encodeJSON(inputs, describing: "session inputs")
+        let bindingJSON = try Self.encodeJSON(binding, describing: "session binding")
+
+        let session = try withHandle { dbh -> OpaquePointer in
+            let ptr = inputsJSON.withUnsafeBufferPointer { inputsBuffer in
+                bindingJSON.withUnsafeBufferPointer { bindingBuffer in
+                    zcashlc_voting_session_open(
                         dbh,
-                        ridBuf.baseAddress,
-                        UInt(ridBuf.count),
-                        bundleIndex,
-                        proposalId,
-                        txBuf.baseAddress,
-                        UInt(txBuf.count)
+                        inputsBuffer.baseAddress,
+                        UInt(inputsBuffer.count),
+                        bindingBuffer.baseAddress,
+                        UInt(bindingBuffer.count),
+                        torRuntime,
+                        epoch
                     )
                 }
             }
 
-            guard result == 0 else {
-                throw VotingRustBackendError.rustError(lastErrorMessage(fallback: "`mark_vote_submitted` failed"))
-            }
-        }
-    }
-
-    /// Record a confirmed cast-vote transaction in one atomic step.
-    ///
-    /// `zcash_voting` parses the confirmation events, records the transaction
-    /// hash, advances the vote-authority-note position and records the
-    /// vote-commitment tree position inside a single database transaction, then
-    /// returns both positions. Callers must not parse the events themselves:
-    /// splitting the `leaf_index` attribute by hand is exactly the duplicated
-    /// state this entry point exists to delete.
-    ///
-    /// `eventsJson` is the confirmation-events array the wallet's chain client
-    /// already fetches, serialized as JSON — a list of
-    /// `{"type": …, "attributes": [{"key": …, "value": …}]}` objects.
-    ///
-    /// Repeating the call with the same transaction hash and position is
-    /// accepted; a stale confirmation cannot rewind a position that a later one
-    /// already advanced.
-    public func confirmVoteSubmission(
-        roundId: String,
-        bundleIndex: UInt32,
-        proposalId: UInt32,
-        txHash: String,
-        eventsJson: String
-    ) throws -> VotingVoteConfirmation {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        let txHashBytes = [UInt8](txHash.utf8)
-        let eventsBytes = [UInt8](eventsJson.utf8)
-
-        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                txHashBytes.withUnsafeBufferPointer { txBuf in
-                    eventsBytes.withUnsafeBufferPointer { evBuf in
-                        zcashlc_voting_confirm_vote_submission(
-                            dbh,
-                            ridBuf.baseAddress,
-                            UInt(ridBuf.count),
-                            bundleIndex,
-                            proposalId,
-                            txBuf.baseAddress,
-                            UInt(txBuf.count),
-                            evBuf.baseAddress,
-                            UInt(evBuf.count)
-                        )
-                    }
-                }
-            }
-
             guard let ptr else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`confirm_vote_submission` failed")
-                )
+                throw Self.votingError(fallback: "`voting_session_open` failed")
             }
             return ptr
         }
-        defer { zcashlc_free_boxed_slice(ptr) }
-        return try decodeJSON(from: ptr)
-    }
-}
 
-// MARK: - Share tracking (static)
-
-extension VotingRustBackend {
-    /// Compute the nullifier for a vote share.
-    ///
-    /// - Parameters:
-    ///   - voteCommitment: 32-byte canonical Pallas-base-field encoding.
-    ///   - shareIndex: Position of the share within its vote.
-    ///   - primaryBlind: 32-byte canonical Pallas-base-field encoding.
-    /// - Returns: 32-byte nullifier as 64 lowercase hex characters.
-    /// - Throws: `VotingRustBackendError.invalidData` if either byte array is not
-    ///   exactly 32 bytes; `VotingRustBackendError.rustError` if the underlying
-    ///   Rust computation fails (for example, non-canonical field encoding).
-    public static func computeShareNullifier(
-        voteCommitment: [UInt8],
-        shareIndex: UInt32,
-        primaryBlind: [UInt8]
-    ) throws -> String {
-        guard
-            voteCommitment.count == votingFieldElementByteCount,
-            primaryBlind.count == votingFieldElementByteCount
-        else {
-            throw VotingRustBackendError.invalidData(
-                "voteCommitment and primaryBlind must each be exactly \(votingFieldElementByteCount) bytes"
-            )
-        }
-
-        let ptr = voteCommitment.withUnsafeBufferPointer { vcBuf in
-            primaryBlind.withUnsafeBufferPointer { blindBuf in
-                zcashlc_voting_compute_share_nullifier(
-                    vcBuf.baseAddress,
-                    blindBuf.baseAddress,
-                    shareIndex
-                )
-            }
-        }
-
-        guard let ptr else {
-            throw VotingRustBackendError.rustError(
-                staticLastErrorMessage(fallback: "`compute_share_nullifier` failed")
-            )
-        }
-        defer { zcashlc_string_free(ptr) }
-        return String(cString: ptr)
-    }
-
-    /// Rebuild one helper-server share payload as `zcash_voting`'s own wire JSON.
-    ///
-    /// The crate parses the persisted recovery bundle, selects the requested
-    /// share, late-binds the confirmed vote-commitment-tree position and the
-    /// scheduled submission time, and serializes the payload itself. Nothing is
-    /// re-proved and nothing is committed a second time.
-    ///
-    /// - Parameters:
-    ///   - commitmentBundleJson: ``VotingStoredCommitmentBundle/bundleJson`` from
-    ///     `getCommitmentBundle(roundId:bundleIndex:proposalId:)`.
-    ///   - voteCommitmentTreePosition: the confirmed position, from
-    ///     ``VotingVoteConfirmation/voteCommitmentTreePosition``.
-    /// - Returns: the helper request body. POST it verbatim; do not decode,
-    ///   re-shape or re-encode it.
-    /// - Throws: `VotingRustBackendError.rustError` if the bundle JSON is
-    ///   malformed, its proposal does not match `proposalId`, or the share index
-    ///   is not present in it.
-    public static func recoverWireJson(
-        commitmentBundleJson: String,
-        proposalId: UInt32,
-        shareIndex: UInt32,
-        voteCommitmentTreePosition: UInt64,
-        submitAt: UInt64
-    ) throws -> String {
-        let bundleBytes = [UInt8](commitmentBundleJson.utf8)
-        let payload = try staticBoxedSliceFFI(fallback: "`recover_wire_json` failed") {
-            bundleBytes.withUnsafeBufferPointer { buf in
-                zcashlc_voting_recover_wire_json(
-                    buf.baseAddress,
-                    UInt(buf.count),
-                    proposalId,
-                    shareIndex,
-                    voteCommitmentTreePosition,
-                    submitAt
-                )
-            }
-        }
-        return String(decoding: payload, as: UTF8.self)
-    }
-
-    /// List the share indices recoverable from a persisted vote recovery bundle.
-    ///
-    /// The crate parses the bundle and applies its own single-share slicing
-    /// (one share when the vote was single-share, all of them otherwise);
-    /// this reads off each recovered payload's own share index. Crash
-    /// recovery calls this instead of guessing a share count from
-    /// `singleShare` alone (`singleShare ? 1 : numOptions`), so a caller-side
-    /// guess can never under- or over-deliver relative to what the crate
-    /// actually reconstructs.
-    ///
-    /// - Parameter commitmentBundleJson: ``VotingStoredCommitmentBundle/bundleJson``
-    ///   from `getCommitmentBundle(roundId:bundleIndex:proposalId:)`.
-    /// - Returns: the recoverable share indices, in the crate's own order.
-    /// - Throws: `VotingRustBackendError.rustError` if the bundle JSON is
-    ///   malformed or its vote fields are out of range.
-    public static func recoverableShareIndices(
-        commitmentBundleJson: String
-    ) throws -> [UInt32] {
-        let bundleBytes = [UInt8](commitmentBundleJson.utf8)
-        let ptr = bundleBytes.withUnsafeBufferPointer { buf in
-            zcashlc_voting_recoverable_share_indices(buf.baseAddress, UInt(buf.count))
-        }
-        guard let ptr else {
-            throw VotingRustBackendError.rustError(
-                staticLastErrorMessage(fallback: "`recoverable_share_indices` failed")
-            )
-        }
-        defer { zcashlc_free_boxed_slice(ptr) }
-        return try staticDecodeJSON(from: ptr)
+        return VotingRoundSession(handle: session, roundId: inputs.roundParams.voteRoundId)
     }
 }
 
@@ -632,133 +437,82 @@ extension VotingRustBackend {
     }
 }
 
+// MARK: - Proving pool (static)
+
+extension VotingRustBackend {
+    /// Fix the process-wide proving policy, answering whether this call is the
+    /// one that configured it.
+    ///
+    /// The pool is configured once per process. A repeat that asks for the
+    /// policy already in force is accepted as a fresh configure and answers
+    /// `true`; only a policy that disagrees with the one in force answers
+    /// `false`, leaving the running pool as it is. A host that cares which
+    /// policy is live must therefore treat `false` as "mine was not applied"
+    /// rather than as a harmless repeat.
+    ///
+    /// First *use* fixes the pool too: ``warmProvingCaches()`` and the first
+    /// proof both start it on the crate's default policy, which sizes the heavy
+    /// job limit to the device's parallelism rather than to one. Call this
+    /// before either, or the policy that ends up live is the default rather
+    /// than the one asked for here.
+    public static func configureProving(_ policy: VotingProvingPolicy) throws -> Bool {
+        let json = try encodeJSON(policy, describing: "proving policy")
+        let result = json.withUnsafeBufferPointer { buffer in
+            zcashlc_voting_configure(buffer.baseAddress, UInt(buffer.count))
+        }
+
+        switch result {
+        case 0:
+            return true
+        case 1:
+            return false
+        default:
+            throw votingError(fallback: "`voting_configure` failed")
+        }
+    }
+
+    /// Warm process-lifetime proving-key caches used by voting proofs.
+    ///
+    /// Returns at once and warms in the background; a no-op after the first
+    /// call in this process. Call it when entering a flow that will prove
+    /// interactively so the first proving call does not pay the multi-second
+    /// keygen — after ``configureProving(_:)``, because warming starts the pool
+    /// and so fixes the policy if nothing has yet. It runs at the pool's resting priority: warm-up is background
+    /// work, and if the voter submits before it finishes, that call's own boost
+    /// covers the keygen remainder.
+    public static func warmProvingCaches() throws {
+        guard zcashlc_voting_warm_proving_caches() == 0 else {
+            throw votingError(fallback: "`warm_proving_caches` failed")
+        }
+    }
+}
+
 // MARK: - Foundation helpers (static)
 
 extension VotingRustBackend {
-    /// Warm process-lifetime proving-key caches used by voting proofs.
+    /// Whether `roundId` is a well-formed voting round id: 64 lowercase hex
+    /// characters encoding a canonical Pallas base-field element.
     ///
-    /// Safe to call multiple times; subsequent calls are cheap. Call when
-    /// entering a flow that will prove interactively (off the main actor) so
-    /// the first proving call does not pay the multi-second keygen. Runs at
-    /// the pool's resting priority: warm-up is background work, and if a user
-    /// submits before it finishes, the proving call's own boost covers the
-    /// keygen remainder.
-    public static func warmProvingCaches() throws {
-        let result = zcashlc_voting_warm_proving_caches()
-        guard result == 0 else {
-            throw VotingRustBackendError.rustError(
-                staticLastErrorMessage(fallback: "`warm_proving_caches` failed")
-            )
+    /// Takes no database, so a host can check an id before it has a handle.
+    public static func validateRoundId(_ roundId: String) -> Bool {
+        let bytes = [UInt8](roundId.utf8)
+        let valid = bytes.withUnsafeBufferPointer { buffer in
+            zcashlc_voting_validate_round_id(buffer.baseAddress, UInt(buffer.count))
         }
-    }
 
-    /// Generate the public delegation inputs for a sender seed + stored hotkey
-    /// secret pair.
-    ///
-    /// `senderSeed` must be ≥ 32 bytes. `hotkeyStoredSecret` is the app-owned
-    /// ``VotingHotkey/storedSecret``, not seed material; `zcash_voting` derives
-    /// the hotkey's Orchard address from it at a fixed account and address
-    /// index, and rejects a secret of the wrong length. `accountIndex` drives
-    /// only the sender's UFVK derivation.
-    public static func generateDelegationInputs(
-        senderSeed: [UInt8],
-        hotkeyStoredSecret: [UInt8],
-        networkId: UInt32,
-        accountIndex: UInt32
-    ) throws -> VotingDelegationInputs {
-        guard senderSeed.count >= votingMinSeedByteCount else {
-            throw VotingRustBackendError.invalidData(
-                "senderSeed must be at least \(votingMinSeedByteCount) bytes"
-            )
+        if !valid {
+            // A rejection also leaves its reason in the FFI's last-error slot.
+            // Nothing here reports it, so it is cleared rather than left to
+            // surface as the explanation of some later failure.
+            _ = lastErrorMessage(fallback: "")
         }
-        let ptr = senderSeed.withUnsafeBufferPointer { senderBuf in
-            hotkeyStoredSecret.withUnsafeBufferPointer { hotkeyBuf in
-                zcashlc_voting_generate_delegation_inputs(
-                    senderBuf.baseAddress,
-                    UInt(senderBuf.count),
-                    hotkeyBuf.baseAddress,
-                    UInt(hotkeyBuf.count),
-                    networkId,
-                    accountIndex
-                )
-            }
-        }
-        guard let ptr else {
-            throw VotingRustBackendError.rustError(
-                staticLastErrorMessage(fallback: "`generate_delegation_inputs` failed")
-            )
-        }
-        defer { zcashlc_free_boxed_slice(ptr) }
-        return try staticDecodeJSON(from: ptr)
-    }
-
-    /// Generate delegation inputs from an explicit sender FVK + stored hotkey
-    /// secret, bypassing sender-seed derivation.
-    public static func generateDelegationInputs(
-        senderFvk: [UInt8],
-        hotkeyStoredSecret: [UInt8],
-        networkId: UInt32,
-        seedFingerprint: [UInt8]
-    ) throws -> VotingDelegationInputs {
-        guard senderFvk.count == votingOrchardFvkByteCount else {
-            throw VotingRustBackendError.invalidData(
-                "senderFvk must be exactly \(votingOrchardFvkByteCount) bytes"
-            )
-        }
-        guard seedFingerprint.count == votingSeedFingerprintByteCount else {
-            throw VotingRustBackendError.invalidData(
-                "seedFingerprint must be exactly \(votingSeedFingerprintByteCount) bytes"
-            )
-        }
-        let ptr = senderFvk.withUnsafeBufferPointer { fvkBuf in
-            hotkeyStoredSecret.withUnsafeBufferPointer { hotkeyBuf in
-                seedFingerprint.withUnsafeBufferPointer { fpBuf in
-                    zcashlc_voting_generate_delegation_inputs_with_fvk(
-                        fvkBuf.baseAddress,
-                        UInt(fvkBuf.count),
-                        hotkeyBuf.baseAddress,
-                        UInt(hotkeyBuf.count),
-                        networkId,
-                        fpBuf.baseAddress,
-                        UInt(fpBuf.count)
-                    )
-                }
-            }
-        }
-        guard let ptr else {
-            throw VotingRustBackendError.rustError(
-                staticLastErrorMessage(fallback: "`generate_delegation_inputs_with_fvk` failed")
-            )
-        }
-        defer { zcashlc_free_boxed_slice(ptr) }
-        return try staticDecodeJSON(from: ptr)
-    }
-
-    /// Extract the ZIP-244 shielded sighash from a finalized PCZT.
-    public static func extractPcztSighash(pczt: [UInt8]) throws -> [UInt8] {
-        try staticBoxedSliceFFI(fallback: "`extract_pczt_sighash` failed") {
-            pczt.withUnsafeBufferPointer { buf in
-                zcashlc_voting_extract_pczt_sighash(buf.baseAddress, UInt(buf.count))
-            }
-        }
-    }
-
-    /// Extract the spend-auth signature for `actionIndex` from a signed PCZT.
-    public static func extractSpendAuthSig(
-        signedPczt: [UInt8],
-        actionIndex: UInt32
-    ) throws -> [UInt8] {
-        try staticBoxedSliceFFI(fallback: "`extract_spend_auth_sig` failed") {
-            signedPczt.withUnsafeBufferPointer { buf in
-                zcashlc_voting_extract_spend_auth_sig(buf.baseAddress, UInt(buf.count), actionIndex)
-            }
-        }
+        return valid
     }
 
     /// Extract the 96-byte Orchard FVK from a UFVK string.
     public static func extractOrchardFvk(ufvk: String, networkId: UInt32) throws -> [UInt8] {
         let bytes = [UInt8](ufvk.utf8)
-        return try staticBoxedSliceFFI(fallback: "`extract_orchard_fvk_from_ufvk` failed") {
+        return try readingBytes(fallback: "`extract_orchard_fvk_from_ufvk` failed") {
             bytes.withUnsafeBufferPointer { buf in
                 zcashlc_voting_extract_orchard_fvk_from_ufvk(buf.baseAddress, UInt(buf.count), networkId)
             }
@@ -771,743 +525,15 @@ extension VotingRustBackend {
     /// Voting rounds anchor to the Ironwood pool, so a round's `nc_root` is the
     /// Ironwood tree's root at the snapshot height — not the Orchard tree's.
     public static func extractNcRoot(treeState: [UInt8]) throws -> [UInt8] {
-        try staticBoxedSliceFFI(fallback: "`extract_nc_root` failed") {
+        try readingBytes(fallback: "`extract_nc_root` failed") {
             treeState.withUnsafeBufferPointer { buf in
                 zcashlc_voting_extract_nc_root(buf.baseAddress, UInt(buf.count))
             }
         }
     }
-
-    /// Verify a Merkle witness against the witness's embedded root.
-    ///
-    /// Returns `true` if valid, `false` if well-formed but invalid.
-    /// Throws `.rustError` if the witness JSON is malformed.
-    public static func verifyWitness(_ witness: VotingWitnessData) throws -> Bool {
-        let json = try JSONEncoder().encode(witness)
-        let bytes = [UInt8](json)
-        let result = bytes.withUnsafeBufferPointer { buf in
-            zcashlc_voting_verify_witness(buf.baseAddress, UInt(buf.count))
-        }
-        switch result {
-        case 1: return true
-        case 0: return false
-        default:
-            throw VotingRustBackendError.rustError(
-                staticLastErrorMessage(fallback: "`verify_witness` failed")
-            )
-        }
-    }
 }
 
-// MARK: - Round lifecycle
-
-extension VotingRustBackend {
-    /// Initialize a voting round.
-    ///
-    /// The round is persisted with the network the database was opened for, so
-    /// that governance PCZT consensus branch identifiers can later be validated
-    /// against the round's snapshot.
-    ///
-    /// Round-parameter byte arrays are validated by Rust; invalid lengths
-    /// throw `.rustError` rather than persisting a partial round.
-    /// `sessionJson` is optional; pass `nil` to leave it unset.
-    public func initRound(
-        roundId: String,
-        snapshotHeight: UInt64,
-        eaPublicKey: [UInt8],
-        ncRoot: [UInt8],
-        nullifierImtRoot: [UInt8],
-        sessionJson: String? = nil
-    ) throws {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        let sessionBytes = sessionJson.map { [UInt8]($0.utf8) }
-
-        try withHandle { dbh in
-            let result = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                eaPublicKey.withUnsafeBufferPointer { eaBuf in
-                    ncRoot.withUnsafeBufferPointer { ncBuf in
-                        nullifierImtRoot.withUnsafeBufferPointer { nullBuf in
-                            withOptionalBufferPointer(sessionBytes) { sessionBuf in
-                                zcashlc_voting_init_round(
-                                    dbh,
-                                    ridBuf.baseAddress,
-                                    UInt(ridBuf.count),
-                                    snapshotHeight,
-                                    eaBuf.baseAddress,
-                                    UInt(eaBuf.count),
-                                    ncBuf.baseAddress,
-                                    UInt(ncBuf.count),
-                                    nullBuf.baseAddress,
-                                    UInt(nullBuf.count),
-                                    sessionBuf?.baseAddress,
-                                    UInt(sessionBuf?.count ?? 0)
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-
-            guard result == 0 else {
-                throw VotingRustBackendError.rustError(lastErrorMessage(fallback: "`init_round` failed"))
-            }
-        }
-    }
-
-    /// Read the persisted state of a round.
-    public func getRoundState(roundId: String) throws -> VotingRoundState {
-        let roundIdBytes = [UInt8](roundId.utf8)
-
-        let ptr: UnsafeMutablePointer<FfiRoundState> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiRoundState>? = roundIdBytes.withUnsafeBufferPointer { buf in
-                zcashlc_voting_get_round_state(dbh, buf.baseAddress, UInt(buf.count))
-            }
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`get_round_state` failed")
-                )
-            }
-            return ptr
-        }
-        defer { zcashlc_voting_free_round_state(ptr) }
-
-        let raw = ptr.pointee
-        let phase = try Self.decodeRoundPhase(raw.phase)
-        let storedRoundId = try Self.decodeRequiredCString(raw.round_id, fieldName: "round_id")
-        let hotkeyAddress = raw.hotkey_address.map { String(cString: $0) }
-        let delegatedWeight: UInt64? = raw.delegated_weight < 0
-            ? nil
-            : UInt64(raw.delegated_weight)
-
-        return VotingRoundState(
-            roundId: storedRoundId,
-            phase: phase,
-            snapshotHeight: raw.snapshot_height,
-            hotkeyAddress: hotkeyAddress,
-            delegatedWeight: delegatedWeight,
-            proofGenerated: raw.proof_generated
-        )
-    }
-
-    /// List all voting rounds known to the database, in storage order.
-    public func listRounds() throws -> [VotingRoundSummary] {
-        let ptr: UnsafeMutablePointer<FfiRoundSummaries> = try withHandle { dbh in
-            guard let ptr = zcashlc_voting_list_rounds(dbh) else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`list_rounds` failed")
-                )
-            }
-            return ptr
-        }
-        defer { zcashlc_voting_free_round_summaries(ptr) }
-
-        let summariesPtr = ptr.pointee.ptr
-        let count = Int(ptr.pointee.len)
-        guard count > 0, let summariesPtr else { return [] }
-
-        var summaries: [VotingRoundSummary] = []
-        summaries.reserveCapacity(count)
-        for index in 0..<count {
-            let raw = summariesPtr.advanced(by: index).pointee
-            let storedRoundId = try Self.decodeRequiredCString(raw.round_id, fieldName: "round_id")
-            let phase = try Self.decodeRoundPhase(raw.phase)
-            summaries.append(
-                VotingRoundSummary(
-                    roundId: storedRoundId,
-                    phase: phase,
-                    snapshotHeight: raw.snapshot_height,
-                    createdAt: raw.created_at
-                )
-            )
-        }
-        return summaries
-    }
-
-    /// Read all vote records persisted for a round.
-    public func getVotes(roundId: String) throws -> [VotingVoteRecord] {
-        let roundIdBytes = [UInt8](roundId.utf8)
-
-        let ptr: UnsafeMutablePointer<FfiVoteRecords> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiVoteRecords>? = roundIdBytes.withUnsafeBufferPointer { buf in
-                zcashlc_voting_get_votes(dbh, buf.baseAddress, UInt(buf.count))
-            }
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`get_votes` failed")
-                )
-            }
-            return ptr
-        }
-        defer { zcashlc_voting_free_vote_records(ptr) }
-
-        let recordsPtr = ptr.pointee.ptr
-        let count = Int(ptr.pointee.len)
-        guard count > 0, let recordsPtr else { return [] }
-
-        var records: [VotingVoteRecord] = []
-        records.reserveCapacity(count)
-        for index in 0..<count {
-            let raw = recordsPtr.advanced(by: index).pointee
-            records.append(
-                VotingVoteRecord(
-                    proposalId: raw.proposal_id,
-                    bundleIndex: raw.bundle_index,
-                    choice: raw.choice,
-                    submitted: raw.submitted
-                )
-            )
-        }
-        return records
-    }
-
-    /// Clear all persisted data for a round.
-    public func clearRound(roundId: String) throws {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        try withHandle { dbh in
-            let result = roundIdBytes.withUnsafeBufferPointer { buf in
-                zcashlc_voting_clear_round(dbh, buf.baseAddress, UInt(buf.count))
-            }
-            guard result == 0 else {
-                throw VotingRustBackendError.rustError(lastErrorMessage(fallback: "`clear_round` failed"))
-            }
-        }
-    }
-
-    /// Restore a delegation carved out of a wiped voting database.
-    ///
-    /// Rust refuses unless every row of the round is provably useless to the
-    /// wallet: no votes, no delivered shares, no Keystone signatures, and no
-    /// accepted transaction hash other than the package's. Only then does it
-    /// clear the round and import the package, recomputing every VAN from
-    /// the hotkey first. A round already holding this delegation returns
-    /// `.alreadyRestored` without writing.
-    public func restoreRecoveredDelegation(
-        _ request: RecoveredDelegationRestoreRequest
-    ) throws -> RecoveredDelegationRestoreResult {
-        let requestBytes = [UInt8](try JSONEncoder().encode(request))
-        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
-            let ptr = requestBytes.withUnsafeBufferPointer { requestBuffer in
-                request.hotkey.storedSecret.withUnsafeBufferPointer { secretBuffer in
-                    zcashlc_voting_restore_recovered_delegation(
-                        dbh,
-                        requestBuffer.baseAddress,
-                        UInt(requestBuffer.count),
-                        secretBuffer.baseAddress,
-                        UInt(secretBuffer.count)
-                    )
-                }
-            }
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`restore_recovered_delegation` failed")
-                )
-            }
-            return ptr
-        }
-        defer { zcashlc_free_boxed_slice(ptr) }
-        let reply: RecoveredDelegationRestoreReply = try decodeJSON(from: ptr)
-        return reply.outcome
-    }
-
-    /// Delete bundle rows with index ≥ `keepCount`, returning the number of rows deleted.
-    public func deleteSkippedBundles(roundId: String, keepCount: UInt32) throws -> UInt32 {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        return try withHandle { dbh in
-            let deleted = roundIdBytes.withUnsafeBufferPointer { buf in
-                zcashlc_voting_delete_skipped_bundles(dbh, buf.baseAddress, UInt(buf.count), keepCount)
-            }
-            guard deleted >= 0 else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`delete_skipped_bundles` failed")
-                )
-            }
-            return UInt32(deleted)
-        }
-    }
-}
-
-// MARK: - Wallet notes
-
-extension VotingRustBackend {
-    /// Read the wallet notes eligible for voting at `snapshotHeight`.
-    ///
-    /// `accountUuidBytes` must be exactly 16 bytes; the FFI scopes the query
-    /// to a specific account and rejects any other length.
-    public func getWalletNotes(
-        accountUuidBytes: [UInt8],
-        dataDbPath: String,
-        snapshotHeight: UInt64,
-        networkId: UInt32
-    ) throws -> [VotingNoteInfo] {
-        guard accountUuidBytes.count == votingAccountUuidByteCount else {
-            throw VotingRustBackendError.invalidData(
-                "accountUuidBytes must be exactly \(votingAccountUuidByteCount) bytes"
-            )
-        }
-        let pathBytes = [UInt8](dataDbPath.utf8)
-
-        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = pathBytes.withUnsafeBufferPointer { pathBuf in
-                accountUuidBytes.withUnsafeBufferPointer { uuidBuf in
-                    zcashlc_voting_get_wallet_notes(
-                        dbh,
-                        pathBuf.baseAddress,
-                        UInt(pathBuf.count),
-                        snapshotHeight,
-                        networkId,
-                        uuidBuf.baseAddress,
-                        UInt(uuidBuf.count)
-                    )
-                }
-            }
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`get_wallet_notes` failed")
-                )
-            }
-            return ptr
-        }
-        defer { zcashlc_free_boxed_slice(ptr) }
-        return try decodeJSON(from: ptr)
-    }
-}
-
-// MARK: - Recovery state
-
-extension VotingRustBackend {
-    /// Persist the on-chain transaction hash for a submitted delegation bundle.
-    public func storeDelegationTxHash(
-        roundId: String,
-        bundleIndex: UInt32,
-        txHash: String
-    ) throws {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        let txHashBytes = [UInt8](txHash.utf8)
-        try withHandle { dbh in
-            let result = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                txHashBytes.withUnsafeBufferPointer { txBuf in
-                    zcashlc_voting_store_delegation_tx_hash(
-                        dbh,
-                        ridBuf.baseAddress,
-                        UInt(ridBuf.count),
-                        bundleIndex,
-                        txBuf.baseAddress,
-                        UInt(txBuf.count)
-                    )
-                }
-            }
-            guard result == 0 else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`store_delegation_tx_hash` failed")
-                )
-            }
-        }
-
-    }
-
-    /// Load a previously-stored delegation transaction hash, if any.
-    public func getDelegationTxHash(
-        roundId: String,
-        bundleIndex: UInt32
-    ) throws -> String? {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { buf in
-                zcashlc_voting_get_delegation_tx_hash(
-                    dbh,
-                    buf.baseAddress,
-                    UInt(buf.count),
-                    bundleIndex
-                )
-            }
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`get_delegation_tx_hash` failed")
-                )
-            }
-            return ptr
-        }
-        defer { zcashlc_free_boxed_slice(ptr) }
-        return try decodeJSON(from: ptr)
-    }
-
-    /// Persist the on-chain transaction hash for a submitted vote.
-    public func storeVoteTxHash(
-        roundId: String,
-        bundleIndex: UInt32,
-        proposalId: UInt32,
-        txHash: String
-    ) throws {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        let txHashBytes = [UInt8](txHash.utf8)
-        try withHandle { dbh in
-            let result = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                txHashBytes.withUnsafeBufferPointer { txBuf in
-                    zcashlc_voting_store_vote_tx_hash(
-                        dbh,
-                        ridBuf.baseAddress,
-                        UInt(ridBuf.count),
-                        bundleIndex,
-                        proposalId,
-                        txBuf.baseAddress,
-                        UInt(txBuf.count)
-                    )
-                }
-            }
-            guard result == 0 else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`store_vote_tx_hash` failed")
-                )
-            }
-        }
-    }
-
-    /// Load a previously-stored vote transaction hash, if any.
-    public func getVoteTxHash(
-        roundId: String,
-        bundleIndex: UInt32,
-        proposalId: UInt32
-    ) throws -> String? {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { buf in
-                zcashlc_voting_get_vote_tx_hash(
-                    dbh,
-                    buf.baseAddress,
-                    UInt(buf.count),
-                    bundleIndex,
-                    proposalId
-                )
-            }
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`get_vote_tx_hash` failed")
-                )
-            }
-            return ptr
-        }
-        defer { zcashlc_free_boxed_slice(ptr) }
-        return try decodeJSON(from: ptr)
-    }
-
-    /// Record the vote-commitment-tree position of a confirmed vote.
-    ///
-    /// The recovery bundle itself is no longer supplied by the caller:
-    /// `zcash_voting` writes it when the vote is committed, so the position is
-    /// all that remains to be learned from the chain.
-    public func recordVcPosition(
-        roundId: String,
-        bundleIndex: UInt32,
-        proposalId: UInt32,
-        voteCommitmentTreePosition: UInt64
-    ) throws {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        try withHandle { dbh in
-            let result = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                zcashlc_voting_record_vc_position(
-                    dbh,
-                    ridBuf.baseAddress,
-                    UInt(ridBuf.count),
-                    bundleIndex,
-                    proposalId,
-                    voteCommitmentTreePosition
-                )
-            }
-            guard result == 0 else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`record_vc_position` failed")
-                )
-            }
-        }
-    }
-
-    /// Load a previously-stored commitment bundle, if any.
-    public func getCommitmentBundle(
-        roundId: String,
-        bundleIndex: UInt32,
-        proposalId: UInt32
-    ) throws -> VotingStoredCommitmentBundle? {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { buf in
-                zcashlc_voting_get_commitment_bundle(
-                    dbh,
-                    buf.baseAddress,
-                    UInt(buf.count),
-                    bundleIndex,
-                    proposalId
-                )
-            }
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`get_commitment_bundle` failed")
-                )
-            }
-            return ptr
-        }
-        defer { zcashlc_free_boxed_slice(ptr) }
-
-        // Rust returns `Option<(String, u64)>`; in JSON that is `null` or
-        // a 2-element array `[bundle_json, vc_tree_position]`.
-        let stored: StoredCommitmentBundleWire? = try decodeJSON(from: ptr)
-        return stored.map {
-            VotingStoredCommitmentBundle(
-                bundleJson: $0.bundleJson,
-                voteCommitmentTreePosition: $0.voteCommitmentTreePosition
-            )
-        }
-    }
-
-    /// Persist a Keystone-produced PCZT signature for a delegation bundle.
-    ///
-    /// `sig` must be exactly 64 bytes; `sighash` and `randomizedKey` must each
-    /// be exactly 32 bytes (matches the Rust-side validation).
-    public func storeKeystoneSignature(
-        roundId: String,
-        bundleIndex: UInt32,
-        sig: [UInt8],
-        sighash: [UInt8],
-        randomizedKey: [UInt8]
-    ) throws {
-        guard sig.count == votingSpendAuthSignatureByteCount else {
-            throw VotingRustBackendError.invalidData(
-                "sig must be exactly \(votingSpendAuthSignatureByteCount) bytes"
-            )
-        }
-        guard sighash.count == votingPcztSighashByteCount else {
-            throw VotingRustBackendError.invalidData(
-                "sighash must be exactly \(votingPcztSighashByteCount) bytes"
-            )
-        }
-        guard randomizedKey.count == votingRandomizedKeyByteCount else {
-            throw VotingRustBackendError.invalidData(
-                "randomizedKey must be exactly \(votingRandomizedKeyByteCount) bytes"
-            )
-        }
-        let roundIdBytes = [UInt8](roundId.utf8)
-        try withHandle { dbh in
-            let result = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                sig.withUnsafeBufferPointer { sigBuf in
-                    sighash.withUnsafeBufferPointer { shBuf in
-                        randomizedKey.withUnsafeBufferPointer { rkBuf in
-                            zcashlc_voting_store_keystone_signature(
-                                dbh,
-                                ridBuf.baseAddress,
-                                UInt(ridBuf.count),
-                                bundleIndex,
-                                sigBuf.baseAddress,
-                                UInt(sigBuf.count),
-                                shBuf.baseAddress,
-                                UInt(shBuf.count),
-                                rkBuf.baseAddress,
-                                UInt(rkBuf.count)
-                            )
-                        }
-                    }
-                }
-            }
-            guard result == 0 else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`store_keystone_signature` failed")
-                )
-            }
-        }
-    }
-
-    /// Load all Keystone signatures stored for a round, in storage order.
-    public func getKeystoneSignatures(roundId: String) throws -> [VotingKeystoneSignatureRecord] {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { buf in
-                zcashlc_voting_get_keystone_signatures(dbh, buf.baseAddress, UInt(buf.count))
-            }
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`get_keystone_signatures` failed")
-                )
-            }
-            return ptr
-        }
-        defer { zcashlc_free_boxed_slice(ptr) }
-        return try decodeJSON(from: ptr)
-    }
-
-    /// Remove all recovery-state rows for a round.
-    public func clearRecoveryState(roundId: String) throws {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        try withHandle { dbh in
-            let result = roundIdBytes.withUnsafeBufferPointer { buf in
-                zcashlc_voting_clear_recovery_state(dbh, buf.baseAddress, UInt(buf.count))
-            }
-            guard result == 0 else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`clear_recovery_state` failed")
-                )
-            }
-        }
-    }
-
-    /// Clears the round's cached vote tree and locally prepared UNSIGNED
-    /// delegation setup fields so an interrupted Keystone signing request can
-    /// be rebuilt; bundles with a Keystone signature, a stored delegation tx
-    /// hash, or a recorded VAN position are preserved.
-    ///
-    /// This is the safe per-round cleanup for resuming an interrupted voting
-    /// session — unlike `clearRound`, it never destroys delegation material an
-    /// on-chain registration may depend on.
-    ///
-    /// - Throws: ``VotingRustBackendError/invalidData`` if `roundId` is empty.
-    ///   This wrapper rejects the empty id up front, matching the FFI, which
-    ///   also refuses it rather than resetting every round's cached tree
-    ///   client account-wide.
-    public func resetSessionState(roundId: String) throws {
-        guard !roundId.isEmpty else {
-            throw VotingRustBackendError.invalidData("roundId must not be empty")
-        }
-        let roundIdBytes = [UInt8](roundId.utf8)
-        try withHandle { dbh in
-            let result = roundIdBytes.withUnsafeBufferPointer { buf in
-                zcashlc_voting_reset_session_state(dbh, buf.baseAddress, UInt(buf.count))
-            }
-            guard result == 0 else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`reset_session_state` failed")
-                )
-            }
-        }
-    }
-}
-
-// MARK: - Share delegation tracking
-
-extension VotingRustBackend {
-    /// Record a share delegation after sending it to helper servers.
-    ///
-    /// The share's nullifier is no longer supplied by the caller: `zcash_voting`
-    /// derives it from the committed vote's recovery state, so a caller cannot
-    /// record a nullifier that disagrees with the share it belongs to. This
-    /// requires the vote to have been committed already.
-    // swiftlint:disable:next function_parameter_count
-    public func recordShareDelegation(
-        roundId: String,
-        bundleIndex: UInt32,
-        proposalId: UInt32,
-        shareIndex: UInt32,
-        sentToURLs: [String],
-        submitAt: UInt64
-    ) throws {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        let urlsJson = try JSONEncoder().encode(sentToURLs)
-        let urlsBytes = [UInt8](urlsJson)
-
-        try withHandle { dbh in
-            let result = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                urlsBytes.withUnsafeBufferPointer { urlsBuf in
-                    zcashlc_voting_record_share_delegation(
-                        dbh,
-                        ridBuf.baseAddress,
-                        UInt(ridBuf.count),
-                        bundleIndex,
-                        proposalId,
-                        shareIndex,
-                        urlsBuf.baseAddress,
-                        UInt(urlsBuf.count),
-                        submitAt
-                    )
-                }
-            }
-            guard result == 0 else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`record_share_delegation` failed")
-                )
-            }
-        }
-    }
-
-    /// Read all share delegations recorded for a round.
-    public func getShareDelegations(roundId: String) throws -> [VotingShareDelegation] {
-        try fetchShareDelegations(
-            roundId: roundId,
-            fallback: "`get_share_delegations` failed"
-        ) { dbh, ptr, len in
-            zcashlc_voting_get_share_delegations(dbh, ptr, len)
-        }
-    }
-
-    /// Read all share delegations not yet confirmed on chain.
-    public func getUnconfirmedDelegations(roundId: String) throws -> [VotingShareDelegation] {
-        try fetchShareDelegations(
-            roundId: roundId,
-            fallback: "`get_unconfirmed_delegations` failed"
-        ) { dbh, ptr, len in
-            zcashlc_voting_get_unconfirmed_delegations(dbh, ptr, len)
-        }
-    }
-
-    /// Mark a previously-recorded share delegation as confirmed on chain.
-    public func markShareConfirmed(
-        roundId: String,
-        bundleIndex: UInt32,
-        proposalId: UInt32,
-        shareIndex: UInt32
-    ) throws {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        try withHandle { dbh in
-            let result = roundIdBytes.withUnsafeBufferPointer { buf in
-                zcashlc_voting_mark_share_confirmed(
-                    dbh,
-                    buf.baseAddress,
-                    UInt(buf.count),
-                    bundleIndex,
-                    proposalId,
-                    shareIndex
-                )
-            }
-            guard result == 0 else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`mark_share_confirmed` failed")
-                )
-            }
-        }
-    }
-
-    /// Append additional helper-server URLs to an existing share delegation's
-    /// `sent_to_urls` set.
-    public func addSentServers(
-        roundId: String,
-        bundleIndex: UInt32,
-        proposalId: UInt32,
-        shareIndex: UInt32,
-        newURLs: [String]
-    ) throws {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        let urlsJson = try JSONEncoder().encode(newURLs)
-        let urlsBytes = [UInt8](urlsJson)
-        try withHandle { dbh in
-            let result = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                urlsBytes.withUnsafeBufferPointer { urlsBuf in
-                    zcashlc_voting_add_sent_servers(
-                        dbh,
-                        ridBuf.baseAddress,
-                        UInt(ridBuf.count),
-                        bundleIndex,
-                        proposalId,
-                        shareIndex,
-                        urlsBuf.baseAddress,
-                        UInt(urlsBuf.count)
-                    )
-                }
-            }
-            guard result == 0 else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`add_sent_servers` failed")
-                )
-            }
-        }
-    }
-}
-
-// MARK: - Delegation workflow
+// MARK: - Hotkeys
 
 extension VotingRustBackend {
     /// Generate a new voting hotkey for `networkId`.
@@ -1528,9 +554,7 @@ extension VotingRustBackend {
     /// with the same care as any other key material.
     public static func generateHotkey(networkId: UInt32) throws -> VotingHotkey {
         guard let ptr = zcashlc_voting_generate_hotkey(networkId) else {
-            throw VotingRustBackendError.rustError(
-                staticLastErrorMessage(fallback: "`generate_hotkey` failed")
-            )
+            throw votingError(fallback: "`generate_hotkey` failed")
         }
         defer { zcashlc_voting_free_hotkey(ptr) }
         return votingHotkey(from: ptr)
@@ -1546,44 +570,10 @@ extension VotingRustBackend {
             zcashlc_voting_hotkey_from_stored_secret(buffer.baseAddress, UInt(buffer.count), networkId)
         }
         guard let ptr else {
-            throw VotingRustBackendError.rustError(
-                staticLastErrorMessage(fallback: "`hotkey_from_stored_secret` failed")
-            )
+            throw votingError(fallback: "`hotkey_from_stored_secret` failed")
         }
         defer { zcashlc_voting_free_hotkey(ptr) }
         return votingHotkey(from: ptr)
-    }
-
-    /// The VAN commitment `hotkey`, `roundId`, `totalNoteValue` and
-    /// `vanCommRand` open. It is the value `restoreRecoveredDelegation`
-    /// recomputes for each bundle before it clears anything, so a caller can
-    /// check a recovered row the same way.
-    public static func vanCommitment(
-        hotkey: VotingHotkey,
-        networkId: UInt32,
-        roundId: String,
-        totalNoteValue: UInt64,
-        vanCommRand: [UInt8]
-    ) throws -> [UInt8] {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        return try staticBoxedSliceFFI(fallback: "`van_commitment` failed") {
-            hotkey.storedSecret.withUnsafeBufferPointer { secret in
-                roundIdBytes.withUnsafeBufferPointer { round in
-                    vanCommRand.withUnsafeBufferPointer { rand in
-                        zcashlc_voting_van_commitment(
-                            secret.baseAddress,
-                            UInt(secret.count),
-                            networkId,
-                            round.baseAddress,
-                            UInt(round.count),
-                            totalNoteValue,
-                            rand.baseAddress,
-                            UInt(rand.count)
-                        )
-                    }
-                }
-            }
-        }
     }
 
     /// Copies an `FfiVotingHotkey` into Swift-owned memory. The caller frees
@@ -1599,568 +589,116 @@ extension VotingRustBackend {
             addressIndex: raw.address_index
         )
     }
+}
 
-    /// Setup vote bundles for a round.
-    public func setupBundles(
-        roundId: String,
-        notes: [VotingNoteInfo]
-    ) throws -> VotingBundleSetupResult {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        let notesJson = try JSONEncoder().encode(notes)
-        let notesBytes = [UInt8](notesJson)
+// MARK: - FFI call helpers
 
-        let ptr: UnsafeMutablePointer<FfiBundleSetupResult> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiBundleSetupResult>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                notesBytes.withUnsafeBufferPointer { notesBuf in
-                    zcashlc_voting_setup_bundles(
-                        dbh,
-                        ridBuf.baseAddress,
-                        UInt(ridBuf.count),
-                        notesBuf.baseAddress,
-                        UInt(notesBuf.count)
-                    )
-                }
-            }
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`setup_bundles` failed")
-                )
-            }
-            return ptr
-        }
-        defer { zcashlc_voting_free_bundle_setup_result(ptr) }
-
-        let raw = ptr.pointee
-        return VotingBundleSetupResult(
-            bundleCount: raw.bundle_count,
-            eligibleWeight: raw.eligible_weight,
-            droppedCount: raw.dropped_count
-        )
+/// Shared by ``VotingRoundSession``, which makes the same three kinds of call
+/// against a session handle.
+///
+/// Each helper reads the last-error slot in the same synchronous scope as the
+/// failing call, because the FFI records errors per thread: a message read
+/// after a thread hop is another thread's slot, which is empty.
+extension VotingRustBackend {
+    /// The typed error the FFI left behind, or `fallback` as a plain
+    /// ``VotingErrorKind/other`` when it left nothing decodable.
+    static func votingError(fallback: String) -> VotingError {
+        VotingError.fromLastErrorMessage(lastErrorMessage(fallback: fallback))
     }
 
-    /// Number of vote bundles persisted for a round, or 0 if the round is unknown.
-    public func getBundleCount(roundId: String) throws -> UInt32 {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        return try withHandle { dbh in
-            let count = roundIdBytes.withUnsafeBufferPointer { buf in
-                zcashlc_voting_get_bundle_count(dbh, buf.baseAddress, UInt(buf.count))
-            }
-            guard count >= 0 else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`get_bundle_count` failed")
-                )
-            }
-            return UInt32(count)
-        }
-    }
-
-    /// Build the voting PCZT for a bundle.
-    public func buildPczt(_ params: VotingBuildPcztParams) throws -> VotingPczt {
-        let keys = params.keys
-        guard keys.seedFingerprint.count == votingSeedFingerprintByteCount else {
-            throw VotingRustBackendError.invalidData(
-                "seedFingerprint must be exactly \(votingSeedFingerprintByteCount) bytes"
-            )
-        }
-
-        let roundIdBytes = [UInt8](params.roundId.utf8)
-        let notesJson = try JSONEncoder().encode(params.notes)
-        let notesBytes = [UInt8](notesJson)
-        let roundNameBytes = [UInt8](keys.roundName.utf8)
-
-        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                notesBytes.withUnsafeBufferPointer { notesBuf in
-                    keys.fvk.withUnsafeBufferPointer { fvkBuf in
-                        keys.hotkeyStoredSecret.withUnsafeBufferPointer { secretBuf in
-                            keys.seedFingerprint.withUnsafeBufferPointer { fpBuf in
-                                roundNameBytes.withUnsafeBufferPointer { nameBuf in
-                                    zcashlc_voting_build_pczt(
-                                        dbh,
-                                        ridBuf.baseAddress,
-                                        UInt(ridBuf.count),
-                                        params.bundleIndex,
-                                        notesBuf.baseAddress,
-                                        UInt(notesBuf.count),
-                                        fvkBuf.baseAddress,
-                                        UInt(fvkBuf.count),
-                                        secretBuf.baseAddress,
-                                        UInt(secretBuf.count),
-                                        params.consensusBranchId,
-                                        fpBuf.baseAddress,
-                                        UInt(fpBuf.count),
-                                        keys.accountIndex,
-                                        nameBuf.baseAddress,
-                                        UInt(nameBuf.count)
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(lastErrorMessage(fallback: "`build_pczt` failed"))
-            }
-            return ptr
+    /// Calls an FFI that answers with JSON in a boxed slice, decoding it and
+    /// freeing the slice. A null answer is the error signal.
+    ///
+    /// A payload that does not decode is this SDK disagreeing with the crate
+    /// about a shape, which is reported as ``VotingErrorKind/internal`` rather
+    /// than as a bare `DecodingError`: the whole voting surface then throws
+    /// either a ``VotingError`` or a ``VotingRustBackendError``, and a host has
+    /// two things to catch instead of three.
+    static func decodingJSON<T: Decodable>(
+        fallback: String,
+        _ call: () -> UnsafeMutablePointer<FfiBoxedSlice>?
+    ) throws -> T {
+        guard let ptr = call() else {
+            throw votingError(fallback: fallback)
         }
         defer { zcashlc_free_boxed_slice(ptr) }
-        return try decodeJSON(from: ptr)
-    }
 
-    /// Persist a `TreeState` blob keyed by round ID, for later witness generation.
-    public func storeTreeState(roundId: String, treeState: [UInt8]) throws {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        try withHandle { dbh in
-            let result = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                treeState.withUnsafeBufferPointer { tsBuf in
-                    zcashlc_voting_store_tree_state(
-                        dbh,
-                        ridBuf.baseAddress,
-                        UInt(ridBuf.count),
-                        tsBuf.baseAddress,
-                        UInt(tsBuf.count)
-                    )
-                }
-            }
-            guard result == 0 else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`store_tree_state` failed")
-                )
-            }
+        let data = boxedSliceData(ptr)
+        do {
+            return try JSONDecoder().decode(T.self, from: data)
+        } catch {
+            throw VotingError(
+                kind: .internal,
+                message: "the voting FFI answered with something that is not a \(T.self) (\(fallback)): \(error)"
+            )
         }
     }
 
-    /// Sign one delegation bundle's PCZT sighash with this account's own Orchard
-    /// SpendAuth key.
-    ///
-    /// `zcash_voting` 2.0 stopped deriving account keys and signing for its
-    /// callers, and prescribes this replacement for software wallets: load the
-    /// bundle's signing request (account index, network, seed fingerprint,
-    /// sighash and spend-auth randomizer), derive the account SpendAuth key from
-    /// the wallet seed, randomize it with the randomizer, and sign the sighash.
-    /// All of that happens in Rust — the seed goes in, only the detached
-    /// signature comes back out.
-    ///
-    /// This is the software counterpart of the Keystone flow: there, the device
-    /// produces the signature and the app extracts it from the signed PCZT; here
-    /// the wallet produces it itself. Both then call the same
-    /// ``getDelegationSubmission(roundId:bundleIndex:signature:sighash:)``,
-    /// which is the only remaining path into a submission payload.
-    ///
-    /// - Parameters:
-    ///   - keys: the same ``VotingDelegationKeyInputs`` used to build and prove
-    ///     this bundle. The crate loads the signing request through them, so a
-    ///     different account index, hotkey secret or seed fingerprint fails
-    ///     instead of silently signing for the wrong account.
-    ///   - seed: the wallet's root seed, at least 32 bytes. It is borrowed for
-    ///     the duration of this call, is never persisted or logged, and must be
-    ///     the seed whose fingerprint is in `keys` — a mismatch throws rather
-    ///     than producing a signature the chain would reject.
-    /// - Returns: the detached 64-byte SpendAuth signature and the 32-byte
-    ///   ZIP-244 sighash it covers. Pass both to `getDelegationSubmission`
-    ///   unchanged.
-    /// - Throws: ``VotingRustBackendError/databaseNotOpen`` if no database is
-    ///   open; ``VotingRustBackendError/invalidData`` if `seed` or the seed
-    ///   fingerprint is the wrong length; ``VotingRustBackendError/rustError``
-    ///   if the bundle has no stored signing request yet (its PCZT setup has not
-    ///   run), or the seed does not match the request.
-    public func signDelegationRequest(
-        roundId: String,
-        bundleIndex: UInt32,
-        keys: VotingDelegationKeyInputs,
-        seed: [UInt8]
-    ) throws -> VotingDelegationSignature {
-        guard keys.seedFingerprint.count == votingSeedFingerprintByteCount else {
-            throw VotingRustBackendError.invalidData(
-                "seedFingerprint must be exactly \(votingSeedFingerprintByteCount) bytes"
-            )
-        }
-        guard seed.count >= votingMinSeedByteCount else {
-            throw VotingRustBackendError.invalidData(
-                "seed must be at least \(votingMinSeedByteCount) bytes"
-            )
-        }
-
-        let roundIdBytes = [UInt8](roundId.utf8)
-        let roundNameBytes = [UInt8](keys.roundName.utf8)
-
-        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                keys.fvk.withUnsafeBufferPointer { fvkBuf in
-                    keys.hotkeyStoredSecret.withUnsafeBufferPointer { secretBuf in
-                        keys.seedFingerprint.withUnsafeBufferPointer { fpBuf in
-                            roundNameBytes.withUnsafeBufferPointer { nameBuf in
-                                seed.withUnsafeBufferPointer { seedBuf in
-                                    zcashlc_voting_sign_delegation_request(
-                                        dbh,
-                                        ridBuf.baseAddress,
-                                        UInt(ridBuf.count),
-                                        bundleIndex,
-                                        fvkBuf.baseAddress,
-                                        UInt(fvkBuf.count),
-                                        secretBuf.baseAddress,
-                                        UInt(secretBuf.count),
-                                        fpBuf.baseAddress,
-                                        UInt(fpBuf.count),
-                                        keys.accountIndex,
-                                        nameBuf.baseAddress,
-                                        UInt(nameBuf.count),
-                                        seedBuf.baseAddress,
-                                        UInt(seedBuf.count)
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`sign_delegation_request` failed")
-                )
-            }
-            return ptr
+    /// Calls an FFI that answers with raw bytes in a boxed slice, copying them
+    /// into Swift-owned memory and freeing the slice.
+    static func readingBytes(
+        fallback: String,
+        _ call: () -> UnsafeMutablePointer<FfiBoxedSlice>?
+    ) throws -> [UInt8] {
+        guard let ptr = call() else {
+            throw votingError(fallback: fallback)
         }
         defer { zcashlc_free_boxed_slice(ptr) }
-        return try decodeJSON(from: ptr)
+        return [UInt8](boxedSliceData(ptr))
     }
 
-    /// Keyless readback of the stored ZIP-244 sighash of the bundle's
-    /// persisted delegation PCZT, scoped to the open wallet.
+    /// The bytes a boxed slice carries.
     ///
-    /// Used to verify a persisted Keystone signature still matches the
-    /// bundle's delegation data before trusting it.
-    ///
-    /// - Returns: the 32-byte ZIP-244 sighash. Pass it to
-    ///   ``getDelegationSubmission(roundId:bundleIndex:signature:sighash:)``
-    ///   alongside the matching signature, exactly as
-    ///   ``VotingDelegationSignature/sighash`` is.
-    /// - Throws: ``VotingRustBackendError/databaseNotOpen`` if no database is
-    ///   open; ``VotingRustBackendError/rustError`` if delegation setup is
-    ///   incomplete for the bundle (its PCZT setup has not run, or a later
-    ///   step wiped the stored sighash); ``VotingRustBackendError/invalidData``
-    ///   if the returned sighash is not exactly 32 bytes.
-    public func getStoredPcztSighash(roundId: String, bundleIndex: UInt32) throws -> [UInt8] {
-        let roundIdBytes = [UInt8](roundId.utf8)
-
-        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { buf in
-                zcashlc_voting_get_stored_pczt_sighash(
-                    dbh,
-                    buf.baseAddress,
-                    UInt(buf.count),
-                    bundleIndex
-                )
-            }
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`get_stored_pczt_sighash` failed")
-                )
-            }
-            return ptr
-        }
-        defer { zcashlc_free_boxed_slice(ptr) }
-        let bytes: [UInt8] = try decodeJSON(from: ptr)
-        guard bytes.count == votingPcztSighashByteCount else {
-            throw VotingRustBackendError.invalidData(
-                "sighash must be exactly \(votingPcztSighashByteCount) bytes"
-            )
-        }
-        return bytes
+    /// The FFI is allowed to answer with a null pointer when the length is
+    /// zero, and `Data(bytes:count:)` will not take one, so that case is read
+    /// as what it means: no bytes. An empty answer where JSON was expected then
+    /// surfaces as the typed decode failure rather than as a trap.
+    static func boxedSliceData(_ ptr: UnsafeMutablePointer<FfiBoxedSlice>) -> Data {
+        guard let bytes = ptr.pointee.ptr, ptr.pointee.len > 0 else { return Data() }
+        return Data(bytes: bytes, count: Int(ptr.pointee.len))
     }
 
-    /// Deletes one bundle's persisted Keystone signature, so the bundle
-    /// becomes eligible again for ``resetSessionState(roundId:)``'s guarded
-    /// cleanup, which otherwise leaves bundles with a stored Keystone
-    /// signature untouched.
+    /// Encodes one FFI argument as JSON.
     ///
-    /// Deleting a missing row succeeds.
-    ///
-    /// - Throws: ``VotingRustBackendError/databaseNotOpen`` if no database is
-    ///   open; ``VotingRustBackendError/rustError`` if the underlying delete
-    ///   fails.
-    public func clearKeystoneSignature(roundId: String, bundleIndex: UInt32) throws {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        try withHandle { dbh in
-            let result = roundIdBytes.withUnsafeBufferPointer { buf in
-                zcashlc_voting_clear_keystone_signature(
-                    dbh,
-                    buf.baseAddress,
-                    UInt(buf.count),
-                    bundleIndex
-                )
-            }
-            guard result == 0 else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`clear_keystone_signature` failed")
-                )
-            }
+    /// The wire types encode without failing, so a throw here is a programming
+    /// error rather than something a voter can cause — it is reported as
+    /// invalid input all the same, because that is what the crate would say
+    /// about the bytes that did cross.
+    static func encodeJSON<T: Encodable>(_ value: T, describing what: String) throws -> [UInt8] {
+        do {
+            return [UInt8](try JSONEncoder().encode(value))
+        } catch {
+            throw VotingError(kind: .invalidInput, message: "\(what) could not be encoded: \(error)")
         }
     }
+}
 
-    /// Get the delegation submission payload for an externally produced
-    /// signature.
-    ///
-    /// This is the only remaining path: `zcash_voting` no longer derives account
-    /// keys or signs on the caller's behalf, so the SpendAuth signature and the
-    /// ZIP-244 sighash must come from the wallet's signer — whether that signer
-    /// is a Keystone device or the wallet itself.
-    ///
-    /// `signature` must be exactly 64 bytes; `sighash` must be exactly 32 bytes.
-    public func getDelegationSubmission(
-        roundId: String,
-        bundleIndex: UInt32,
-        signature: [UInt8],
-        sighash: [UInt8]
-    ) throws -> VotingDelegationSubmission {
-        guard signature.count == votingSpendAuthSignatureByteCount else {
-            throw VotingRustBackendError.invalidData(
-                "signature must be exactly \(votingSpendAuthSignatureByteCount) bytes"
-            )
-        }
-        guard sighash.count == votingPcztSighashByteCount else {
-            throw VotingRustBackendError.invalidData(
-                "sighash must be exactly \(votingPcztSighashByteCount) bytes"
-            )
-        }
-        let roundIdBytes = [UInt8](roundId.utf8)
+// MARK: - Blocking calls
 
-        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                signature.withUnsafeBufferPointer { sigBuf in
-                    sighash.withUnsafeBufferPointer { shBuf in
-                        zcashlc_voting_get_delegation_submission_with_signature(
-                            dbh,
-                            ridBuf.baseAddress,
-                            UInt(ridBuf.count),
-                            bundleIndex,
-                            sigBuf.baseAddress,
-                            UInt(sigBuf.count),
-                            shBuf.baseAddress,
-                            UInt(shBuf.count)
-                        )
-                    }
-                }
-            }
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(
-                        fallback: "`get_delegation_submission_with_signature` failed"
-                    )
-                )
-            }
-            return ptr
-        }
-        defer { zcashlc_free_boxed_slice(ptr) }
-        return try decodeJSON(from: ptr)
+/// Internal to the SDK: the seam the one blocking store call runs through, and
+/// what the tests over the handle's lifetime read.
+extension VotingRustBackend {
+    /// Runs `body` on the voting surface's own threads, registered as in
+    /// flight, without holding the lock while it runs.
+    ///
+    /// A ``close()`` during the call parks the handle rather than freeing it,
+    /// and this is what frees it when the last such call returns.
+    func runBlocking<T: Sendable>(_ body: @escaping @Sendable (OpaquePointer) throws -> T) async throws -> T {
+        let (dbh, ticket) = try startCall()
+        defer { freeHandlesNoCallIsUsing() }
+
+        return try await calls.run(ticket: ticket) { try body(dbh) }
     }
 
-    /// Persist the VAN leaf position after delegation transaction confirmation.
-    public func storeVanPosition(
-        roundId: String,
-        bundleIndex: UInt32,
-        position: UInt32
-    ) throws {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        try withHandle { dbh in
-            let result = roundIdBytes.withUnsafeBufferPointer { buf in
-                zcashlc_voting_store_van_position(
-                    dbh,
-                    buf.baseAddress,
-                    UInt(buf.count),
-                    bundleIndex,
-                    position
-                )
-            }
-            guard result == 0 else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`store_van_position` failed")
-                )
-            }
-        }
-    }
-
-    /// Build and prove the real delegation ZKP for a bundle. Long-running.
+    /// How many handles a ``close()`` has parked for a call still using them.
     ///
-    /// `progress` is invoked with values in `0.0...1.0` from the proving thread.
-    /// The closure must be thread-safe; it may be called concurrently with the
-    /// returned `Task`'s actor and is bridged through a `@convention(c)`
-    /// trampoline. The closure is retained for the duration of the call only.
-    ///
-    /// Do not call back into this `VotingRustBackend` from `progress`. Rust may
-    /// invoke the callback while the database-handle lock is held, so re-entering
-    /// this backend can deadlock.
-    ///
-    /// Holds the interactive proving QoS boost while the proof itself runs.
-    ///
-    /// Cancellation (MOB-1860): a caller that cancels while the PIR
-    /// servers are still being probed — or in the brief window between
-    /// resolution finishing and the detached proving call being scheduled —
-    /// never reaches the FFI at all. `PirSnapshotResolver.resolve` and this
-    /// method both check for cancellation before that point and throw
-    /// `CancellationError` instead of starting the proof. Once the FFI has
-    /// actually been entered, though, nothing here can interrupt it: the
-    /// underlying `zcashlc_voting_build_and_prove_delegation` call is
-    /// synchronous and non-cooperative, and runs to completion regardless of
-    /// later cancellation. That limitation is inherent to the FFI boundary, not
-    /// something this method closes.
-    public func buildAndProveDelegation(
-        _ params: VotingDelegationProofParams,
-        pirEndpoints: [String],
-        expectedSnapshotHeight: UInt64,
-        pirLayout: VotingPirLayout = .unknown,
-        pirResolver: PirSnapshotResolver = PirSnapshotResolver(),
-        progress: (@Sendable (Double) -> Void)? = nil
-    ) async throws -> VotingDelegationProofResult {
-        try await buildAndProveDelegation(
-            params,
-            pirEndpoints: pirEndpoints,
-            expectedSnapshotHeight: expectedSnapshotHeight,
-            pirLayout: pirLayout,
-            pirResolver: pirResolver,
-            progress: progress,
-            // A closure literal, not the bare `syncBuildAndProveDelegation` method reference: a
-            // bound instance-method value is not inferred `@Sendable` even though `self` is
-            // `@unchecked Sendable`, which would otherwise warn on every call.
-            proveEntry: { [self] proveParams, url, layout, proveProgress in
-                try syncBuildAndProveDelegation(
-                    proveParams,
-                    pirServerUrl: url,
-                    pirLayout: layout,
-                    progress: proveProgress
-                )
-            }
-        )
-    }
-
-    /// Test seam for the method above (MOB-1860). `proveEntry` stands
-    /// in for the FFI entry point (`syncBuildAndProveDelegation` in production)
-    /// so a test can observe whether it was reached — and control what it
-    /// returns or throws — without paying for the real, potentially
-    /// minutes-long proof.
-    ///
-    /// `proveEntry` has no default value: Swift does not allow a method's
-    /// default argument to reference another instance member, so the public
-    /// overload above supplies `syncBuildAndProveDelegation` explicitly on
-    /// every call instead of defaulting to it here.
-    func buildAndProveDelegation(
-        _ params: VotingDelegationProofParams,
-        pirEndpoints: [String],
-        expectedSnapshotHeight: UInt64,
-        pirLayout: VotingPirLayout = .unknown,
-        pirResolver: PirSnapshotResolver = PirSnapshotResolver(),
-        progress: (@Sendable (Double) -> Void)? = nil,
-        proveEntry: @escaping @Sendable (
-            VotingDelegationProofParams,
-            String,
-            VotingPirLayout,
-            (@Sendable (Double) -> Void)?
-        ) throws -> VotingDelegationProofResult
-    ) async throws -> VotingDelegationProofResult {
-        try requireOpenDatabase()
-
-        guard params.keys.seedFingerprint.count == votingSeedFingerprintByteCount else {
-            throw VotingRustBackendError.invalidData(
-                "seedFingerprint must be exactly \(votingSeedFingerprintByteCount) bytes"
-            )
-        }
-
-        let pirServerUrl = try await pirResolver.resolve(
-            endpoints: pirEndpoints,
-            expectedSnapshotHeight: BlockHeight(expectedSnapshotHeight)
-        )
-
-        // `resolve` above already refuses to return a match once cancelled, but a cancellation
-        // that lands in the instant between `resolve` returning and this check still needs to be
-        // caught here, before the detached proving call below can be scheduled at all.
-        try Task.checkCancellation()
-
-        let cancellationFlag = CancellationFlag()
-
-        // The proving FFI can run for minutes; detach so we do not block the
-        // caller's executor for the full duration. `VotingRustBackend` is
-        // `@unchecked Sendable`, the lock keeps `withHandle` correct, and
-        // `notes`/byte arrays cross the boundary by value.
-        //
-        // `withTaskCancellationHandler` closes the remaining race: a cancellation that lands after
-        // the check above but before the detached closure runs sets `cancellationFlag`, which the
-        // closure consults before calling `proveEntry`. Once `proveEntry` has been entered, nothing
-        // here can interrupt it — see this method's doc comment for why.
-        return try await withTaskCancellationHandler {
-            try await Self.withInteractiveProvingBoost {
-                try await Task.detached(priority: .userInitiated) {
-                    if cancellationFlag.isCancelled {
-                        throw CancellationError()
-                    }
-                    return try proveEntry(params, pirServerUrl, pirLayout, progress)
-                }.value
-            }
-        } onCancel: {
-            cancellationFlag.markCancelled()
-        }
-    }
-
-    /// Validate a PIR-fetched IMT non-membership proof bytewise.
-    ///
-    /// Returns `true` if the proof is well-formed and valid, `false` if it is
-    /// well-formed but invalid. Throws `.invalidData` for length mismatches and
-    /// `.rustError` if the underlying validation panics.
-    public static func validatePirProof(_ proof: VotingPirProof) throws -> Bool {
-        guard proof.root.count == votingPirRootByteCount else {
-            throw VotingRustBackendError.invalidData(
-                "root must be exactly \(votingPirRootByteCount) bytes"
-            )
-        }
-        guard proof.nfBounds.count == votingPirNullifierBoundsByteCount else {
-            throw VotingRustBackendError.invalidData(
-                "nfBounds must be exactly \(votingPirNullifierBoundsByteCount) bytes"
-            )
-        }
-        let pirPathDescription = "\(votingPirPathElementCount) * \(votingPirRootByteCount)"
-        guard proof.path.count == votingPirPathByteCount else {
-            throw VotingRustBackendError.invalidData(
-                "path must be exactly \(votingPirPathByteCount) bytes (\(pirPathDescription))"
-            )
-        }
-        guard proof.nullifier.count == votingPirNullifierByteCount else {
-            throw VotingRustBackendError.invalidData(
-                "nullifier must be exactly \(votingPirNullifierByteCount) bytes"
-            )
-        }
-        guard proof.expectedRoot.count == votingPirRootByteCount else {
-            throw VotingRustBackendError.invalidData(
-                "expectedRoot must be exactly \(votingPirRootByteCount) bytes"
-            )
-        }
-
-        let result = proof.root.withUnsafeBufferPointer { rootBuf in
-            proof.nfBounds.withUnsafeBufferPointer { boundsBuf in
-                proof.path.withUnsafeBufferPointer { pathBuf in
-                    proof.nullifier.withUnsafeBufferPointer { nfBuf in
-                        proof.expectedRoot.withUnsafeBufferPointer { expBuf in
-                            zcashlc_voting_validate_pir_proof(
-                                rootBuf.baseAddress,
-                                boundsBuf.baseAddress,
-                                proof.leafPosition,
-                                pathBuf.baseAddress,
-                                nfBuf.baseAddress,
-                                expBuf.baseAddress
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        switch result {
-        case 1: return true
-        case 0: return false
-        default:
-            throw VotingRustBackendError.rustError(
-                staticLastErrorMessage(fallback: "`validate_pir_proof` failed")
-            )
-        }
+    /// Zero in a quiet backend, and zero again once the last of those calls has
+    /// returned. Read by the tests that prove a second close does not lose the
+    /// first one's handle.
+    var parkedHandleCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return handlesAwaitingFree.count
     }
 }
 
@@ -2179,300 +717,72 @@ private extension VotingRustBackend {
         return try operation(dbh)
     }
 
-    func requireOpenDatabase() throws {
+    /// ``withHandle(_:)`` with `roundId`'s UTF-8 bytes in scope.
+    func withRoundId<T>(
+        _ roundId: String,
+        _ operation: (OpaquePointer, UnsafePointer<UInt8>?, UInt) throws -> T
+    ) throws -> T {
+        let bytes = [UInt8](roundId.utf8)
+        return try withHandle { dbh in
+            try bytes.withUnsafeBufferPointer { buffer in
+                try operation(dbh, buffer.baseAddress, UInt(buffer.count))
+            }
+        }
+    }
+
+    /// ``withRoundId(_:_:)`` for the calls that also take a byte argument.
+    func withRoundId<T>(
+        _ roundId: String,
+        bytes: [UInt8],
+        _ operation: (OpaquePointer, UnsafePointer<UInt8>?, UInt, UnsafePointer<UInt8>?, UInt) throws -> T
+    ) throws -> T {
+        try withRoundId(roundId) { dbh, id, idLen in
+            try bytes.withUnsafeBufferPointer { buffer in
+                try operation(dbh, id, idLen, buffer.baseAddress, UInt(buffer.count))
+            }
+        }
+    }
+
+    /// Reads the handle and registers the call under one lock hold, so a call
+    /// either registers before ``close()`` decides whether it may free the
+    /// handle or is refused as closed: there is no window where a call starts
+    /// against a handle that is about to be freed.
+    ///
+    /// Synchronous, because that is what taking a lock around a few field reads
+    /// should be: an `async` function may not hold an `NSLock` across a suspension.
+    func startCall() throws -> (OpaquePointer, UUID) {
         lock.lock()
         defer { lock.unlock() }
 
-        guard handle != nil else {
+        guard let dbh = handle else {
             throw VotingRustBackendError.databaseNotOpen
         }
+        return (dbh, calls.register())
     }
 
-    func lastErrorMessage(fallback: String) -> String {
-        Self.staticLastErrorMessage(fallback: fallback)
-    }
+    /// Frees the handles a ``close()`` left behind, once the last call that
+    /// could still have been using one has returned.
+    func freeHandlesNoCallIsUsing() {
+        lock.lock()
+        defer { lock.unlock() }
 
-    func decodeJSON<T: Decodable>(from ptr: UnsafeMutablePointer<FfiBoxedSlice>) throws -> T {
-        let data = Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
-        return try JSONDecoder().decode(T.self, from: data)
-    }
+        guard calls.isIdle, !handlesAwaitingFree.isEmpty else { return }
 
-    /// Synchronous body of `commitVote`. Runs inside `Task.detached` so proving
-    /// does not block the caller's executor.
-    func syncCommitVote(
-        _ draft: VoteCommitDraft,
-        progress: (@Sendable (Double) -> Void)?
-    ) throws -> VotingVoteCommit {
-        let roundIdBytes = [UInt8](draft.roundId.utf8)
-        let authPathJson = try JSONEncoder().encode(draft.vanWitness.authPath)
-        let authPathBytes = [UInt8](authPathJson)
-
-        let progressBox = progress.map(VotingProgressBox.init(report:))
-        let progressContext = progressBox.map { Unmanaged.passRetained($0).toOpaque() }
-        defer {
-            if let progressContext {
-                Unmanaged<VotingProgressBox>.fromOpaque(progressContext).release()
-            }
+        for parked in handlesAwaitingFree {
+            zcashlc_voting_db_free(parked)
         }
-        let trampoline: VotingProgressCallback? = progressBox == nil ? nil : votingProgressCallbackTrampoline
-
-        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                draft.hotkeyStoredSecret.withUnsafeBufferPointer { secretBuf in
-                    authPathBytes.withUnsafeBufferPointer { pathBuf in
-                        zcashlc_voting_commit_vote(
-                            dbh,
-                            ridBuf.baseAddress,
-                            UInt(ridBuf.count),
-                            draft.bundleIndex,
-                            secretBuf.baseAddress,
-                            UInt(secretBuf.count),
-                            draft.proposalId,
-                            draft.choice,
-                            draft.numOptions,
-                            draft.voteCommitmentTreePosition,
-                            pathBuf.baseAddress,
-                            UInt(pathBuf.count),
-                            draft.vanWitness.position,
-                            draft.vanWitness.anchorHeight,
-                            trampoline,
-                            progressContext,
-                            draft.singleShare ? 1 : 0
-                        )
-                    }
-                }
-            }
-
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`commit_vote` failed")
-                )
-            }
-            return ptr
-        }
-        defer { zcashlc_free_boxed_slice(ptr) }
-        return try decodeJSON(from: ptr)
+        handlesAwaitingFree.removeAll()
     }
 
-    /// Reads the last error recorded by `libzcashlc` and clears it as a side
-    /// effect, so subsequent failures do not surface a stale message.
-    static func staticLastErrorMessage(fallback: String) -> String {
-        let errorLen = zcashlc_last_error_length()
-        defer { zcashlc_clear_last_error() }
+    /// Refuses the empty round id the FFI reads as "every round of this
+    /// wallet".
+    func requireNamedRound(_ roundId: String, calling method: String) throws {
+        guard roundId.isEmpty else { return }
 
-        if errorLen > 0 {
-            let error = UnsafeMutablePointer<Int8>.allocate(capacity: Int(errorLen))
-            defer { error.deallocate() }
-            zcashlc_error_message_utf8(error, errorLen)
-            if let message = String(validatingUTF8: error) {
-                return message
-            }
-        }
-
-        return fallback
-    }
-
-    /// Decode JSON returned by static FFI calls.
-    static func staticDecodeJSON<T: Decodable>(from ptr: UnsafeMutablePointer<FfiBoxedSlice>) throws -> T {
-        let data = Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
-        return try JSONDecoder().decode(T.self, from: data)
-    }
-
-    /// Decode Rust's persisted round phase without silently aliasing unknown values.
-    static func decodeRoundPhase(_ rawValue: UInt32) throws -> VotingRoundPhase {
-        guard let phase = VotingRoundPhase(rawValue: rawValue) else {
-            throw VotingRustBackendError.invalidData("unknown phase \(rawValue)")
-        }
-
-        return phase
-    }
-
-    /// Decode required C strings from Rust, treating null as an invariant violation.
-    static func decodeRequiredCString(
-        _ pointer: UnsafePointer<CChar>?,
-        fieldName: String
-    ) throws -> String {
-        guard let pointer else {
-            throw VotingRustBackendError.invalidData("\(fieldName) must not be null")
-        }
-
-        return String(cString: pointer)
-    }
-
-    /// Calls a static FFI returning `*FfiBoxedSlice` and copies the resulting
-    /// bytes into a Swift `[UInt8]`, freeing the slice in `defer`.
-    static func staticBoxedSliceFFI(
-        fallback: String,
-        _ call: () -> UnsafeMutablePointer<FfiBoxedSlice>?
-    ) throws -> [UInt8] {
-        guard let ptr = call() else {
-            throw VotingRustBackendError.rustError(staticLastErrorMessage(fallback: fallback))
-        }
-        defer { zcashlc_free_boxed_slice(ptr) }
-        return [UInt8](Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len)))
-    }
-
-    /// Read share-delegation records from a DB-bound FFI JSON response.
-    func fetchShareDelegations(
-        roundId: String,
-        fallback: String,
-        _ call: (OpaquePointer, UnsafePointer<UInt8>?, UInt) -> UnsafeMutablePointer<FfiBoxedSlice>?
-    ) throws -> [VotingShareDelegation] {
-        let roundIdBytes = [UInt8](roundId.utf8)
-        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
-            let ptr = roundIdBytes.withUnsafeBufferPointer { buf in
-                call(dbh, buf.baseAddress, UInt(buf.count))
-            }
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(lastErrorMessage(fallback: fallback))
-            }
-            return ptr
-        }
-        defer { zcashlc_free_boxed_slice(ptr) }
-        return try decodeJSON(from: ptr)
-    }
-
-    /// Synchronous body of `buildAndProveDelegation`. Lives on the FFI thread
-    /// inside `Task.detached` so the calling actor is not blocked for the
-    /// duration of proving (potentially minutes).
-    func syncBuildAndProveDelegation(
-        _ params: VotingDelegationProofParams,
-        pirServerUrl: String,
-        pirLayout: VotingPirLayout,
-        progress: (@Sendable (Double) -> Void)?
-    ) throws -> VotingDelegationProofResult {
-        let keys = params.keys
-        let roundIdBytes = [UInt8](params.roundId.utf8)
-        let notesJson = try JSONEncoder().encode(params.notes)
-        let notesBytes = [UInt8](notesJson)
-        let roundNameBytes = [UInt8](keys.roundName.utf8)
-        let urlBytes = [UInt8](pirServerUrl.utf8)
-
-        let progressBox = progress.map(VotingProgressBox.init(report:))
-        let progressContext = progressBox.map { Unmanaged.passRetained($0).toOpaque() }
-        defer {
-            if let progressContext {
-                Unmanaged<VotingProgressBox>.fromOpaque(progressContext).release()
-            }
-        }
-        let trampoline: VotingProgressCallback? = progressBox == nil ? nil : votingProgressCallbackTrampoline
-
-        let ptr: UnsafeMutablePointer<FfiBoxedSlice> = try withHandle { dbh in
-            let ptr: UnsafeMutablePointer<FfiBoxedSlice>? = roundIdBytes.withUnsafeBufferPointer { ridBuf in
-                notesBytes.withUnsafeBufferPointer { notesBuf in
-                    keys.fvk.withUnsafeBufferPointer { fvkBuf in
-                        keys.hotkeyStoredSecret.withUnsafeBufferPointer { secretBuf in
-                            keys.seedFingerprint.withUnsafeBufferPointer { fpBuf in
-                                roundNameBytes.withUnsafeBufferPointer { nameBuf in
-                                    urlBytes.withUnsafeBufferPointer { urlBuf in
-                                        zcashlc_voting_build_and_prove_delegation(
-                                            dbh,
-                                            ridBuf.baseAddress,
-                                            UInt(ridBuf.count),
-                                            params.bundleIndex,
-                                            notesBuf.baseAddress,
-                                            UInt(notesBuf.count),
-                                            fvkBuf.baseAddress,
-                                            UInt(fvkBuf.count),
-                                            secretBuf.baseAddress,
-                                            UInt(secretBuf.count),
-                                            fpBuf.baseAddress,
-                                            UInt(fpBuf.count),
-                                            keys.accountIndex,
-                                            nameBuf.baseAddress,
-                                            UInt(nameBuf.count),
-                                            urlBuf.baseAddress,
-                                            UInt(urlBuf.count),
-                                            pirLayout.pirDepth,
-                                            pirLayout.tier0Layers,
-                                            pirLayout.tier1Layers,
-                                            pirLayout.polyLen,
-                                            trampoline,
-                                            progressContext
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            guard let ptr else {
-                throw VotingRustBackendError.rustError(
-                    lastErrorMessage(fallback: "`build_and_prove_delegation` failed")
-                )
-            }
-            return ptr
-        }
-        defer { zcashlc_free_boxed_slice(ptr) }
-        return try decodeJSON(from: ptr)
-    }
-}
-
-// MARK: - File-private FFI bridges
-
-/// The `commitVote` arguments, grouped so the detached proving body takes a
-/// single `Sendable` value instead of eleven captured parameters.
-///
-/// Conforms to `Undescribable` because `hotkeyStoredSecret` is the voting
-/// hotkey's key material.
-private struct VoteCommitDraft: Sendable, Undescribable {
-    let roundId: String
-    let bundleIndex: UInt32
-    let hotkeyStoredSecret: [UInt8]
-    let proposalId: UInt32
-    let choice: UInt32
-    let numOptions: UInt32
-    let voteCommitmentTreePosition: UInt64
-    let vanWitness: VotingVanWitness
-    let singleShare: Bool
-}
-
-/// JSON wire format for `Option<(String, u64)>` returned by the recovery FFI.
-/// Decodes from a 2-element JSON array `[bundleJson, vcTreePosition]`.
-private struct StoredCommitmentBundleWire: Decodable {
-    let bundleJson: String
-    let voteCommitmentTreePosition: UInt64
-
-    init(from decoder: Decoder) throws {
-        var container = try decoder.unkeyedContainer()
-        bundleJson = try container.decode(String.self)
-        voteCommitmentTreePosition = try container.decode(UInt64.self)
-    }
-}
-
-/// C function-pointer type for the voting proof progress callback.
-private typealias VotingProgressCallback = @convention(c) (Double, UnsafeMutableRawPointer?) -> Void
-
-/// Heap-allocated container that retains the Swift progress closure across the
-/// FFI call so the `@convention(c)` trampoline can recover it from the
-/// `*mut c_void` context pointer.
-private final class VotingProgressBox: @unchecked Sendable {
-    let report: @Sendable (Double) -> Void
-    init(report: @escaping @Sendable (Double) -> Void) {
-        self.report = report
-    }
-}
-
-/// Trampoline matching `VotingProgressCallback`. Passes the progress value to
-/// the Swift closure stored in the `VotingProgressBox` reachable through
-/// `context`.
-private let votingProgressCallbackTrampoline: VotingProgressCallback = { progress, context in
-    guard let context else { return }
-    let box = Unmanaged<VotingProgressBox>.fromOpaque(context).takeUnretainedValue()
-    box.report(progress)
-}
-
-/// Run `body` with the buffer pointer for `bytes` if it is non-nil, otherwise
-/// pass `nil`. Used by FFI calls that take an optional `(ptr, len)` pair.
-private func withOptionalBufferPointer<R>(
-    _ bytes: [UInt8]?,
-    _ body: (UnsafeBufferPointer<UInt8>?) throws -> R
-) rethrows -> R {
-    if let bytes {
-        return try bytes.withUnsafeBufferPointer { try body($0) }
-    } else {
-        return try body(nil)
+        throw VotingError(
+            kind: .invalidInput,
+            message: "\(method) needs a round id; the empty id is the crate's wallet-wide reset"
+        )
     }
 }
 
@@ -2482,13 +792,3 @@ private func bytesFromRawPointer(_ pointer: UnsafeMutablePointer<UInt8>?, count:
     guard let pointer, count > 0 else { return [] }
     return [UInt8](UnsafeBufferPointer(start: pointer, count: count))
 }
-
-#if DEBUG
-extension VotingRustBackend {
-    func withLockedHandleForTesting(_ operation: () -> Void) throws {
-        try withHandle { _ in
-            operation()
-        }
-    }
-}
-#endif

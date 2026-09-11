@@ -307,6 +307,26 @@ extension ClosureSDKSynchronizer: ClosureSynchronizer {
         completion(height)
     }
 
+    // swiftlint:disable:next function_parameter_count
+    public func makeVotingRoundSession(
+        backend: VotingRustBackend,
+        inputs: VotingSessionInputs,
+        binding: VotingSessionBinding,
+        route: VotingTransportRoute,
+        epoch: UInt64,
+        completion: @escaping (Result<VotingRoundSession, Error>) -> Void
+    ) {
+        AsyncToClosureGateway.executeThrowingAction(completion) {
+            try await self.synchronizer.makeVotingRoundSession(
+                backend: backend,
+                inputs: inputs,
+                binding: binding,
+                route: route,
+                epoch: epoch
+            )
+        }
+    }
+
     public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8, completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void) {
         AsyncToClosureGateway.executeThrowingAction(completion) {
             try await self.synchronizer.httpRequestOverTor(for: request, retryLimit: retryLimit)

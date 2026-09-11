@@ -1,11 +1,11 @@
 use anyhow::anyhow;
 use serde::Serialize;
-use zcash_client_sqlite::util::SystemClock;
 use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_voting as voting;
 use zip32::AccountId;
 
 use super::constants::MIN_SEED_LEN;
+use super::errors::{internal, invalid_input};
 use super::ffi_types::FfiVotingHotkey;
 
 // =============================================================================
@@ -30,7 +30,7 @@ pub(super) unsafe fn bytes_from_ptr<'a>(ptr: *const u8, len: usize) -> anyhow::R
         return Ok(&[]);
     }
     if ptr.is_null() {
-        return Err(anyhow!("FFI pointer is null but length is non-zero"));
+        return Err(invalid_input("FFI pointer is null but length is non-zero"));
     }
     Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
@@ -44,51 +44,29 @@ pub(super) unsafe fn bytes_from_ptr<'a>(ptr: *const u8, len: usize) -> anyhow::R
 /// Same contract as `bytes_from_ptr`.
 pub(super) unsafe fn str_from_ptr(ptr: *const u8, len: usize) -> anyhow::Result<String> {
     let bytes = unsafe { bytes_from_ptr(ptr, len) }?;
-    Ok(std::str::from_utf8(bytes)?.to_string())
+    let text = std::str::from_utf8(bytes)
+        .map_err(|e| invalid_input(format!("FFI string is not valid UTF-8: {e}")))?;
+    Ok(text.to_string())
 }
 
 /// Return JSON-serialized bytes as `*mut ffi::BoxedSlice`.
+///
+/// A DTO this crate defines that will not serialize is this crate's fault, not
+/// the host's, so the failure crosses as `internal` rather than `invalid_input`.
 pub(super) fn json_to_boxed_slice<T: Serialize>(
     value: &T,
 ) -> anyhow::Result<*mut crate::ffi::BoxedSlice> {
-    let json = serde_json::to_vec(value)?;
+    let json =
+        serde_json::to_vec(value).map_err(|e| internal(format!("failed to encode JSON: {e}")))?;
     Ok(crate::ffi::BoxedSlice::some(json))
 }
 
-/// Open the wallet database.
+/// Derive the account's unified spending key from `seed`.
 ///
-/// The store is parameterized by `NetworkParams` rather than `Network` so that a
-/// custom (modified-mainnet or regtest) chain resolves its consensus parameters
-/// the same way every other `zcashlc_*` entry point does.
-pub(super) fn open_wallet_db(
-    wallet_db_path: &str,
-    network_id: u32,
-) -> anyhow::Result<
-    zcash_client_sqlite::WalletDb<
-        rusqlite::Connection,
-        crate::NetworkParams,
-        SystemClock,
-        rand::rngs::OsRng,
-    >,
-> {
-    let network = crate::parse_network(network_id)?;
-    zcash_client_sqlite::WalletDb::for_path(wallet_db_path, network, SystemClock, rand::rngs::OsRng)
-        .map_err(|e| anyhow!("failed to open wallet DB: {}", e))
-}
-
-#[allow(dead_code)]
-pub(super) fn round_phase_to_u32(phase: voting::storage::RoundPhase) -> u32 {
-    use voting::storage::RoundPhase::*;
-
-    match phase {
-        Initialized => 0,
-        HotkeyGenerated => 1,
-        DelegationConstructed => 2,
-        DelegationProved => 3,
-        VoteReady => 4,
-    }
-}
-
+/// The network is resolved through [`crate::parse_network`] rather than from a
+/// bare `Network`, so a custom (modified-mainnet or regtest) chain derives
+/// through the same consensus parameters as every other `zcashlc_*` entry
+/// point.
 pub(super) fn usk_from_seed(
     network_id: u32,
     seed: &[u8],
@@ -109,53 +87,41 @@ pub(super) fn usk_from_seed(
     Ok(usk)
 }
 
-pub(super) struct HotkeySideInputs {
-    pub(super) g_d_new_x: Vec<u8>,
-    pub(super) pk_d_new_x: Vec<u8>,
-    pub(super) hotkey_raw_address: Vec<u8>,
-}
-
 /// Map the SDK's numeric network id onto `zcash_voting`'s network selector.
 ///
 /// `zcash_voting` replaced the numeric `network_id` convention with a typed
 /// enum, so every call into the crate needs this conversion at the boundary.
+///
+/// The custom slot ([`crate::NETWORK_ID_REGTEST`]) has no voting identity of
+/// its own: a modified-mainnet chain votes with mainnet hotkeys and HRPs, so
+/// its voting network follows the registered base network. Deriving it through
+/// [`crate::parse_network`] also means an unconfigured custom slot errors here
+/// rather than silently passing for Regtest.
 pub(super) fn voting_network(network_id: u32) -> anyhow::Result<voting::Network> {
     match network_id {
         crate::NETWORK_ID_TESTNET => Ok(voting::Network::Testnet),
         crate::NETWORK_ID_MAINNET => Ok(voting::Network::Mainnet),
-        other => Err(anyhow!(
-            "Invalid network type: {}. Expected either {} or {} for Testnet or Mainnet, respectively.",
+        crate::NETWORK_ID_REGTEST => {
+            use zcash_protocol::consensus::{NetworkType, Parameters};
+            // `parse_network` reports an unconfigured custom slot as a bare
+            // message; re-wrap it so this failure reaches Swift as typed JSON
+            // like every other one.
+            let params =
+                crate::parse_network(network_id).map_err(|e| invalid_input(e.to_string()))?;
+            match params.network_type() {
+                NetworkType::Main => Ok(voting::Network::Mainnet),
+                NetworkType::Test => Ok(voting::Network::Testnet),
+                NetworkType::Regtest => Ok(voting::Network::Regtest),
+            }
+        }
+        other => Err(invalid_input(format!(
+            "Invalid network type: {}. Expected {}, {}, or {} for Testnet, Mainnet, or a custom network, respectively.",
             other,
             crate::NETWORK_ID_TESTNET,
             crate::NETWORK_ID_MAINNET,
-        )),
+            crate::NETWORK_ID_REGTEST,
+        ))),
     }
-}
-
-/// Derive the delegation side inputs implied by a stored voting-hotkey secret.
-///
-/// `hotkey_stored_secret` is the app-owned random material previously returned
-/// as `FfiVotingHotkey::stored_secret`, not wallet seed material: `zcash_voting`
-/// derives the hotkey's Orchard address from it at a fixed account and address
-/// index, so no wallet key derivation is involved.
-pub(super) fn derive_hotkey_side_inputs(
-    hotkey_stored_secret: &[u8],
-    network_id: u32,
-) -> anyhow::Result<HotkeySideInputs> {
-    let network = voting_network(network_id)?;
-    let hotkey = voting::VotingHotkey::from_stored_secret(hotkey_stored_secret, network)
-        .map_err(|e| anyhow!("failed to reconstruct voting hotkey: {}", e))?;
-
-    let hotkey_addr_bytes = hotkey.raw_orchard_address();
-    let (g_d_new_x, pk_d_new_x) =
-        voting::action::derive_hotkey_x_coords_from_raw_address(hotkey_addr_bytes)
-            .map_err(|e| anyhow!("derive_hotkey_x_coords failed: {}", e))?;
-
-    Ok(HotkeySideInputs {
-        g_d_new_x: g_d_new_x.to_vec(),
-        pk_d_new_x: pk_d_new_x.to_vec(),
-        hotkey_raw_address: hotkey_addr_bytes.to_vec(),
-    })
 }
 
 // =============================================================================
@@ -166,7 +132,6 @@ pub(super) fn derive_hotkey_side_inputs(
 ///
 /// The caller owns the returned allocation and must release it with
 /// `zcashlc_voting_free_hotkey`, which zeroizes the secret.
-#[allow(dead_code)]
 pub(super) fn voting_hotkey_to_ffi(
     hotkey: voting::VotingHotkey,
 ) -> anyhow::Result<FfiVotingHotkey> {
@@ -195,7 +160,12 @@ mod tests {
     #[test]
     fn bytes_from_ptr_rejects_null_when_nonzero_len() {
         let err = unsafe { bytes_from_ptr(std::ptr::null(), 3) }.expect_err("null");
-        assert!(err.to_string().contains("null"));
+        // The boundary contract is that every voting FFI failure is
+        // `VotingErrorView` JSON, so Swift never has to parse message text.
+        let view: zcash_voting::VotingErrorView =
+            serde_json::from_str(&err.to_string()).expect("json error");
+        assert_eq!(serde_json::to_value(view.kind).unwrap(), "invalid_input");
+        assert!(view.message.contains("null"));
     }
 
     #[test]
@@ -207,7 +177,32 @@ mod tests {
     #[test]
     fn str_from_ptr_rejects_null_when_nonzero_len() {
         let err = unsafe { str_from_ptr(std::ptr::null(), 3) }.expect_err("null");
-        assert!(err.to_string().contains("null"));
+        let view: zcash_voting::VotingErrorView =
+            serde_json::from_str(&err.to_string()).expect("json error");
+        assert_eq!(serde_json::to_value(view.kind).unwrap(), "invalid_input");
+    }
+
+    /// The custom slot's voting identity follows the registered base network,
+    /// so a modified-mainnet chain keeps mainnet hotkeys and HRPs. Asserted
+    /// through the store FFI, which is where the process-global custom-network
+    /// slot is configured exactly once (see
+    /// `store_ffi::tests::db_open_custom_network_derives_voting_network_from_base`);
+    /// here only the two standard ids and the rejection are checked, because a
+    /// second writer of that global would race it.
+    #[test]
+    fn voting_network_maps_standard_ids_and_rejects_unknown() {
+        assert_eq!(
+            voting_network(crate::NETWORK_ID_TESTNET).unwrap(),
+            voting::Network::Testnet
+        );
+        assert_eq!(
+            voting_network(crate::NETWORK_ID_MAINNET).unwrap(),
+            voting::Network::Mainnet
+        );
+        let err = voting_network(99).expect_err("unknown network id");
+        let view: zcash_voting::VotingErrorView =
+            serde_json::from_str(&err.to_string()).expect("json error");
+        assert_eq!(serde_json::to_value(view.kind).unwrap(), "invalid_input");
     }
 
     #[test]

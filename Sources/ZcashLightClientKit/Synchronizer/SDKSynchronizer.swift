@@ -1212,6 +1212,35 @@ public class SDKSynchronizer: Synchronizer {
         await sdkFlags.torClientInitializationSuccessfullyDone
     }
 
+    public func makeVotingRoundSession(
+        backend: VotingRustBackend,
+        inputs: VotingSessionInputs,
+        binding: VotingSessionBinding,
+        route: VotingTransportRoute,
+        epoch: UInt64
+    ) async throws -> VotingRoundSession {
+        switch route {
+        case .direct:
+            return try backend.makeSession(inputs: inputs, binding: binding, torRuntime: nil, epoch: epoch)
+        case .tor:
+            let torEnabled = await sdkFlags.torEnabled
+            let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
+
+            guard torEnabled || exchangeRateEnabled else {
+                throw ZcashError.torNotEnabled
+            }
+
+            let torClient = initializer.container.resolve(TorClient.self)
+
+            return try await torClient.makeVotingRoundSession(
+                backend: backend,
+                inputs: inputs,
+                binding: binding,
+                epoch: epoch
+            )
+        }
+    }
+
     public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8 = 3) async throws -> (data: Data, response: HTTPURLResponse) {
         let torEnabled = await sdkFlags.torEnabled
         let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
