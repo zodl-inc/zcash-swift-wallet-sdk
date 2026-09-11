@@ -4,8 +4,8 @@
 //! per stage on the thread that needs it instead of holding one across stages.
 //! [`SdkWalletDbOpener`] is how it opens this SDK's: by path, parameterized by
 //! [`crate::NetworkParams`] so a custom-parameter chain resolves its consensus parameters
-//! the same way every other `zcashlc_*` entry point does, and with the connection setup
-//! the FFI gives its own wallet handles — bar a shorter lock wait, see [`BUSY_TIMEOUT`].
+//! the same way every other `zcashlc_*` entry point does, and with the same connection
+//! setup the FFI gives its own wallet handles, lock wait included.
 //!
 //! The crate's own `SqliteWalletDbOpener` is not usable here: it is parameterized by
 //! `zcash_voting::Network`, which has no custom-parameter arm, and it wraps a bare
@@ -15,15 +15,6 @@
 use rand::rngs::OsRng;
 use zcash_client_sqlite::{WalletDb, util::SystemClock};
 use zcash_voting::{VotingError, WalletDbOpener};
-
-/// How long a voting read waits for the wallet database's write lock before failing.
-///
-/// Shorter than the host's own [`crate::WALLET_DB_BUSY_TIMEOUT`], deliberately: a voting
-/// read is one step of a long-running round that retries, so it should surrender the
-/// thread to a concurrent writer quickly rather than block a pipeline stage for as long
-/// as a foreground wallet call is allowed to. A wait that runs out surfaces from the
-/// crate's own query path as a retryable `DbBusy`, not as a lost round.
-const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000);
 
 /// Opens the host wallet database for the voting crate's pipeline stages.
 ///
@@ -77,13 +68,19 @@ impl WalletDbOpener for SdkWalletDbOpener {
         // calling `WalletDb::for_path`, which would leave the connection with SQLite's
         // instant-`SQLITE_BUSY` default. `WalletDb::from_connection` requires the array
         // module to have been loaded on the connection it is given.
+        //
+        // The wait is the host's own `WALLET_DB_BUSY_TIMEOUT`, not a shorter one of this
+        // module's: a pipeline stage reads this file while sync may be writing to it, so it
+        // has to tolerate exactly the contention every other wallet handle tolerates. A
+        // voting read that gave up sooner would fail a stage on a lock the host itself waits
+        // out.
         let conn = rusqlite::Connection::open(&self.path).map_err(|e| {
             storage(format!(
                 "failed to open wallet database at {}: {e}",
                 self.path
             ))
         })?;
-        conn.busy_timeout(BUSY_TIMEOUT)
+        conn.busy_timeout(crate::WALLET_DB_BUSY_TIMEOUT)
             .map_err(|e| storage(format!("failed to set wallet database busy_timeout: {e}")))?;
         rusqlite::vtab::array::load_module(&conn)
             .map_err(|e| storage(format!("failed to load wallet database array module: {e}")))?;
