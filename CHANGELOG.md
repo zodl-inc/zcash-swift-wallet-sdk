@@ -235,7 +235,9 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `keystoneSignatures(roundId:)`, and `precomputeDelegationPir(roundId:bundleIndex:notes:…)` is
     `VotingRoundSession.precomputePir(bundleIndex:)`, which takes neither notes nor endpoints
     because the session already holds them.
-- Removed public types (25): `RecoveredDelegationBundle`, `RecoveredDelegationRestoreRequest`,
+- Removed public types (30): `HTTPPirSnapshotProbe`, `PirSnapshotProbeOutcome`,
+  `PirSnapshotProbing`, `PirSnapshotResolver`, `PirSnapshotResolverError`,
+  `RecoveredDelegationBundle`, `RecoveredDelegationRestoreRequest`,
   `RecoveredDelegationRestoreResult`, `VotingBuildPcztParams`, `VotingBundleSetupResult`,
   `VotingDelegationInputs`, `VotingDelegationKeyInputs`, `VotingDelegationPirPrecomputeResult`,
   `VotingDelegationProofParams`, `VotingDelegationProofResult`, `VotingDelegationSignature`,
@@ -245,6 +247,14 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `VotingWireEncryptedShare` and `VotingWitnessData`. The wire and witness types are gone because
   those payloads no longer cross the boundary; `VotingNoteInfo` is gone because the session selects
   notes from the wallet itself, so a host no longer assembles a note list to vote with.
+- The five `PirSnapshot*` types went with `precomputeDelegationPir`, the only call that used them:
+  `VotingSessionInputs.pirEndpoints` now goes straight to the crate's PIR fleet, which normalizes
+  and dedupes the list but does not probe it for the round's snapshot. A server serving a different
+  snapshot is caught where it matters — the circuit root is compared against the round's stored
+  `nullifier_imt_root` and a mismatch fails the call — but it fails as `VotingErrorKind.invalidInput`
+  rather than as a transport failure, so the fleet does **not** fail over to the next endpoint. A
+  host is therefore responsible for supplying endpoints that serve the round's snapshot: filter them
+  before opening the session if the fleet may hold servers that are behind or ahead.
 
 ## Fixed
 

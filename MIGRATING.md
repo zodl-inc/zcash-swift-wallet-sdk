@@ -377,7 +377,7 @@ should let that sync finish first.
 | --- | --- |
 | `initRound`, `setupBundles(roundId:notes:)` | `VotingRoundSession.setupBundles()`, `async`, returning `VotingBundleLayout`. The session selects the notes from the wallet itself, so `VotingNoteInfo` is gone with them. |
 | `getRoundState`, `getBundleCount` | `VotingRoundSession.plan()` or `VotingRustBackend.roundPlan(roundId:proposalIds:)`, both answering `VotingRoundPlan`. Read its derived flags (`needsBundleSetup`, `needsDelegationSigning`, `hasUnconfirmedShares`, `primaryAction`) instead of matching step kinds. |
-| `precomputeDelegationPir` | `VotingRoundSession.precomputePir(bundleIndex:)` — no notes, endpoints or layout arguments; the session holds them. |
+| `precomputeDelegationPir` | `VotingRoundSession.precomputePir(bundleIndex:)` — no notes, endpoints or layout arguments; the session holds them. Its endpoint-picking helpers (`PirSnapshotResolver`, `PirSnapshotResolverError`, `PirSnapshotProbeOutcome`, `PirSnapshotProbing`, `HTTPPirSnapshotProbe`) are removed with it; see the note below. |
 | `buildPczt`, `buildAndProveDelegation`, `generateDelegationInputs`, `generateNoteWitnesses`, `generateVanWitness`, `verifyWitness`, `validatePirProof`, `vanCommitment` | `VotingRoundSession.precomputeDelegationProof(bundleIndex:progress:)` for a proof ahead of time; otherwise `run(signer:policy:overrides:events:)` does it. |
 | `signDelegationRequest`, `extractPcztSighash`, `extractSpendAuthSig` | `run(signer: .software(seed:))`. Sighashes, PCZTs and signatures no longer cross into Swift for a software wallet. |
 | `storeKeystoneSignature`, `clearKeystoneSignature`, `getStoredPcztSighash` | `VotingRoundSession.keystoneSigningRequests(bundleIndices:)` and `storeKeystoneSignatures(_:)`, then `run(signer: .keystoneStored)`. |
@@ -392,6 +392,16 @@ should let that sync finish first.
 `listRounds()` survives but its `VotingRoundSummary` changed: `phase` is a `String` rather than the
 removed `VotingRoundPhase`, and it gained `walletId` and `network`. `deleteSkippedBundles(roundId:keepCount:)`
 returns `UInt64`. `resetSessionState(roundId:)` also refuses an empty round id.
+
+**PIR endpoints are yours to choose.** `PirSnapshotResolver` and the four types around it are gone
+along with the call that used them. `VotingSessionInputs.pirEndpoints` goes straight to the crate's
+PIR fleet, which normalizes and dedupes the list but does not probe it: nothing checks, before the
+round runs, that a configured server serves the round's snapshot. A wrong one cannot produce a bad
+proof — the connected circuit's root is compared against the round's stored `nullifier_imt_root` and
+a mismatch fails the call — but it fails as `VotingErrorKind.invalidInput`, which is not a transport
+failure, so the fleet does **not** move on to the next endpoint. If the configured fleet can hold a
+server that is behind or ahead of the round's snapshot, filter the list on the host side before
+opening the session.
 
 ### A transaction hash is not proof a vote finished
 
