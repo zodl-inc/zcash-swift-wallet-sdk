@@ -14,7 +14,10 @@
 //!
 //! Every entry point blocks its calling thread for the whole operation, which
 //! for a run or a proof is minutes rather than milliseconds, so a host calls
-//! them off the thread it draws on.
+//! them off the thread it draws on. Each one takes its own reference to the
+//! round as it reads the handle, so the three long calls behave alike under
+//! [`zcashlc_voting_session_free`]: freeing the handle mid-call releases the
+//! host's reference and the round outlives the call that is using it.
 //!
 //! # Events
 //!
@@ -62,26 +65,33 @@ use super::wire::{
 
 /// One open voting round, as the host holds it.
 ///
-/// An opaque box around the `Arc` the session's own work shares: a run hands
-/// its task a clone of it, so freeing this handle while a run is in flight
-/// releases the host's reference without dropping the session the run is
-/// using.
+/// An opaque box around an `Arc` on the round. Every entry point takes its own
+/// clone of that `Arc` as it reads the pointer ([`session_from_ptr`]), so this
+/// handle is only ever the host's reference: freeing it while a call is in
+/// flight releases that reference and leaves the call holding the round.
 pub struct VotingSessionHandle {
     session: Arc<VotingSession>,
 }
 
-/// Borrow the session behind a raw pointer, or fail with typed JSON.
+/// Take an owned reference to the session behind a raw pointer, or fail with
+/// typed JSON.
+///
+/// Returns a clone rather than a borrow, so the handle's box is touched only
+/// while this function runs: an entry point that then works for minutes holds
+/// the round itself, not the allocation the host may free meanwhile. Every
+/// entry point here goes through it for that reason, whether it is a read that
+/// returns at once or a run that does not.
 ///
 /// # Safety
 ///
 /// If non-null, `ptr` must point to a live `VotingSessionHandle` returned by
-/// [`zcashlc_voting_session_open`] and not yet freed. The returned reference
-/// must not outlive it.
-unsafe fn session_from_ptr<'a>(
-    ptr: *mut VotingSessionHandle,
-) -> anyhow::Result<&'a Arc<VotingSession>> {
+/// [`zcashlc_voting_session_open`] and not yet freed — that is, the host must
+/// not free the handle while a call is reading this pointer. Freeing it once a
+/// call has taken its reference is safe, and is what
+/// [`zcashlc_voting_session_free`] documents.
+unsafe fn session_from_ptr(ptr: *mut VotingSessionHandle) -> anyhow::Result<Arc<VotingSession>> {
     unsafe { ptr.as_ref() }
-        .map(|handle| &handle.session)
+        .map(|handle| Arc::clone(&handle.session))
         .ok_or_else(|| invalid_input("VotingSessionHandle is null"))
 }
 
@@ -201,11 +211,16 @@ pub unsafe extern "C" fn zcashlc_voting_session_open(
 
 /// Free a `VotingSessionHandle`.
 ///
-/// Releases the host's reference to the round. A run or tracking run still in
-/// flight holds its own reference, so freeing during one is memory-safe and
-/// the session is dropped when that work finishes; the SDK's Swift wrapper
-/// still cancels and joins first, because the run would otherwise keep driving
-/// a round nothing is listening to.
+/// Releases the host's reference to the round. Every entry point took its own
+/// reference when it read its handle, so freeing during any call in flight —
+/// a run, a tracking run or a proof alike — is memory-safe: this drops the
+/// host's reference and the round itself is dropped when the last call using
+/// it returns. What is not safe is freeing the handle while another entry
+/// point is reading the same pointer, which no host can arrange usefully
+/// anyway.
+///
+/// The SDK's Swift wrapper still cancels and joins before freeing, because a
+/// run left to itself keeps driving a round nothing is listening to.
 ///
 /// # Safety
 ///
@@ -736,6 +751,55 @@ mod tests {
             .push(String::from_utf8_lossy(json).into_owned());
     }
 
+    /// A raw pointer this test hands to a thread of its own on purpose.
+    ///
+    /// Raw pointers are not `Send`, and rightly so; what makes these two safe
+    /// to move is the handshake in
+    /// [`freeing_the_handle_during_a_run_is_safe`], which keeps the session
+    /// handle and the callback context alive for as long as the other thread
+    /// can touch them.
+    struct SharedPtr<T>(*mut T);
+
+    // SAFETY: as stated on the type — the one test that constructs these owns
+    // both targets and outlives the thread it hands them to.
+    unsafe impl<T> Send for SharedPtr<T> {}
+
+    /// The rendezvous [`freeing_the_handle_during_a_run_is_safe`] performs:
+    /// the run says it has started, then waits to be told the handle is freed.
+    struct FreeDuringRun {
+        entered: std::sync::mpsc::SyncSender<()>,
+        freed: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        once: std::sync::Once,
+    }
+
+    /// The first event parks the run until the test thread has freed the
+    /// handle; every later event passes straight through.
+    ///
+    /// A callback that blocks is exactly what the module documentation tells
+    /// hosts not to write. It is the point here: it is what makes the free
+    /// provably overlap the call rather than race it.
+    ///
+    /// # Safety
+    ///
+    /// `context` must point at a live `FreeDuringRun`, which the test holds
+    /// for the whole run.
+    unsafe extern "C" fn park_until_freed(
+        context: *mut std::ffi::c_void,
+        _json: *const u8,
+        _json_len: usize,
+    ) {
+        let rendezvous = unsafe { &*context.cast::<FreeDuringRun>() };
+        rendezvous.once.call_once(|| {
+            rendezvous.entered.send(()).expect("the test thread waits");
+            rendezvous
+                .freed
+                .lock()
+                .expect("free signal")
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the test thread frees the handle");
+        });
+    }
+
     #[test]
     fn session_open_rejects_null_db_and_bad_json() {
         let inputs = b"{}";
@@ -1085,5 +1149,62 @@ mod tests {
             "no_spendable_notes" | "insufficient_eligibility"
         ));
         unsafe { free_session(db, session) };
+    }
+
+    /// Freeing the handle while a run is in flight releases the host's
+    /// reference and nothing else: the call took its own when it read the
+    /// pointer, so the round outlives the free and still returns its report.
+    ///
+    /// Driven through the event callback rather than by timing: the tracking
+    /// run parks in its first event, the test thread frees the handle while it
+    /// is parked, and only then is the run let go. A free that dropped the
+    /// round here would leave the driver running on freed memory.
+    #[test]
+    fn freeing_the_handle_during_a_run_is_safe() {
+        let (db, _dir, session) = open_session(0x59);
+        let (entered, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (freed, freed_rx) = std::sync::mpsc::channel();
+        let rendezvous = std::sync::Arc::new(FreeDuringRun {
+            entered,
+            freed: std::sync::Mutex::new(freed_rx),
+            once: std::sync::Once::new(),
+        });
+        let context = SharedPtr(
+            std::sync::Arc::as_ptr(&rendezvous)
+                .cast::<std::ffi::c_void>()
+                .cast_mut(),
+        );
+        let tracked = SharedPtr(session);
+
+        let run = std::thread::spawn(move || {
+            // Named whole rather than reached into: a closure that only ever
+            // mentions `tracked.0` captures the raw pointer itself, which is
+            // not `Send`, instead of the wrapper that says why moving it here
+            // is sound.
+            let (tracked, context) = (tracked, context);
+            let report = unsafe {
+                zcashlc_voting_session_track_shares(
+                    tracked.0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    Some(park_until_freed),
+                    context.0,
+                )
+            };
+            assert!(!report.is_null());
+            unsafe { take_json(report) }
+        });
+
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the tracking run reported an event");
+        unsafe { zcashlc_voting_session_free(session) };
+        freed.send(()).expect("the tracking run waits");
+
+        let report = run.join().expect("tracking thread");
+        assert_eq!(report["quiescence"]["kind"], "nothing_to_track");
+        unsafe { zcashlc_voting_db_free(db) };
     }
 }
