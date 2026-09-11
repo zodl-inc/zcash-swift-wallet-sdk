@@ -789,6 +789,47 @@ mod tests {
         );
     }
 
+    /// Both halves of the ceremony window are bare `Option<u64>` with no
+    /// `serde(default)`, and Swift omits an absent one rather than writing
+    /// `null`. What makes that work is serde resolving a missing field to
+    /// `None` for an `Option`, which is a property of serde rather than of this
+    /// DTO — so it is pinned here, on the shape every host that leaves those
+    /// inputs at their defaults actually sends.
+    #[test]
+    fn session_inputs_dto_decodes_without_the_optional_ceremony_window() {
+        let json = serde_json::json!({
+            "account_uuid": "11111111-1111-1111-1111-111111111111",
+            "wallet_db_path": "/tmp/wallet.sqlite3",
+            "round_params": {
+                "vote_round_id": "round-1",
+                "snapshot_height": 10,
+                "ea_pk": STANDARD.encode([1u8, 2, 3]),
+                "nc_root": STANDARD.encode([4u8, 5, 6]),
+                "nullifier_imt_root": STANDARD.encode([7u8, 8, 9]),
+            },
+            "round_name": "Q3 governance",
+            "anchor_tree_state": STANDARD.encode([1u8, 2, 3]),
+            "chain_endpoints": ["https://chain.example"],
+            "vote_tree_node_urls": ["https://tree.example"],
+            "helper_urls": ["https://helper.example"],
+            "pir_endpoints": ["https://pir.example"],
+            "pir_layout": {
+                "pir_depth": 19,
+                "tier0_layers": 12,
+                "tier1_layers": 7,
+                "poly_len": 4096,
+            },
+        });
+
+        let inputs: SessionInputsDto = serde_json::from_value(json).expect("absent window");
+
+        assert_eq!(inputs.ceremony_start_seconds, None);
+        assert_eq!(inputs.vote_end_time_seconds, None);
+        // The rest still decoded, so this is an absent field rather than a
+        // decode that gave up early.
+        assert_eq!(inputs.round_name, "Q3 governance");
+    }
+
     #[test]
     fn session_binding_dto_hotkey_secret_defaults_absent_and_null_to_none() {
         let absent: SessionBindingDto =

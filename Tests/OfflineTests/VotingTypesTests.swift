@@ -701,6 +701,43 @@ final class VotingTypesTests: XCTestCase {
         XCTAssertEqual(layout["poly_len"] as? UInt32, 2048)
     }
 
+    /// A round with no ceremony window — what both initializer defaults give —
+    /// omits both keys rather than writing `null`. The crate declares them as
+    /// bare `Option<u64>` with no `serde(default)`, so what makes them optional
+    /// there is serde resolving a missing field to `None`; this is the Swift
+    /// half of that, and `VotingRoundSessionTests` opens a real session on it.
+    func testEncodesSessionInputsOmittingAnAbsentCeremonyWindow() throws {
+        let inputs = VotingSessionInputs(
+            accountUUID: "11111111-1111-1111-1111-111111111111",
+            walletDbPath: "/tmp/wallet.sqlite3",
+            roundParams: VotingRoundParameters(
+                voteRoundId: "round-1",
+                snapshotHeight: 10,
+                eaPk: Data([1, 2, 3]),
+                ncRoot: Data([4, 5, 6]),
+                nullifierImtRoot: Data([7, 8, 9])
+            ),
+            roundName: "Q3 governance",
+            anchorTreeState: Data([1, 2, 3]),
+            chainEndpoints: ["https://chain.example"],
+            voteTreeNodeUrls: ["https://tree.example"],
+            helperUrls: ["https://helper.example"],
+            pirEndpoints: ["https://pir.example"],
+            pirLayout: VotingPirLayout(pirDepth: 1, tier0Layers: 2, tier1Layers: 3, polyLen: 2048)
+        )
+
+        XCTAssertNil(inputs.ceremonyStartSeconds)
+        XCTAssertNil(inputs.voteEndTimeSeconds)
+
+        let object = try encodedObject(inputs)
+
+        XCTAssertFalse(object.keys.contains("ceremony_start_seconds"))
+        XCTAssertFalse(object.keys.contains("vote_end_time_seconds"))
+        // The rest of the round still crosses, so this is an omission rather
+        // than an encoder that gave up on the whole value.
+        XCTAssertEqual(object["round_name"] as? String, "Q3 governance")
+    }
+
     func testEncodesSessionBindingAndSignedBundle() throws {
         let unbound = try encodedObject(
             VotingSessionBinding(roster: [VotingProposalRosterEntry(proposalId: 1, numOptions: 2)])

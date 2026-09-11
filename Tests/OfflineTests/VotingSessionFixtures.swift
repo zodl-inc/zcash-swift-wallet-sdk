@@ -73,7 +73,17 @@ extension XCTestCase {
     /// points at the discard port, so nothing built here can touch the
     /// network. `tag` names the round (one per test keeps rounds distinct
     /// within a store).
-    func makeVotingSessionEnvironment(tag: UInt8, walletId: String) async throws -> VotingSessionFixtureEnvironment {
+    ///
+    /// The ceremony window is a parameter because both halves of it are
+    /// optional on the wire: passing `nil` omits the key entirely, which is
+    /// what a round that announces no window produces and what the crate's
+    /// `Option<u64>` has to accept.
+    func makeVotingSessionEnvironment(
+        tag: UInt8,
+        walletId: String,
+        ceremonyStartSeconds: UInt64? = 1_000,
+        voteEndTimeSeconds: UInt64? = 2_000_000_000
+    ) async throws -> VotingSessionFixtureEnvironment {
         let root = Environment.uniqueTestTempDirectory
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
@@ -133,8 +143,8 @@ extension XCTestCase {
             // the fleet validates it against YPIR's minima, so a made-up shape
             // fails at session open.
             pirLayout: VotingPirLayout(pirDepth: 19, tier0Layers: 12, tier1Layers: 7, polyLen: 4096),
-            ceremonyStartSeconds: 1_000,
-            voteEndTimeSeconds: 2_000_000_000
+            ceremonyStartSeconds: ceremonyStartSeconds,
+            voteEndTimeSeconds: voteEndTimeSeconds
         )
         let binding = VotingSessionBinding(roster: [VotingProposalRosterEntry(proposalId: 1, numOptions: 3)])
 

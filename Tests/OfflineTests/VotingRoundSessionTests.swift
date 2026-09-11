@@ -219,6 +219,35 @@ final class VotingRoundSessionTests: XCTestCase {
         await fixture.session.close()
     }
 
+    /// A round that announces no ceremony window opens over the real FFI.
+    ///
+    /// Both halves of the window default to `nil`, and Swift omits an absent
+    /// key rather than writing `null`, so the bytes that cross carry neither
+    /// `ceremony_start_seconds` nor `vote_end_time_seconds`. Nothing else
+    /// proves the crate's bare `Option<u64>` fields resolve to `None` from an
+    /// absent key — and every host that leaves those defaults alone depends on
+    /// it.
+    func testASessionOpensForARoundThatAnnouncesNoCeremonyWindow() async throws {
+        let environment = try await makeVotingSessionEnvironment(
+            tag: 0x48,
+            walletId: sessionWalletId,
+            ceremonyStartSeconds: nil,
+            voteEndTimeSeconds: nil
+        )
+        XCTAssertNil(environment.inputs.ceremonyStartSeconds)
+        XCTAssertNil(environment.inputs.voteEndTimeSeconds)
+
+        let session = try environment.backend.makeSession(
+            inputs: environment.inputs,
+            binding: environment.binding,
+            torRuntime: nil,
+            epoch: 1
+        )
+
+        XCTAssertEqual(try session.plan().roundId, environment.roundId)
+        await session.close()
+    }
+
     /// The account id crosses as UUID text, and an id that is not 16 bytes is
     /// refused rather than read off the end of its array. `AccountUUID` is
     /// `Codable`, so a decoded one never passed the initializer that checks.
