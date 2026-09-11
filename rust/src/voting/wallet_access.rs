@@ -27,8 +27,6 @@ pub(super) struct SdkWalletDbOpener {
     network_id: u32,
 }
 
-// Consumed by session setup, which lands in a later change.
-#[allow(dead_code)]
 impl SdkWalletDbOpener {
     /// An opener for the wallet database at `path` on the SDK network `network_id`.
     ///

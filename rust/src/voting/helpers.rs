@@ -1,6 +1,5 @@
 use anyhow::anyhow;
 use serde::Serialize;
-use zcash_client_sqlite::util::SystemClock;
 use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_voting as voting;
 use zip32::AccountId;
@@ -62,31 +61,12 @@ pub(super) fn json_to_boxed_slice<T: Serialize>(
     Ok(crate::ffi::BoxedSlice::some(json))
 }
 
-/// Open the wallet database.
+/// Derive the account's unified spending key from `seed`.
 ///
-/// The store is parameterized by `NetworkParams` rather than `Network` so that a
-/// custom (modified-mainnet or regtest) chain resolves its consensus parameters
-/// the same way every other `zcashlc_*` entry point does.
-// Consumed by the session and store FFI, which land in a later change.
-#[allow(dead_code)]
-pub(super) fn open_wallet_db(
-    wallet_db_path: &str,
-    network_id: u32,
-) -> anyhow::Result<
-    zcash_client_sqlite::WalletDb<
-        rusqlite::Connection,
-        crate::NetworkParams,
-        SystemClock,
-        rand::rngs::OsRng,
-    >,
-> {
-    let network = crate::parse_network(network_id)?;
-    zcash_client_sqlite::WalletDb::for_path(wallet_db_path, network, SystemClock, rand::rngs::OsRng)
-        .map_err(|e| anyhow!("failed to open wallet DB: {}", e))
-}
-
-// Consumed by the session and store FFI, which land in a later change.
-#[allow(dead_code)]
+/// The network is resolved through [`crate::parse_network`] rather than from a
+/// bare `Network`, so a custom (modified-mainnet or regtest) chain derives
+/// through the same consensus parameters as every other `zcashlc_*` entry
+/// point.
 pub(super) fn usk_from_seed(
     network_id: u32,
     seed: &[u8],

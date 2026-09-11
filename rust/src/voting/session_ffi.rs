@@ -158,9 +158,10 @@ struct ProofStatusResponse {
 /// the session's whole life: null is the direct HTTP route, and a Tor runtime
 /// is used through an isolated client taken during this call, so the round's
 /// circuits are not linkable to the rest of the wallet's Tor use. A session
-/// opened on Tor never falls back to a direct connection — a Tor route that
-/// cannot connect fails the request instead (spec D12). PIR and vote-tree
-/// traffic take the shared direct transport either way.
+/// opened on Tor never falls back to a direct connection: a Tor route that
+/// cannot connect fails the request, because putting the voter's traffic on
+/// the clear network after they asked for Tor is worse than failing. PIR and
+/// vote-tree traffic take the shared direct transport either way.
 ///
 /// `epoch` is the host's operation epoch at open; move it with
 /// [`zcashlc_voting_session_set_epoch`]. Nothing here reaches the network:
@@ -337,8 +338,8 @@ pub unsafe extern "C" fn zcashlc_voting_session_eligibility(
 /// returning what the precompute did as JSON.
 ///
 /// Reaches the PIR fleet over the shared direct transport whatever route the
-/// session opened on (spec D12), so it blocks for as long as those queries
-/// take. Returns null on error.
+/// session opened on — a PIR query names no voter — so it blocks for as long
+/// as those queries take. Returns null on error.
 ///
 /// # Safety
 ///
@@ -476,7 +477,7 @@ pub unsafe extern "C" fn zcashlc_voting_session_store_keystone_signatures(
 /// default policy respectively. `signer_json` is a `SignerDto` and is never
 /// empty: a run without delegation is `{"kind":"none"}`, stated by the host
 /// rather than inferred from a missing argument. A software seed lives in the
-/// SDK's signer for this call only (spec D9).
+/// SDK's signer for this call only, and never reaches Swift.
 ///
 /// The driver itself does not fail — a run that could do nothing says why
 /// through the report's quiescence — so null here means the call around it

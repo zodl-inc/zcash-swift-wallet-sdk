@@ -152,7 +152,7 @@ pub(crate) fn synthetic_tree_state(height: u64) -> Vec<u8> {
 pub(crate) fn temp_wallet_db_with_account(network_id: u32) -> (tempfile::TempDir, String, String) {
     use prost::Message as _;
     use zcash_client_backend::data_api::{
-        Account as _, AccountBirthday, AccountPurpose, WalletWrite,
+        Account as _, AccountBirthday, AccountPurpose, WalletRead as _, WalletWrite,
     };
 
     let (dir, path) = temp_wallet_db(network_id);
@@ -173,6 +173,34 @@ pub(crate) fn temp_wallet_db_with_account(network_id: u32) -> (tempfile::TempDir
         .import_account_ufvk("voting", &ufvk, &birthday, AccountPurpose::ViewOnly, None)
         .expect("import account");
     let account_uuid = account.id().expose_uuid().to_string();
+
+    // `zcash_voting` refuses a wallet whose fully scanned height is below the
+    // round snapshot, and it derives that height the way `WalletSummary` does:
+    // the fully scanned block when there is one, otherwise the block below the
+    // wallet birthday. Asserting it here means a change to the birthday or to
+    // the synthetic tree state fails at the fixture, naming itself, instead of
+    // surfacing as an unrelated refusal in whichever test runs first.
+    //
+    // The two expressions below restate that derivation rather than call it —
+    // the crate's own is private — so this assertion is coupled to it: if a
+    // later `zcash_voting` computes the fully scanned height some other way,
+    // this fixture agrees with a rule the crate no longer applies, and the
+    // mismatch surfaces in the tests that select notes rather than here.
+    let scanned = db
+        .block_fully_scanned()
+        .expect("fully scanned block")
+        .map(|meta| meta.block_height())
+        .or_else(|| {
+            db.get_wallet_birthday()
+                .expect("wallet birthday")
+                .map(|birthday| birthday - 1)
+        })
+        .expect("an imported account gives the wallet a birthday");
+    assert_eq!(
+        u64::from(u32::from(scanned)),
+        SYNTHETIC_SNAPSHOT_HEIGHT,
+        "fixture wallet is no longer scanned exactly to the voting snapshot"
+    );
 
     (dir, path, account_uuid)
 }

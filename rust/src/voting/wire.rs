@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::errors::VotingResultExt;
+
 /// Serialize `[u8]` as a standard-alphabet, padded base64 string; deserialize back.
 ///
 /// Used via `#[serde(with = "b64")]` on every non-optional byte field crossing
@@ -62,6 +64,20 @@ pub(super) mod b64_opt {
             .map(|encoded| STANDARD.decode(encoded).map_err(serde::de::Error::custom))
             .transpose()
     }
+}
+
+/// Project a crate round plan onto the wire view Swift decodes.
+///
+/// `RoundPlanView::try_from` is fallible — the view restates a plan's step
+/// payloads in a shape that need not hold for every plan the crate can build —
+/// so every caller has to map that failure onto the JSON envelope. There are
+/// three of them (the session's `plan` and `set_ballot_intents`, and the
+/// store's `round_plan`), and they must answer alike, so the projection lives
+/// here once.
+pub(super) fn plan_view(
+    plan: zcash_voting::session::RoundPlan,
+) -> anyhow::Result<zcash_voting::wire::RoundPlanView> {
+    zcash_voting::wire::RoundPlanView::try_from(plan).ffi()
 }
 
 /// Parameters for a voting round, sourced from the vote chain.
@@ -298,8 +314,10 @@ impl ShareTrackingPolicyDto {
 ///
 /// Unlike the upstream crate's own `Default` (which sizes both fields to
 /// `available_parallelism`), this SDK's default keeps `max_active_heavy_jobs`
-/// at 1 (spec D6): CPU workers may run wide, but only one heavy proof/keygen
-/// job is admitted at a time unless Swift raises it explicitly.
+/// at 1: CPU workers may run wide, but only one heavy proof/keygen job is
+/// admitted at a time unless Swift raises it explicitly. A phone that admits
+/// two Orchard proofs at once is the memory-pressure kill this SDK cannot
+/// recover from, so the ceiling is the host's to raise, never the default.
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
 pub(super) struct ProvingPolicyDto {
     #[serde(default)]

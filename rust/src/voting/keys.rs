@@ -47,9 +47,9 @@ pub unsafe extern "C" fn zcashlc_voting_extract_orchard_fvk_from_ufvk(
 
 /// Extract the Ironwood note commitment tree root from a protobuf-encoded TreeState.
 ///
-/// Voting rounds anchor to the Ironwood pool — `zcash_voting 2.0` supports no
-/// other shielded protocol — so a round's `nc_root` is the root of the Ironwood
-/// tree, not the Orchard one. They are distinct pools with distinct trees whose
+/// Voting rounds anchor to the Ironwood pool — `zcash_voting` supports no other
+/// shielded protocol — so a round's `nc_root` is the root of the Ironwood tree,
+/// not the Orchard one. They are distinct pools with distinct trees whose
 /// roots never coincide on a live chain, so reading the wrong field does not
 /// degrade gracefully: it fails every round, always.
 ///

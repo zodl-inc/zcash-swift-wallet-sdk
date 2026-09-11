@@ -5,7 +5,9 @@
 //! this SDK's executor: either the crate's own direct HTTP client, or the
 //! wallet's Tor runtime. A session picks one when it opens and keeps it, so a
 //! round that chose Tor can never reach the network any other way — a Tor route
-//! that cannot connect fails the request rather than falling back (spec D12).
+//! that cannot connect fails the request rather than falling back, because a
+//! silent fall-back would put the voter's traffic on the clear network after
+//! they asked for Tor, which is the one outcome worse than the request failing.
 //!
 //! The crate owns protocol headers, deadlines, response ceilings and the
 //! definite-versus-ambiguous classification; this module owns only how one
@@ -326,7 +328,8 @@ impl RouteHttp for TorRoute {
 /// The crate transport for the chain and helper traffic of one session.
 ///
 /// PIR and vote-tree traffic keeps the shared direct transport instead
-/// ([`super::runtime::direct_transport`], spec D12).
+/// ([`super::runtime::direct_transport`]): it identifies no voter and is
+/// throughput-sensitive, so it is not what this route governs.
 pub(super) fn routed_transport(route: SdkRoute) -> Arc<HyperTransport<SdkRoute>> {
     Arc::new(HyperTransport::with_route(route))
 }

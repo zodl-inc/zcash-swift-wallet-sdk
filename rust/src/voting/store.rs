@@ -13,7 +13,8 @@
 //! destructive edits a screen performs directly. Driving a round (proving,
 //! submission, helper delivery) belongs to the session, not to this module;
 //! the one exception is [`sync_vote_tree`], which the crate implements as a
-//! blocking call over its own direct transport (spec D12).
+//! blocking call over its own direct transport — vote-tree traffic names no
+//! voter, so it is not routed through a session's Tor choice.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -21,7 +22,7 @@ use zcash_voting::storage::VotingDb;
 
 use super::errors::{VotingResultExt, internal, invalid_input};
 use super::helpers::voting_network;
-use super::wire::{KeystoneSignatureRecordDto, RoundSummaryDto};
+use super::wire::{KeystoneSignatureRecordDto, RoundSummaryDto, plan_view};
 
 /// Opaque handle over one open voting sidecar database.
 ///
@@ -87,8 +88,19 @@ impl VotingDatabaseHandle {
 
     /// A handle on the same connection, scoped to this handle's wallet.
     pub(super) fn scoped(&self) -> anyhow::Result<Arc<VotingDb>> {
+        Ok(self.scoped_with_id()?.0)
+    }
+
+    /// [`Self::scoped`] plus the wallet id it scoped to.
+    ///
+    /// For the one caller that needs both. Reading the id a second time from
+    /// the handle would be reading it after a wallet switch could have
+    /// replaced it, which would ask one wallet's question of another wallet's
+    /// rows; taking both from one read cannot disagree.
+    pub(super) fn scoped_with_id(&self) -> anyhow::Result<(Arc<VotingDb>, String)> {
         let wallet_id = self.wallet_id()?;
-        Ok(Arc::new(self.root.scoped(&wallet_id).ffi()?))
+        let db = Arc::new(self.root.scoped(&wallet_id).ffi()?);
+        Ok((db, wallet_id))
     }
 
     fn wallet_id_slot(&self) -> anyhow::Result<MutexGuard<'_, Option<String>>> {
@@ -120,18 +132,24 @@ pub(super) fn round_plan(
 ) -> anyhow::Result<zcash_voting::wire::RoundPlanView> {
     let db = h.scoped()?;
     let plan = zcash_voting::session::resume_plan(&db, round_id, proposal_ids).ffi()?;
-    zcash_voting::wire::RoundPlanView::try_from(plan).ffi()
+    plan_view(plan)
 }
 
-/// Rounds of this wallet with helper-share work still outstanding (spec D13).
+/// Rounds of this wallet with helper-share work still outstanding.
+///
+/// This is what tells the host whether it still owes share tracking, so it
+/// is the query the app polls on entering the voting flow and on foreground
+/// while anything is pending.
 pub(super) fn pending_share_rounds(
     h: &VotingDatabaseHandle,
 ) -> anyhow::Result<Vec<zcash_voting::wire::PendingShareRoundView>> {
     // The crate's multi-account entry point re-scopes per wallet id and
     // ignores the handle's own, so the id is passed explicitly. The SDK holds
-    // one handle per wallet, so that list is always this wallet alone.
-    let wallet_id = h.wallet_id()?;
-    let db = h.scoped()?;
+    // one handle per wallet, so that list is always this wallet alone — and
+    // the id comes back from the same read that scoped the handle, so a wallet
+    // switch between the two cannot ask one wallet's question of another's
+    // rows.
+    let (db, wallet_id) = h.scoped_with_id()?;
     Ok(
         zcash_voting::share::pending_rounds_for_accounts(&db, &[wallet_id.as_str()])
             .ffi()?
@@ -144,11 +162,11 @@ pub(super) fn pending_share_rounds(
 /// Sync the round's vote-commitment tree from `node_url`, returning the height
 /// synced to.
 ///
-/// The crate resolves the transport itself (spec D12): it reuses the wallet's
-/// tree client that already holds this round, whatever transport that client
-/// was built on, and otherwise opens one over its own direct transport. There
-/// is no route argument here by design — vote-tree traffic is not the chain
-/// and helper traffic the session's route governs.
+/// The crate resolves the transport itself: it reuses the wallet's tree
+/// client that already holds this round, whatever transport that client was
+/// built on, and otherwise opens one over its own direct transport. There is
+/// no route argument here by design — vote-tree traffic names no voter, so it
+/// is not the chain and helper traffic the session's route governs.
 pub(super) fn sync_vote_tree(
     h: &VotingDatabaseHandle,
     round_id: &str,
@@ -354,6 +372,33 @@ mod tests {
         let view: zcash_voting::VotingErrorView =
             serde_json::from_str(&err.to_string()).expect("json error");
         assert_eq!(serde_json::to_value(view.kind).unwrap(), "invalid_input");
+    }
+
+    /// The wallet id the pending-share query runs under is the one the handle
+    /// is scoped to at the moment of the call, taken from a single read.
+    ///
+    /// The crate's multi-account entry point takes the id as an argument and
+    /// ignores the scoped handle's own, so an id read separately from the
+    /// scope could ask one wallet's question of another's rows. Switching the
+    /// handle between two wallets is what makes a mismatch visible.
+    #[test]
+    fn pending_share_rounds_follows_the_handle_to_the_current_wallet() {
+        let handle = open_memory_store(crate::NETWORK_ID_MAINNET, "wallet-a");
+        let params = synthetic_round_params(0x15, 123);
+        handle
+            .scoped()
+            .unwrap()
+            .ensure_round(zcash_voting::Network::Mainnet, &params, None)
+            .unwrap();
+        assert_eq!(list_rounds(&handle).unwrap().len(), 1);
+
+        handle.set_wallet_id("wallet-b").unwrap();
+        assert!(list_rounds(&handle).unwrap().is_empty());
+        assert!(pending_share_rounds(&handle).unwrap().is_empty());
+
+        let (db, wallet_id) = handle.scoped_with_id().unwrap();
+        assert_eq!(wallet_id, "wallet-b");
+        assert!(db.list_rounds().unwrap().is_empty());
     }
 
     #[test]

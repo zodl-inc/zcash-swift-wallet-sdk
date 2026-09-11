@@ -14,9 +14,11 @@
 //! is what lets Swift open a session on the main thread and discover a bad
 //! round configuration immediately rather than through a timeout.
 //!
-//! Traffic splits by kind (spec D12): chain and helper requests go through the
-//! route chosen at open — Tor or direct, never falling back — while PIR and
-//! vote-tree requests use the process-wide direct transport.
+//! Traffic splits by kind: chain and helper requests go through the route
+//! chosen at open — Tor or direct, never falling back — because they are what
+//! links this device to a vote. PIR and vote-tree requests use the
+//! process-wide direct transport: they identify no voter and move enough
+//! bytes that routing them over Tor would cost far more than it bought.
 //!
 //! A run — [`VotingSession::run`] or [`VotingSession::track_shares`] — is
 //! driven on the shared runtime instead of on the calling thread, and streams
@@ -36,7 +38,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use zeroize::Zeroizing;
 
-use super::errors::{VotingResultExt, internal, invalid_input};
+use super::errors::{VotingResultExt, envelope_or_invalid_input, internal, invalid_input};
 use super::route::SdkRoute;
 use super::signer::SeedSpendAuthSigner;
 use super::store::VotingDatabaseHandle;
@@ -45,7 +47,7 @@ use super::wire::{
     BallotIntentDto, BundleLayoutDto, DelegationProgressDto, DrivePolicyDto, EligibilityDto,
     HostOverridesDto, KeystoneSignatureBatchResultDto, KeystoneSignedBundleDto,
     KeystoneSigningRequestDto, PirPrecomputeDto, ProofStatusDto, SessionBindingDto,
-    SessionEventDto, SessionInputsDto, ShareTrackingPolicyDto, SignerDto,
+    SessionEventDto, SessionInputsDto, ShareTrackingPolicyDto, SignerDto, plan_view,
 };
 
 /// Stack the delegation proving thread is created with.
@@ -101,6 +103,12 @@ impl EventSink {
 
     /// A sink over the host's `callback`, called with `context`.
     ///
+    /// The callback runs on whichever thread reached the event: one of the
+    /// shared runtime's workers, or the proof thread this module creates. It
+    /// must not block — the round driver reports from concurrent bundle tasks,
+    /// and a callback that waits holds one of them up and can stall the run.
+    /// Hand the JSON off and return.
+    ///
     /// # Safety
     ///
     /// `callback`, when present, must be safe to call with `context` from any
@@ -150,9 +158,12 @@ impl EventSink {
             // emitted string's bytes.
             let collected = unsafe { &*context.cast::<std::sync::Mutex<Vec<String>>>() };
             let json = unsafe { std::slice::from_raw_parts(json, json_len) };
+            // A panic must not unwind out of an `extern "C"` frame, so a
+            // poisoned lock is taken anyway: the assertion belongs to the test
+            // that reads the vector back, not to the driver's worker thread.
             collected
                 .lock()
-                .expect("collected events")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(String::from_utf8_lossy(json).into_owned());
         }
 
@@ -188,7 +199,8 @@ pub struct VotingSession {
     /// `DelegationDriver` while this session keeps using it.
     pipeline: Arc<zcash_voting::DelegationPipeline<SdkWalletDbOpener>>,
     /// The PIR fleet delegation precompute queries, over the shared direct
-    /// transport (spec D12).
+    /// transport rather than this session's route: a PIR query names no
+    /// voter, and the volume it moves does not belong on Tor.
     pir: Arc<zcash_voting::PirFleet>,
     /// The helper client, kept beside the executor's clone: the two share one
     /// health tracker, so share tracking observes what the round's deliveries
@@ -268,7 +280,9 @@ impl VotingSession {
             .transpose()
             .ffi()?;
 
-        // Spec D6: the existing five-note policy with privacy trimming off.
+        // The five-note bundle layout this SDK has always used, with privacy
+        // trimming off: trimming drops eligible notes to blur the voter's
+        // weight, which costs voting power the voter did not agree to give up.
         // A round that already persisted a plan keeps its stored policy — the
         // crate treats that one as authoritative — so this seeds new rounds only.
         let bundle_policy = zcash_voting::BundlePolicy::default().with_max_privacy_bundles(None);
@@ -334,8 +348,9 @@ impl VotingSession {
             hotkey_secret: binding.hotkey_secret.map(Zeroizing::new),
         })
         .ffi()?
-        // Vote-tree sync is not chain or helper traffic, so it keeps the
-        // shared direct transport whatever route this session chose (spec D12).
+        // Vote-tree sync is not chain or helper traffic — it names no voter —
+        // so it keeps the shared direct transport whatever route this session
+        // chose.
         .with_tree_transport(super::runtime::direct_transport());
 
         let control = zcash_voting::ChainSubmissionControl::new(epoch);
@@ -365,7 +380,7 @@ impl VotingSession {
     /// which the bare `resume_plan` does not check.
     pub(super) fn plan(&self) -> anyhow::Result<zcash_voting::wire::RoundPlanView> {
         let plan = self.executor.plan().ffi()?;
-        zcash_voting::wire::RoundPlanView::try_from(plan).ffi()
+        plan_view(plan)
     }
 
     /// Records ballot decisions and returns the refreshed plan.
@@ -382,7 +397,7 @@ impl VotingSession {
             .map(BallotIntentDto::into_intent)
             .collect::<Vec<_>>();
         let plan = self.executor.set_ballot_intents(&intents).ffi()?;
-        zcash_voting::wire::RoundPlanView::try_from(plan).ffi()
+        plan_view(plan)
     }
 
     /// Creates the round row, then its delegation bundle rows.
@@ -423,8 +438,8 @@ impl VotingSession {
     /// The one delegation step worth running ahead of a drive: a bundle whose
     /// rows are already warm proves without waiting on the PIR fleet, and the
     /// report says how much of the warmth was already there. PIR traffic takes
-    /// the shared direct transport whatever route this session opened on
-    /// (spec D12).
+    /// the shared direct transport whatever route this session opened on: a
+    /// PIR query names no voter, and its volume does not belong on Tor.
     pub(super) fn precompute_pir(&self, bundle_index: u32) -> anyhow::Result<PirPrecomputeDto> {
         let report = self
             .pipeline
@@ -482,7 +497,8 @@ impl VotingSession {
     }
 
     /// The redacted PCZTs a Keystone device signs, one per named bundle and in
-    /// the order named (spec D8).
+    /// the order named — one request per bundle, because the device signs one
+    /// QR at a time and the host shows them in the order it asked for.
     ///
     /// A bundle the pipeline cannot build a request for fails the whole call
     /// rather than dropping out of the batch: the host asked for the set of
@@ -561,8 +577,9 @@ impl VotingSession {
     /// `signer` decides what the run may do with delegation. Without one, the
     /// driver reports the bundles that owe a signature instead of dispatching
     /// them; with a software seed, the seed goes into [`SeedSpendAuthSigner`]
-    /// and nowhere else, and its `Zeroizing` buffer is wiped when this run's
-    /// delegation inputs drop with the spawned task (spec D9).
+    /// and nowhere else — never into Swift, and never into a sighash, alpha or
+    /// PCZT the host could see — and its `Zeroizing` buffer is wiped when this
+    /// run's delegation inputs drop with the spawned task.
     ///
     /// The driver itself never fails: a run that could do nothing says why
     /// through the report's quiescence. What can fail is either side of it —
@@ -586,13 +603,13 @@ impl VotingSession {
             SignerDto::Software { seed } => {
                 Some(zcash_voting::DelegationSigner::Software(Arc::new(
                     // `SeedSpendAuthSigner::new` rejects a seed it cannot derive
-                    // from with a bare message, so it is re-wrapped here: every
-                    // failure this call returns has to reach Swift as the typed
-                    // envelope the rest of the session uses. The network checks it
-                    // delegates report `invalid_input` themselves, so the kind is
-                    // the same either way.
+                    // from with a bare message, which has to reach Swift as the
+                    // typed envelope the rest of the session uses — but the
+                    // network check it delegates already returns one, so wrapping
+                    // unconditionally would nest that envelope's JSON inside a
+                    // second one's message.
                     SeedSpendAuthSigner::new(seed, self.network_id, self.network)
-                        .map_err(|e| invalid_input(e.to_string()))?,
+                        .map_err(envelope_or_invalid_input)?,
                 )))
             }
             SignerDto::KeystoneStored => Some(zcash_voting::DelegationSigner::Keystone(
@@ -916,7 +933,9 @@ fn require_distinct_bundles(bundle_indices: &[u32]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::voting::store;
     use crate::voting::test_support::*;
+    use crate::voting::wire::DecisionDto;
 
     /// A session over a fresh in-memory store and a fresh wallet holding one
     /// note-less account.
@@ -948,6 +967,23 @@ mod tests {
         )
         .expect("open");
         (store, dir, session)
+    }
+
+    /// The refusal a wallet with nothing to vote with produces.
+    ///
+    /// Note selection reports it as `NoSpendableNotes` or, once weight is
+    /// decomposed, as `InsufficientEligibility`; which of the two a fixture
+    /// lands on is the crate's business, and every caller here only needs the
+    /// round to have refused rather than failed some other way.
+    fn assert_empty_wallet_refusal(err: &anyhow::Error) {
+        let kind = error_kind(err);
+        assert!(
+            matches!(
+                kind.as_str(),
+                "no_spendable_notes" | "insufficient_eligibility"
+            ),
+            "unexpected kind for an empty wallet: {kind}"
+        );
     }
 
     /// The error kind of a voting failure that crossed as `VotingErrorView` JSON.
@@ -992,16 +1028,29 @@ mod tests {
         assert_eq!(session.round_id(), hex_round_id(0x20));
     }
 
-    /// A round whose bundle setup failed still plans, and says what it owes.
+    /// A round whose bundle setup failed keeps its row and still plans.
     ///
     /// This is the sequence a voter with no eligible notes produces, so the
     /// round must survive it: `setup_bundles` persisted the round row before
     /// note selection refused, and the plan that follows reports a round that
-    /// owes a draft — no proposal has been decided — rather than failing.
+    /// owes a draft — no proposal has been decided — rather than failing. The
+    /// surviving row is asserted through the store, because a plan alone reads
+    /// the same for a round the sidecar never recorded.
     #[test]
-    fn open_then_plan_on_fresh_round_needs_bundle_setup() {
-        let (_store, _dir, session) = open_session(0x22);
-        session.setup_bundles().unwrap_err(); // empty wallet: no spendable notes
+    fn plan_after_a_refused_bundle_setup_keeps_the_round_and_owes_a_draft() {
+        let (store, _dir, session) = open_session(0x22);
+        let err = session.setup_bundles().unwrap_err(); // empty wallet
+        assert_empty_wallet_refusal(&err);
+
+        let rounds = store::list_rounds(&store).expect("rounds");
+        assert_eq!(
+            rounds
+                .iter()
+                .map(|r| r.round_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![hex_round_id(0x22).as_str()],
+        );
+
         let plan = session.plan().expect("a round with no bundles still plans");
         assert_eq!(plan.round_id, hex_round_id(0x22));
         assert!(plan.needs_draft_setup);
@@ -1026,29 +1075,23 @@ mod tests {
     fn setup_bundles_on_empty_wallet_is_no_spendable_notes() {
         let (_store, _dir, session) = open_session(0x23);
         let err = session.setup_bundles().unwrap_err();
-        assert!(matches!(
-            error_kind(&err).as_str(),
-            "no_spendable_notes" | "insufficient_eligibility"
-        ));
+        assert_empty_wallet_refusal(&err);
     }
 
     #[test]
     fn eligibility_on_empty_wallet_is_no_spendable_notes() {
         let (_store, _dir, session) = open_session(0x26);
         let err = session.eligibility().unwrap_err();
-        assert!(matches!(
-            error_kind(&err).as_str(),
-            "no_spendable_notes" | "insufficient_eligibility"
-        ));
+        assert_empty_wallet_refusal(&err);
     }
 
     #[test]
     fn set_ballot_intents_requires_rostered_proposals() {
         let (_store, _dir, session) = open_session(0x24);
         let err = session
-            .set_ballot_intents(vec![crate::voting::wire::BallotIntentDto {
+            .set_ballot_intents(vec![BallotIntentDto {
                 proposal_id: 99,
-                decision: crate::voting::wire::DecisionDto::Skipped,
+                decision: DecisionDto::Skipped,
             }])
             .unwrap_err();
         assert_eq!(error_kind(&err), "invalid_input");
@@ -1063,9 +1106,9 @@ mod tests {
         let (_store, _dir, session) = open_session(0x27);
         session.setup_bundles().unwrap_err();
         let plan = session
-            .set_ballot_intents(vec![crate::voting::wire::BallotIntentDto {
+            .set_ballot_intents(vec![BallotIntentDto {
                 proposal_id: 1,
-                decision: crate::voting::wire::DecisionDto::Choice { option: 0 },
+                decision: DecisionDto::Choice { option: 0 },
             }])
             .expect("plan");
         assert_eq!(plan.round_id, hex_round_id(0x27));
@@ -1082,9 +1125,9 @@ mod tests {
     fn set_ballot_intents_before_round_setup_is_a_typed_error() {
         let (_store, _dir, session) = open_session(0x28);
         let err = session
-            .set_ballot_intents(vec![crate::voting::wire::BallotIntentDto {
+            .set_ballot_intents(vec![BallotIntentDto {
                 proposal_id: 1,
-                decision: crate::voting::wire::DecisionDto::Choice { option: 0 },
+                decision: DecisionDto::Choice { option: 0 },
             }])
             .unwrap_err();
         assert_eq!(error_kind(&err), "storage");
@@ -1106,15 +1149,30 @@ mod tests {
 
     /// A sink with no callback drops events rather than calling through a
     /// null function pointer.
+    ///
+    /// Asserted against a collecting sink rather than on its own: that the
+    /// call returns proves only that nothing crashed, so the same event is
+    /// emitted through a sink that records it and then through the empty one,
+    /// and what must hold is that the recorded vector does not grow.
     #[test]
     fn event_sink_without_a_callback_drops_events() {
-        EventSink::none().emit(&SessionEventDto::DelegationProgress {
-            progress: crate::voting::wire::DelegationProgressDto {
+        let event = SessionEventDto::DelegationProgress {
+            progress: DelegationProgressDto {
                 bundle_index: 0,
                 stage: "proof_starting".to_string(),
                 fraction: None,
             },
-        });
+        };
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        EventSink::collecting(&seen).emit(&event);
+        assert_eq!(collected(&seen).len(), 1, "the collecting sink recorded it");
+
+        EventSink::none().emit(&event);
+        assert_eq!(
+            collected(&seen).len(),
+            1,
+            "a sink with no callback must record nothing"
+        );
     }
 
     /// A cancelled session drives nothing: no plan is read and no endpoint is
@@ -1146,6 +1204,10 @@ mod tests {
     /// A seed the signer cannot derive from stops the call before anything is
     /// spawned, and reaches Swift as the typed envelope every other session
     /// failure uses rather than as a bare message.
+    ///
+    /// The message is asserted too, because the failure is wrapped on its way
+    /// out: a wrap that did not check for an envelope first would put a
+    /// serialized error where Swift shows text.
     #[test]
     fn run_with_a_software_seed_too_short_to_derive_is_a_typed_error() {
         let (_store, _dir, session) = open_session(0x35);
@@ -1159,6 +1221,13 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error_kind(&err), "invalid_input");
+        let view: zcash_voting::VotingErrorView =
+            serde_json::from_str(&err.to_string()).expect("typed JSON error");
+        assert!(
+            view.message.contains("seed must be at least"),
+            "not the seed refusal in readable form: {}",
+            view.message
+        );
     }
 
     /// A fresh round with an undecided ballot: nothing is dispatchable, and the
@@ -1217,13 +1286,13 @@ mod tests {
         session.setup_bundles().unwrap_err();
         session
             .set_ballot_intents(vec![
-                crate::voting::wire::BallotIntentDto {
+                BallotIntentDto {
                     proposal_id: 1,
-                    decision: crate::voting::wire::DecisionDto::Choice { option: 0 },
+                    decision: DecisionDto::Choice { option: 0 },
                 },
-                crate::voting::wire::BallotIntentDto {
+                BallotIntentDto {
                     proposal_id: 2,
-                    decision: crate::voting::wire::DecisionDto::Skipped,
+                    decision: DecisionDto::Skipped,
                 },
             ])
             .expect("a terminal ballot over the bound roster");
@@ -1277,8 +1346,8 @@ mod tests {
 
     /// One Keystone-signed bundle, with PCZT bytes no signature can come out
     /// of: every assertion below refuses the batch before it reads them.
-    fn signed_bundle(bundle_index: u32) -> crate::voting::wire::KeystoneSignedBundleDto {
-        crate::voting::wire::KeystoneSignedBundleDto {
+    fn signed_bundle(bundle_index: u32) -> KeystoneSignedBundleDto {
+        KeystoneSignedBundleDto {
             bundle_index,
             signed_pczt: vec![0u8; 4],
         }
@@ -1311,10 +1380,7 @@ mod tests {
     fn keystone_request_without_setup_is_a_typed_error() {
         let (_store, _dir, session) = open_session(0x42);
         let err = session.keystone_signing_requests(&[0]).unwrap_err();
-        assert!(matches!(
-            error_kind(&err).as_str(),
-            "no_spendable_notes" | "insufficient_eligibility"
-        ));
+        assert_empty_wallet_refusal(&err);
     }
 
     /// PIR precompute prepares the bundle before it warms a single row, so an
@@ -1325,10 +1391,7 @@ mod tests {
     fn precompute_pir_without_bundles_is_a_typed_error() {
         let (_store, _dir, session) = open_session(0x43);
         let err = session.precompute_pir(0).unwrap_err();
-        assert!(matches!(
-            error_kind(&err).as_str(),
-            "no_spendable_notes" | "insufficient_eligibility"
-        ));
+        assert_empty_wallet_refusal(&err);
     }
 
     #[test]
@@ -1370,10 +1433,7 @@ mod tests {
         // The empty wallet's own refusal, which is also what says the fleet
         // was never reached: a dialled endpoint would have failed as its own
         // transport kind instead.
-        assert!(matches!(
-            error_kind(&err).as_str(),
-            "no_spendable_notes" | "insufficient_eligibility"
-        ));
+        assert_empty_wallet_refusal(&err);
 
         let events = collected(&seen);
         assert!(

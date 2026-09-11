@@ -28,8 +28,6 @@ static DIRECT: OnceLock<Arc<HyperTransport<DirectRoute>>> = OnceLock::new();
 ///
 /// Built lazily on first use and reused by every session thereafter — one
 /// process-wide runtime rather than one per session.
-// Consumed by session setup, which lands in a later change.
-#[allow(dead_code)]
 pub(super) fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -41,13 +39,13 @@ pub(super) fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-/// The process-wide direct HTTP transport for PIR and vote-tree traffic (spec D12).
+/// The process-wide direct HTTP transport for PIR and vote-tree traffic.
 ///
 /// Chain and helper traffic route through the transport selected at session
 /// open (Tor or direct); PIR and vote-tree traffic always use this shared
-/// direct transport instead.
-// Consumed by session setup, which lands in a later change.
-#[allow(dead_code)]
+/// direct transport instead, because neither carries anything that identifies
+/// the voter to an observer and both are throughput-sensitive enough that
+/// routing them over Tor would cost far more than it bought.
 pub(super) fn direct_transport() -> Arc<HyperTransport<DirectRoute>> {
     DIRECT
         .get_or_init(|| Arc::new(HyperTransport::new()))
@@ -63,8 +61,7 @@ pub(super) enum ProvingConfigureOutcome {
     AlreadyConfigured,
 }
 
-/// Fixes the process-wide proving policy (spec D6), or reports that one is
-/// already fixed.
+/// Fixes the process-wide proving policy, or reports that one is already fixed.
 pub(super) fn configure_proving(policy: ProvingPolicy) -> anyhow::Result<ProvingConfigureOutcome> {
     match configure_proving_runtime(policy) {
         Ok(()) => Ok(ProvingConfigureOutcome::Configured),
@@ -75,8 +72,7 @@ pub(super) fn configure_proving(policy: ProvingPolicy) -> anyhow::Result<Proving
     }
 }
 
-/// Fixes the process-wide proving policy (spec D6) from a JSON-encoded
-/// `ProvingPolicyDto`.
+/// Fixes the process-wide proving policy from a JSON-encoded `ProvingPolicyDto`.
 ///
 /// Returns `0` when this call configured the pool, `1` when it was already
 /// configured, `-1` on error (including malformed JSON).

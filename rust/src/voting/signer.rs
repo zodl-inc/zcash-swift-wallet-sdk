@@ -42,16 +42,12 @@ use super::helpers::{usk_from_seed, voting_network};
 /// consensus parameters the same way every other `zcashlc_*` entry point does.
 /// `network` is the crate's view of the same chain, and every request the crate
 /// hands over must name it — see [`sign_delegation_request`].
-// Consumed by session setup, which lands in a later change.
-#[allow(dead_code)]
 pub(super) struct SeedSpendAuthSigner {
     seed: Zeroizing<Vec<u8>>,
     network_id: u32,
     network: Network,
 }
 
-// Consumed by session setup, which lands in a later change.
-#[allow(dead_code)]
 impl SeedSpendAuthSigner {
     /// A signer over `seed`, rejecting anything too short to derive from and
     /// any `network_id` / `network` pair that does not name one chain.
@@ -117,8 +113,6 @@ impl SpendAuthSigner for SeedSpendAuthSigner {
 /// or the derived key is not the account key the request's `alpha` was drawn
 /// against. [`SeedSpendAuthSigner::new`] is where that is checked for the
 /// signer path.
-// Consumed by session setup, which lands in a later change.
-#[allow(dead_code)]
 pub(super) fn sign_delegation_request(
     seed: &[u8],
     network_id: u32,
@@ -171,8 +165,6 @@ pub(super) fn sign_delegation_request(
 /// The sighash and `rk` come from the request the device was given, not from
 /// the PCZT it returned: they are what the stored signature is later verified
 /// against, so they must be the values this wallet set up the bundle with.
-// Consumed by the session FFI's Keystone signature storage, which lands in a later change.
-#[allow(dead_code)]
 pub(super) fn keystone_signature_input(
     request: &KeystoneSigningRequest,
     signed_pczt: &[u8],
@@ -309,6 +301,27 @@ mod tests {
 
         assert_eq!(err.kind(), zcash_voting::VotingErrorKind::InvalidInput);
         assert!(err.to_string().contains("ZIP-32"), "unexpected: {err}");
+    }
+
+    /// ZIP-32 account indices are 31-bit; the hardened bit is the derivation's
+    /// own. A request naming an index with that bit set has to be refused
+    /// before any key is derived, or the derivation would silently sign under
+    /// a different account than the one the request named.
+    #[test]
+    fn account_index_above_the_zip32_range_is_rejected() {
+        let seed = [1u8; 32];
+        let mut request = request_for(&seed, [0u8; 32]);
+        request.account_index = 1 << 31;
+
+        let err =
+            sign_delegation_request(&seed, crate::NETWORK_ID_TESTNET, Network::Testnet, request)
+                .unwrap_err();
+
+        assert_eq!(err.kind(), zcash_voting::VotingErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("account_index"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]
