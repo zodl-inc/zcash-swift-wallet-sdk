@@ -61,24 +61,33 @@ public enum VotingRustBackendError: LocalizedError, Equatable {
 /// and writes hold it for their whole duration — they are queries, and holding
 /// it is what keeps ``close()`` from freeing the handle underneath one. The one
 /// store call that reaches the network, ``syncVoteTree(roundId:nodeUrl:)``,
-/// does not: it runs its FFI call on a detached task with the lock released, so
-/// a round listing or a close is never stuck behind a tree sync. Everything
-/// else that blocks for longer than a query belongs to a session.
+/// does not: it runs its FFI call on the voting surface's own threads with the
+/// lock released, so a round listing or a close is never stuck behind a tree
+/// sync. Everything else that blocks for longer than a query belongs to a
+/// session.
 public final class VotingRustBackend: @unchecked Sendable {
     private let lock = NSLock()
     private var handle: OpaquePointer?
-    /// The handle a ``close()`` could not free because a sync was still using
-    /// it. The last sync to finish frees it.
-    private var handleAwaitingFree: OpaquePointer?
-    /// The detached vote-tree syncs running right now, keyed so a finished one
-    /// removes its own entry and no other.
-    private var inFlight: [UUID: Task<Void, Never>] = [:]
+    /// The handles a ``close()`` could not free because a sync was still using
+    /// one. The last sync to finish frees them all: a backend closed and
+    /// reopened while a sync runs parks a second handle, and neither of them
+    /// may be lost.
+    private var handlesAwaitingFree: [OpaquePointer] = []
+    /// The blocking vote-tree syncs running right now.
+    private let calls = VotingBlockingCalls()
 
     public init() {}
 
     deinit {
         if let handle {
             zcashlc_voting_db_free(handle)
+        }
+        // A parked handle outlives its `close()` only while the sync using it
+        // runs, and that sync holds this backend — so reaching here with one
+        // parked should not happen. It is freed rather than trusted to: the
+        // alternative is a leaked sidecar connection nothing can reach.
+        for parked in handlesAwaitingFree {
+            zcashlc_voting_db_free(parked)
         }
     }
 
@@ -138,10 +147,10 @@ public final class VotingRustBackend: @unchecked Sendable {
         // Cleared before the free decision, so a call racing this one is
         // refused as closed whichever side of the free it lands on.
         handle = nil
-        if inFlight.isEmpty {
+        if calls.isIdle {
             zcashlc_voting_db_free(dbh)
         } else {
-            handleAwaitingFree = dbh
+            handlesAwaitingFree.append(dbh)
         }
     }
 
@@ -206,16 +215,17 @@ public final class VotingRustBackend: @unchecked Sendable {
     /// it synced to.
     ///
     /// The one store call that reaches the network, and it blocks for the whole
-    /// sync, so it runs its FFI call on a detached task rather than on the
-    /// caller's executor — and without the backend lock, which would otherwise
-    /// hold up every other call on this handle, ``close()`` included, for the
-    /// duration of a network round trip. The handle stays valid while it runs:
-    /// a close during a sync frees the handle when the sync returns.
+    /// sync, so it runs its FFI call on the voting surface's own threads rather
+    /// than on the caller's executor — and without the backend lock, which
+    /// would otherwise hold up every other call on this handle, ``close()``
+    /// included, for the duration of a network round trip. The handle stays
+    /// valid while it runs: a close during a sync frees the handle when the
+    /// sync returns.
     public func syncVoteTree(roundId: String, nodeUrl: String) async throws -> UInt32 {
         let id = [UInt8](roundId.utf8)
         let url = [UInt8](nodeUrl.utf8)
 
-        let height = try await detached { dbh -> Int64 in
+        let height = try await runBlocking { dbh -> Int64 in
             let synced = id.withUnsafeBufferPointer { idBytes in
                 url.withUnsafeBufferPointer { urlBytes in
                     zcashlc_voting_sync_vote_tree(
@@ -663,6 +673,35 @@ extension VotingRustBackend {
     }
 }
 
+// MARK: - Blocking calls
+
+/// Internal to the SDK: the seam the one blocking store call runs through, and
+/// what the tests over the handle's lifetime read.
+extension VotingRustBackend {
+    /// Runs `body` on the voting surface's own threads, registered as in
+    /// flight, without holding the lock while it runs.
+    ///
+    /// A ``close()`` during the call parks the handle rather than freeing it,
+    /// and this is what frees it when the last such call returns.
+    func runBlocking<T: Sendable>(_ body: @escaping @Sendable (OpaquePointer) throws -> T) async throws -> T {
+        let (dbh, ticket) = try startCall()
+        defer { freeHandlesNoCallIsUsing() }
+
+        return try await calls.run(ticket: ticket) { try body(dbh) }
+    }
+
+    /// How many handles a ``close()`` has parked for a call still using them.
+    ///
+    /// Zero in a quiet backend, and zero again once the last of those calls has
+    /// returned. Read by the tests that prove a second close does not lose the
+    /// first one's handle.
+    var parkedHandleCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return handlesAwaitingFree.count
+    }
+}
+
 // MARK: - Private helpers
 
 private extension VotingRustBackend {
@@ -704,57 +743,35 @@ private extension VotingRustBackend {
         }
     }
 
-    /// Runs `body` on a detached task registered as in flight, without holding
-    /// the lock while it runs.
+    /// Reads the handle and registers the call under one lock hold, so a call
+    /// either registers before ``close()`` decides whether it may free the
+    /// handle or is refused as closed: there is no window where a call starts
+    /// against a handle that is about to be freed.
     ///
-    /// The handle is read and the task registered under one lock hold, so a
-    /// call either registers before ``close()`` looks at the list or is refused
-    /// as closed: there is no window where a call starts against a handle that
-    /// is about to be freed.
-    func detached<T: Sendable>(_ body: @escaping @Sendable (OpaquePointer) throws -> T) async throws -> T {
-        let box = VotingResultBox<T>()
-        let ticket = UUID()
-        let task = try startDetached(ticket: ticket) { dbh in
-            box.complete(Result<T, Error> { try body(dbh) })
-        }
-
-        await task.value
-        finishDetached(ticket: ticket)
-
-        return try box.take()
-    }
-
     /// Synchronous, because that is what taking a lock around a few field reads
     /// should be: an `async` function may not hold an `NSLock` across a suspension.
-    func startDetached(
-        ticket: UUID,
-        _ body: @escaping @Sendable (OpaquePointer) -> Void
-    ) throws -> Task<Void, Never> {
+    func startCall() throws -> (OpaquePointer, UUID) {
         lock.lock()
         defer { lock.unlock() }
 
         guard let dbh = handle else {
             throw VotingRustBackendError.databaseNotOpen
         }
-
-        let task = Task.detached(priority: .userInitiated) {
-            body(dbh)
-        }
-        inFlight[ticket] = task
-        return task
+        return (dbh, calls.register())
     }
 
-    /// Retires one finished call, freeing the handle a ``close()`` left behind
-    /// once it was the last one using it.
-    func finishDetached(ticket: UUID) {
+    /// Frees the handles a ``close()`` left behind, once the last call that
+    /// could still have been using one has returned.
+    func freeHandlesNoCallIsUsing() {
         lock.lock()
         defer { lock.unlock() }
 
-        inFlight[ticket] = nil
-        if inFlight.isEmpty, let dbh = handleAwaitingFree {
-            zcashlc_voting_db_free(dbh)
-            handleAwaitingFree = nil
+        guard calls.isIdle, !handlesAwaitingFree.isEmpty else { return }
+
+        for parked in handlesAwaitingFree {
+            zcashlc_voting_db_free(parked)
         }
+        handlesAwaitingFree.removeAll()
     }
 
     /// Refuses the empty round id the FFI reads as "every round of this

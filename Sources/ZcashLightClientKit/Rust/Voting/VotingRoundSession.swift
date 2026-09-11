@@ -84,33 +84,6 @@ private let votingEventTrampoline: @convention(c) (
         .report(json, length: Int(length))
 }
 
-/// Carries a detached call's answer back to the task that awaited it.
-///
-/// Shared with ``VotingRustBackend``, whose vote-tree sync runs detached for
-/// the same reason: the FFI call blocks, so it must not run on the caller's
-/// executor, and its answer has to cross back.
-final class VotingResultBox<Value>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var result: Result<Value, Error>?
-
-    func complete(_ result: Result<Value, Error>) {
-        lock.lock()
-        defer { lock.unlock() }
-        self.result = result
-    }
-
-    /// The answer the detached call left. Called only after that call has
-    /// finished, so an empty box is this file's own bug rather than a race.
-    func take() throws -> Value {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let result else {
-            throw VotingError(kind: .internal, message: "voting FFI task finished without a result")
-        }
-        return try result.get()
-    }
-}
-
 // MARK: - VotingRoundSession
 
 /// One open voting round.
@@ -122,9 +95,11 @@ final class VotingResultBox<Value>: @unchecked Sendable {
 /// — chosen at open for its whole life.
 ///
 /// Blocking and cancellation: every call that reads the wallet, proves, or
-/// reaches the network runs its FFI call on a detached task and is awaited, so
-/// no caller's executor is blocked. ``cancel()`` stops a run or a tracking run
-/// at its next boundary; it does not interrupt a proof already running under
+/// reaches the network runs its FFI call on the voting surface's own threads
+/// (``VotingBlockingCalls``) and is awaited, so neither the caller's executor
+/// nor a thread of Swift's cooperative pool is held for the minutes such a call
+/// can take. ``cancel()`` stops a run or a tracking run at its next boundary;
+/// it does not interrupt a proof already running under
 /// ``precomputeDelegationProof(bundleIndex:progress:)``, which the crate takes
 /// no cancellation signal for at this revision — a proof that finishes is
 /// persisted and reused, so nothing is wasted. Cancellation is permanent: a
@@ -157,10 +132,9 @@ public final class VotingRoundSession: @unchecked Sendable {
     private var handle: OpaquePointer?
     private var closed = false
     private var driving = false
-    /// The detached tasks running FFI calls right now, which ``close()`` waits
-    /// for before it frees the handle. Keyed rather than a bare set so a
-    /// finished call removes its own entry and no other.
-    private var inFlight: [UUID: Task<Void, Never>] = [:]
+    /// The blocking FFI calls this session has running right now, which
+    /// ``close()`` waits for before it frees the handle.
+    private let calls = VotingBlockingCalls()
     private let eventQueue: DispatchQueue
 
     init(handle: OpaquePointer, roundId: String) {
@@ -460,11 +434,8 @@ public final class VotingRoundSession: @unchecked Sendable {
     /// its closure writes to should expect one more call into it.
     public func close() async {
         cancel()
-
-        for task in markClosed() {
-            await task.value
-        }
-
+        markClosed()
+        await calls.join()
         releaseHandle()
     }
 }
@@ -487,85 +458,59 @@ private extension VotingRoundSession {
         return try operation(session)
     }
 
-    /// Runs one blocking FFI call on a detached task and awaits it, decoding
-    /// the JSON it answers with.
+    /// Runs one blocking FFI call off the caller's executor and awaits it,
+    /// decoding the JSON it answers with.
     func blocking<T: Decodable & Sendable>(
         fallback: String,
         _ call: @escaping @Sendable (OpaquePointer) -> UnsafeMutablePointer<FfiBoxedSlice>?
     ) async throws -> T {
-        try await detached { session in
+        try await runBlocking { session in
             try VotingRustBackend.decodingJSON(fallback: fallback) {
                 call(session)
             }
         }
     }
 
-    /// Runs `body` on a detached task registered as in flight, so ``close()``
-    /// waits for it before freeing the handle.
+    /// Runs `body` on the voting surface's own threads, registered as in
+    /// flight, so ``close()`` waits for it before freeing the handle.
     ///
-    /// The handle is read and the task registered under one lock hold, so a
-    /// call either registers before ``close()`` takes its list or is refused as
-    /// closed: there is no window where a call starts against a handle that is
-    /// about to be freed.
-    func detached<T: Sendable>(_ body: @escaping @Sendable (OpaquePointer) throws -> T) async throws -> T {
-        let box = VotingResultBox<T>()
-        let ticket = UUID()
-        let task = try startDetached(ticket: ticket) { session in
-            box.complete(Result<T, Error> { try body(session) })
-        }
-
-        await task.value
-        finishDetached(ticket: ticket)
-
-        return try box.take()
+    /// The handle is read and the call registered under one lock hold, so a
+    /// call either joins what ``close()`` waits for or is refused as closed:
+    /// there is no window where a call starts against a handle that is about to
+    /// be freed.
+    func runBlocking<T: Sendable>(_ body: @escaping @Sendable (OpaquePointer) throws -> T) async throws -> T {
+        let (session, ticket) = try startCall()
+        return try await calls.run(ticket: ticket) { try body(session) }
     }
 
-    /// Reads the handle and registers the task under one lock hold, so a call
-    /// either joins the list ``VotingRoundSession/close()`` waits for or is
-    /// refused as closed. Synchronous because that is what taking a lock around
-    /// a few field reads should be.
-    func startDetached(
-        ticket: UUID,
-        _ body: @escaping @Sendable (OpaquePointer) -> Void
-    ) throws -> Task<Void, Never> {
+    /// Reads the handle and registers the call under one lock hold.
+    /// Synchronous because that is what taking a lock around a few field reads
+    /// should be: an `async` function may not hold an `NSLock` across a
+    /// suspension.
+    func startCall() throws -> (OpaquePointer, UUID) {
         lock.lock()
         defer { lock.unlock() }
 
         guard let session = handle, !closed else {
             throw VotingRustBackendError.sessionClosed
         }
-
-        // `userInitiated` because every call routed here is work a voter waits
-        // on, and the thread it blocks is its own.
-        let task = Task.detached(priority: .userInitiated) {
-            body(session)
-        }
-        inFlight[ticket] = task
-        return task
+        return (session, calls.register())
     }
 
-    func finishDetached(ticket: UUID) {
-        lock.lock()
-        defer { lock.unlock() }
-        inFlight[ticket] = nil
-    }
-
-    /// Closes the session to new work and answers with what is still in flight.
-    func markClosed() -> [Task<Void, Never>] {
+    /// Closes the session to new work. Every call registered after this throws
+    /// ``VotingRustBackendError/sessionClosed`` instead, which is what makes the
+    /// join that follows complete rather than chase new arrivals.
+    func markClosed() {
         lock.lock()
         defer { lock.unlock() }
         closed = true
-        return Array(inFlight.values)
     }
 
-    /// Frees the handle once nothing is in flight. The calls that owned the
-    /// tasks remove their own entries as they return; this clears whatever had
-    /// not got there yet.
+    /// Frees the handle once nothing is in flight.
     func releaseHandle() {
         lock.lock()
         defer { lock.unlock() }
 
-        inFlight.removeAll()
         if let session = handle {
             zcashlc_voting_session_free(session)
             handle = nil

@@ -143,6 +143,58 @@ final class VotingRustBackendTests: XCTestCase {
         XCTAssertEqual(try backend.listRounds(), [])
     }
 
+    /// A close that cannot free its handle parks it, and a second close while
+    /// the first handle is still parked parks its own rather than replacing it.
+    ///
+    /// The sequence is close → open → sync → close with the first sync still in
+    /// flight: a single parking slot would hold only the second handle, and the
+    /// first sidecar connection would be leaked with nothing left able to reach
+    /// it. Both handles are real, so the frees this asserts are real frees.
+    ///
+    /// The in-flight calls take the backend's own blocking path with a test body
+    /// in place of the FFI call: what the body does is irrelevant to the
+    /// bookkeeping, and a real `syncVoteTree` returns too fast to hold open.
+    func testASecondCloseParksItsOwnHandleRatherThanReplacingTheFirst() async throws {
+        let backend = VotingRustBackend()
+        let firstPath = "\(NSTemporaryDirectory())voting-\(UUID().uuidString).sqlite3"
+        let secondPath = "\(NSTemporaryDirectory())voting-\(UUID().uuidString).sqlite3"
+        addTeardownBlock {
+            try? FileManager.default.removeItem(atPath: firstPath)
+            try? FileManager.default.removeItem(atPath: secondPath)
+        }
+
+        let release = DispatchSemaphore(value: 0)
+        let firstRunning = expectation(description: "the first call is in flight")
+        let secondRunning = expectation(description: "the second call is in flight")
+
+        try backend.open(path: firstPath, networkId: 1)
+        async let first: Void = backend.runBlocking { _ in
+            firstRunning.fulfill()
+            release.wait()
+        }
+        await fulfillment(of: [firstRunning], timeout: 30)
+
+        backend.close()
+        XCTAssertEqual(backend.parkedHandleCount, 1)
+
+        try backend.open(path: secondPath, networkId: 1)
+        async let second: Void = backend.runBlocking { _ in
+            secondRunning.fulfill()
+            release.wait()
+        }
+        await fulfillment(of: [secondRunning], timeout: 30)
+
+        backend.close()
+        XCTAssertEqual(backend.parkedHandleCount, 2, "the second close replaced the handle the first one parked")
+
+        release.signal()
+        release.signal()
+        try await first
+        try await second
+
+        XCTAssertEqual(backend.parkedHandleCount, 0, "the last call to return frees every parked handle")
+    }
+
     /// The hotkey statics need no database, and a stored secret re-derives the
     /// same hotkey rather than a new one.
     func testHotkeyFromStoredSecretReDerivesTheSameHotkey() throws {
