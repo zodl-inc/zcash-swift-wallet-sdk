@@ -168,7 +168,9 @@ catch let error as VotingError {
     case .noSpendableNotes, .insufficientEligibility:
         showNotEligible()          // a state to show, not a fault to report
     case .pirUnavailable where error.retryable:
-        retryLater(after: error.endpoint)
+        // `endpoint` names the server that failed and `httpStatus` what it answered.
+        noteUnavailable(endpoint: error.endpoint, status: error.httpStatus)
+        retryLater()
     default:
         show(error.message)        // written to be read by a person
     }
@@ -233,7 +235,10 @@ and store what the device signs.
 
 ```swift
 let requests = try await session.keystoneSigningRequests(bundleIndices: plan.delegationBundlesNeedingSigning)
-let result = try await session.storeKeystoneSignatures(signedBundles)   // [VotingKeystoneSignedBundle]
+let signed = try await showQRsAndCollectSignatures(requests)      // [VotingKeystoneSignedBundle]
+let stored = try await session.storeKeystoneSignatures(signed)
+show("\(stored.inserted) stored, \(stored.alreadyPresent) already there")
+
 let report = try await session.run(signer: .keystoneStored) { event in render(event) }
 ```
 
@@ -267,7 +272,8 @@ case .backgroundShareWorkOnly:
     scheduleShareTracking(report.quiescence.shares)
 case .chainTerminal, .persistedChainTerminal, .chainRecoveryStalled:
     // `step` and `chainOutcome` name what ended; `chainOutcome.diagnosticMessage`
-    // is the redacted text to show. Running again will not move it.
+    // is the redacted text to show. Running again does not move it by itself —
+    // see the note on `retryBlockedCombinedCast(roundId:bundleIndex:)` below.
     show(report.quiescence.chainOutcome?.diagnosticMessage)
 case .failures:
     // `report.failures` carries each `VotingRoundStepFailureRecord`; `skippedBundles`
@@ -283,6 +289,19 @@ case .unknown:
 }
 ```
 
+Read `report.failures` whatever the quiescence kind is. A non-empty list does **not** imply a
+`.failures` quiescence: a run can isolate one bundle, carry on with the rest and finish as
+`.noWorkLeft` with failures recorded, and `report.skippedBundles` is the authoritative list of what
+was isolated. A host that only shows failures under `.failures` will silently drop the bundle that
+was skipped.
+
+One terminal state a host *can* move is an advisory combined-cast block: when the chain keeps
+refusing a bundle's combined cast, the wallet stops re-proving that delegation, and running again
+changes nothing until the voter says the cause is fixed.
+`VotingRustBackend.retryBlockedCombinedCast(roundId:bundleIndex:)` forgets that rejection streak and
+answers whether there was one to forget, so it belongs behind a deliberate "try again" rather than
+behind an automatic retry.
+
 Share tracking is its own bounded pass, with no signer, and its own quiescence
 (`VotingShareTrackingQuiescenceKind`):
 
@@ -293,15 +312,17 @@ case .allConfirmed, .nothingToTrack, .voteEndReached, .cancelled:
     stopTracking()
 case .failing, .passBudgetExhausted:
     rearmWithBackoff()             // bounded by the round's vote end
-case .alreadyDriving, .unknown:
+case .alreadyDriving:
     break                          // another pass already holds this round
+case .unknown:
+    break                          // a newer crate's reason
 }
 ```
 
 `run` and `trackShares` are exclusive per session: a second one while the first is in flight throws
 `VotingRustBackendError.sessionBusy`.
 
-### Cancelling, account switches, and shutdown
+### Cancelling, account and route changes, and shutdown
 
 `cancel()` stops a run or a tracking run at its next boundary, permanently — a cancelled session is
 finished, not paused, and further work on that round needs a new session. It does **not** interrupt
@@ -314,8 +335,20 @@ likewise not cancellable.
 switches wallets or leaves the flow, and every bounded pass started under the older epoch stops at
 its next boundary.
 
+**A route change means a new session.** The route is chosen once, at
+`makeVotingRoundSession(backend:inputs:binding:route:epoch:)`, and is fixed for the session's whole
+life: there is no setter, and `.tor` never falls back to `.direct`. So a Tor toggle in the middle of
+a voting flow — the voter turning Tor on or off, or the synchronizer losing its Tor client — is
+handled the same way as a wallet switch: `cancel()`, bump `setOperationEpoch(_:)` so anything still
+in flight stops at its next boundary, `await close()` the session, and open a new one with the new
+route. Nothing durable is lost by doing so: bundle rows, proofs and stored signatures live in the
+sidecar, and the new session picks the round up where the old one left it.
+
 `close()` cancels, waits for every call still in flight, and frees the handle; every call afterwards
-throws `VotingRustBackendError.sessionClosed`. Close the sessions before closing the backend, and
+throws `VotingRustBackendError.sessionClosed`. It does not drain the event queue, so one more call
+into the events closure can arrive after `close()` has returned — what it carries is an already
+decoded Swift value, nothing the freed handle owned, but a host that tears down the state its closure
+writes to should expect that last callback. Close the sessions before closing the backend, and
 close both before deleting the sidecar file — `VotingRustBackend.close()` does not wait for a
 `syncVoteTree` still in flight, so a host that means to delete the file rather than stop using it
 should let that sync finish first.

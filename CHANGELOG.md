@@ -201,6 +201,19 @@ and this library adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new `resetVoteTree(roundId:)` refuse an empty round id rather than resetting every round's cached
   tree state. `VotingKeystoneSignatureRecord`'s `sig`, `sighash` and `randomizedKey` are `Data`
   instead of `[UInt8]`.
+- New on the surviving `VotingRustBackend` surface, alongside the session:
+  `roundPlan(roundId:proposalIds:)` and `pendingShareRounds()` (the reads a round list and a
+  share-tracking schedule are built from), `resetVoteTree(roundId:)`,
+  `deleteRound(roundId:discardingRecovery:)`, `clearBallotIntents(roundId:proposalIds:)`,
+  `keystoneSignatures(roundId:)`, `configureProving(_:)`, and
+  `validateRoundId(_:)`, which reports whether a string is a canonical round id without needing a
+  database or a session. `retryBlockedCombinedCast(roundId:bundleIndex:)` forgets a bundle's
+  combined-cast rejection streak and answers whether there was one: the wallet stops re-proving a
+  delegation the chain keeps refusing, and this is the voter's explicit "the cause is fixed", so it
+  belongs behind a deliberate retry rather than an automatic one. `VotingRoundSession.eligibility()`
+  answers a `VotingEligibilityReport` — distinct note count, eligible weight, whether this account
+  can vote at all, and the value a privacy trim would drop — without persisting anything, so a
+  screen can say "you cannot vote in this round" before a round row exists.
 - `warmProvingCaches()` returns at once and warms in the background instead of warming on the
   calling thread, and the new `configureProving(_:)` must run **before** it: warming starts the
   proving pool, and starting it fixes the policy, after which `configureProving(_:)` returns `false`
