@@ -121,14 +121,38 @@ final class VotingRustBackendTests: XCTestCase {
     /// policy — so the assertion is the rule rather than that first answer.
     func testConfigureProvingIsIdempotent() throws {
         let policy = VotingProvingPolicy(cpuWorkerCount: nil, maxActiveHeavyJobs: 1)
-        let configured = try VotingRustBackend.configureProving(policy)
-        XCTAssertEqual(try VotingRustBackend.configureProving(policy), configured)
 
-        // Some policy is in force by now, whichever call fixed it. A heavy-job
-        // count no machine's core count is disagrees with it either way, and is
-        // refused rather than applied.
+        if try VotingRustBackend.configureProving(policy) {
+            // This call fixed the pool, so the policy in force is this one, and
+            // asking for it again is accepted as a fresh configure rather than
+            // reported as a conflict.
+            XCTAssertTrue(try VotingRustBackend.configureProving(policy))
+        }
+
+        // Some policy is in force by now, whichever call fixed it. This one
+        // asks for a heavy-job count that no machine's core count is, so it
+        // disagrees with whatever is in force and is refused rather than
+        // applied.
         let conflicting = VotingProvingPolicy(cpuWorkerCount: nil, maxActiveHeavyJobs: 1024)
         XCTAssertFalse(try VotingRustBackend.configureProving(conflicting))
+    }
+
+    /// The vote-tree sync is the one store call that reaches the network. It
+    /// runs off the backend lock, so a node that refuses the connection comes
+    /// back as the crate's typed failure and leaves the backend answering.
+    func testSyncVoteTreeReportsATypedFailureAndLeavesTheBackendUsable() async throws {
+        let backend = try openBackend()
+
+        do {
+            // Port 9 is the discard port: nothing listens, and loopback refuses
+            // at once rather than hanging.
+            _ = try await backend.syncVoteTree(roundId: hexRoundId(0x03), nodeUrl: "http://127.0.0.1:9/")
+            XCTFail("nothing is listening on the discard port")
+        } catch {
+            XCTAssertTrue(error is VotingError, "expected VotingError, got \(error)")
+        }
+
+        XCTAssertEqual(try backend.listRounds(), [])
     }
 
     /// The hotkey statics need no database, and a stored secret re-derives the

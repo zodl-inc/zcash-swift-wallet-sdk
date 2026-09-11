@@ -57,14 +57,22 @@ public enum VotingRustBackendError: LocalizedError, Equatable {
 /// refusals — no handle, a handle already open — throw
 /// ``VotingRustBackendError``.
 ///
-/// Thread safety: handle access is serialized by an `NSLock`, and the
-/// database-bound calls hold it for their full duration so `close()` cannot
-/// free the handle while Rust is using it. Those calls are sidecar reads and
-/// writes, not network or proving work; everything that blocks for longer than
-/// a query belongs to a session.
+/// Thread safety: handle access is serialized by an `NSLock`. The sidecar reads
+/// and writes hold it for their whole duration — they are queries, and holding
+/// it is what keeps ``close()`` from freeing the handle underneath one. The one
+/// store call that reaches the network, ``syncVoteTree(roundId:nodeUrl:)``,
+/// does not: it runs its FFI call on a detached task with the lock released, so
+/// a round listing or a close is never stuck behind a tree sync. Everything
+/// else that blocks for longer than a query belongs to a session.
 public final class VotingRustBackend: @unchecked Sendable {
     private let lock = NSLock()
     private var handle: OpaquePointer?
+    /// The handle a ``close()`` could not free because a sync was still using
+    /// it. The last sync to finish frees it.
+    private var handleAwaitingFree: OpaquePointer?
+    /// The detached vote-tree syncs running right now, keyed so a finished one
+    /// removes its own entry and no other.
+    private var inFlight: [UUID: Task<Void, Never>] = [:]
 
     public init() {}
 
@@ -112,13 +120,28 @@ public final class VotingRustBackend: @unchecked Sendable {
     /// opened from this handle keeps its own reference to the sidecar and
     /// stays usable, but closing the sessions first is the order that leaves
     /// nothing driving a round the host has stopped listening to.
+    ///
+    /// The backend is closed to new calls the moment this returns: every
+    /// database-bound call throws ``VotingRustBackendError/databaseNotOpen``
+    /// from here on. It does not wait for a
+    /// ``syncVoteTree(roundId:nodeUrl:)`` still in flight — this call does not
+    /// block, and a sync cannot be interrupted — so the handle, and with it the
+    /// sidecar connection, is freed when that sync returns instead of here. A
+    /// host that means to delete the sidecar file, rather than just stop using
+    /// it, should let the sync it started finish first.
     public func close() {
         lock.lock()
         defer { lock.unlock() }
 
-        if let dbh = handle {
+        guard let dbh = handle else { return }
+
+        // Cleared before the free decision, so a call racing this one is
+        // refused as closed whichever side of the free it lands on.
+        handle = nil
+        if inFlight.isEmpty {
             zcashlc_voting_db_free(dbh)
-            handle = nil
+        } else {
+            handleAwaitingFree = dbh
         }
     }
 
@@ -182,16 +205,37 @@ public final class VotingRustBackend: @unchecked Sendable {
     /// Sync a round's vote-commitment tree from `nodeUrl`, returning the height
     /// it synced to.
     ///
-    /// Blocks for the duration of the sync, so call it off the main actor.
-    public func syncVoteTree(roundId: String, nodeUrl: String) throws -> UInt32 {
+    /// The one store call that reaches the network, and it blocks for the whole
+    /// sync, so it runs its FFI call on a detached task rather than on the
+    /// caller's executor — and without the backend lock, which would otherwise
+    /// hold up every other call on this handle, ``close()`` included, for the
+    /// duration of a network round trip. The handle stays valid while it runs:
+    /// a close during a sync frees the handle when the sync returns.
+    public func syncVoteTree(roundId: String, nodeUrl: String) async throws -> UInt32 {
+        let id = [UInt8](roundId.utf8)
         let url = [UInt8](nodeUrl.utf8)
-        let height = try withRoundId(roundId, bytes: url) { dbh, id, idLen, node, nodeLen in
-            zcashlc_voting_sync_vote_tree(dbh, id, idLen, node, nodeLen)
+
+        let height = try await detached { dbh -> Int64 in
+            let synced = id.withUnsafeBufferPointer { idBytes in
+                url.withUnsafeBufferPointer { urlBytes in
+                    zcashlc_voting_sync_vote_tree(
+                        dbh,
+                        idBytes.baseAddress,
+                        UInt(idBytes.count),
+                        urlBytes.baseAddress,
+                        UInt(urlBytes.count)
+                    )
+                }
+            }
+
+            // Read here rather than after the await: the FFI's last-error slot
+            // is per-thread, and this is the thread that made the call.
+            guard synced >= 0 else {
+                throw Self.votingError(fallback: "`voting_sync_vote_tree` failed")
+            }
+            return synced
         }
 
-        guard height >= 0 else {
-            throw Self.votingError(fallback: "`voting_sync_vote_tree` failed")
-        }
         guard let synced = UInt32(exactly: height) else {
             throw VotingError(
                 kind: .internal,
@@ -569,7 +613,7 @@ extension VotingRustBackend {
         }
         defer { zcashlc_free_boxed_slice(ptr) }
 
-        let data = Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len))
+        let data = boxedSliceData(ptr)
         do {
             return try JSONDecoder().decode(T.self, from: data)
         } catch {
@@ -590,7 +634,18 @@ extension VotingRustBackend {
             throw votingError(fallback: fallback)
         }
         defer { zcashlc_free_boxed_slice(ptr) }
-        return [UInt8](Data(bytes: ptr.pointee.ptr, count: Int(ptr.pointee.len)))
+        return [UInt8](boxedSliceData(ptr))
+    }
+
+    /// The bytes a boxed slice carries.
+    ///
+    /// The FFI is allowed to answer with a null pointer when the length is
+    /// zero, and `Data(bytes:count:)` will not take one, so that case is read
+    /// as what it means: no bytes. An empty answer where JSON was expected then
+    /// surfaces as the typed decode failure rather than as a trap.
+    static func boxedSliceData(_ ptr: UnsafeMutablePointer<FfiBoxedSlice>) -> Data {
+        guard let bytes = ptr.pointee.ptr, ptr.pointee.len > 0 else { return Data() }
+        return Data(bytes: bytes, count: Int(ptr.pointee.len))
     }
 
     /// Encodes one FFI argument as JSON.
@@ -646,6 +701,59 @@ private extension VotingRustBackend {
             try bytes.withUnsafeBufferPointer { buffer in
                 try operation(dbh, id, idLen, buffer.baseAddress, UInt(buffer.count))
             }
+        }
+    }
+
+    /// Runs `body` on a detached task registered as in flight, without holding
+    /// the lock while it runs.
+    ///
+    /// The handle is read and the task registered under one lock hold, so a
+    /// call either registers before ``close()`` looks at the list or is refused
+    /// as closed: there is no window where a call starts against a handle that
+    /// is about to be freed.
+    func detached<T: Sendable>(_ body: @escaping @Sendable (OpaquePointer) throws -> T) async throws -> T {
+        let box = VotingResultBox<T>()
+        let ticket = UUID()
+        let task = try startDetached(ticket: ticket) { dbh in
+            box.complete(Result<T, Error> { try body(dbh) })
+        }
+
+        await task.value
+        finishDetached(ticket: ticket)
+
+        return try box.take()
+    }
+
+    /// Synchronous, because that is what taking a lock around a few field reads
+    /// should be: an `async` function may not hold an `NSLock` across a suspension.
+    func startDetached(
+        ticket: UUID,
+        _ body: @escaping @Sendable (OpaquePointer) -> Void
+    ) throws -> Task<Void, Never> {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let dbh = handle else {
+            throw VotingRustBackendError.databaseNotOpen
+        }
+
+        let task = Task.detached(priority: .userInitiated) {
+            body(dbh)
+        }
+        inFlight[ticket] = task
+        return task
+    }
+
+    /// Retires one finished call, freeing the handle a ``close()`` left behind
+    /// once it was the last one using it.
+    func finishDetached(ticket: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        inFlight[ticket] = nil
+        if inFlight.isEmpty, let dbh = handleAwaitingFree {
+            zcashlc_voting_db_free(dbh)
+            handleAwaitingFree = nil
         }
     }
 

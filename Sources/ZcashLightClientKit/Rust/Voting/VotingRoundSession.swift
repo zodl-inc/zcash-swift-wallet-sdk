@@ -15,9 +15,11 @@ import libzcashlc
 /// and from several threads at once during a run — and must not be kept
 /// waiting: a callback that blocks holds up the bundle task that reported. So
 /// the bridge does the least it can on that thread, decoding the event and
-/// handing it to one serial queue per session. Events therefore reach the host
-/// in the order the session reported them, on a queue that is not the caller's
-/// and not Rust's.
+/// handing it to one serial queue per session. The host's closure therefore
+/// runs one event at a time, on a queue that is neither the caller's nor
+/// Rust's, in the order the callbacks arrived — which during a run is the order
+/// several bundle threads reached the callback, not an order the round itself
+/// defines.
 final class VotingEventBridge: @unchecked Sendable {
     private let queue: DispatchQueue
     private let onEvent: @Sendable (VotingSessionEvent) -> Void
@@ -83,7 +85,11 @@ private let votingEventTrampoline: @convention(c) (
 }
 
 /// Carries a detached call's answer back to the task that awaited it.
-private final class VotingResultBox<Value>: @unchecked Sendable {
+///
+/// Shared with ``VotingRustBackend``, whose vote-tree sync runs detached for
+/// the same reason: the FFI call blocks, so it must not run on the caller's
+/// executor, and its answer has to cross back.
+final class VotingResultBox<Value>: @unchecked Sendable {
     private let lock = NSLock()
     private var result: Result<Value, Error>?
 
@@ -133,8 +139,10 @@ private final class VotingResultBox<Value>: @unchecked Sendable {
 ///
 /// Events: the stream is a best-effort narration — the report each call returns
 /// is the authoritative account of what happened, and an event may be dropped
-/// under load. Events are delivered on one serial queue per session, in the
-/// order the session reported them, and every event reported during a call
+/// under load. The closure runs on one serial queue per session, one event at a
+/// time, in the order the FFI's callback delivered them; a run reports from
+/// several bundle threads at once, so that order is the order they arrived
+/// rather than an order the round defines. Every event delivered during a call
 /// reaches the closure before that call returns. The closure must not block
 /// that queue: it delays every later event, and blocking it on work that waits
 /// for the call itself deadlocks the call.
@@ -444,6 +452,12 @@ public final class VotingRoundSession: @unchecked Sendable {
     /// own reference to the round — but a run left to itself keeps driving a
     /// round nothing is listening to, so this joins first. Idempotent, and
     /// every call afterwards throws ``VotingRustBackendError/sessionClosed``.
+    ///
+    /// The event queue is not drained here: an event already handed to it can
+    /// still reach the host's closure after this returns. Nothing unsafe
+    /// follows from that — what the closure receives is a decoded Swift value,
+    /// not memory the freed handle owned — but a host that tears down the state
+    /// its closure writes to should expect one more call into it.
     public func close() async {
         cancel()
 
@@ -600,8 +614,20 @@ extension AccountUUID {
     /// ``AccountUUID/id`` is the raw 16 bytes; `zcash_voting` names accounts by
     /// their UUID text, so the two have to be converted rather than passed
     /// through as bytes.
-    var votingUUIDString: String {
-        UUID(
+    ///
+    /// The length is checked rather than assumed: the initializer that traps on
+    /// a wrong one is not the only way an `AccountUUID` is made — a decoded one
+    /// carries whatever its payload said — and a voting session is not the
+    /// place to find that out by reading off the end of an array.
+    func votingUUIDString() throws -> String {
+        guard id.count == 16 else {
+            throw VotingError(
+                kind: .invalidInput,
+                message: "account UUID is \(id.count) bytes, not the 16 a UUID is"
+            )
+        }
+
+        return UUID(
             uuid: (
                 id[0], id[1], id[2], id[3],
                 id[4], id[5], id[6], id[7],

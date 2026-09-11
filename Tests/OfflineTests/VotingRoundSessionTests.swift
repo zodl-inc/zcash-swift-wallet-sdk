@@ -24,6 +24,13 @@ private let unroutableEndpoint = "http://127.0.0.1:9/"
 
 private let sessionWalletId = "voting-session-tests"
 
+/// A fixture that cannot be built is a failure rather than an unsupported
+/// environment: `XCTFail` records where, and throwing this stops the test
+/// instead of letting it run against half a wallet.
+private enum VotingFixtureFailure: Error {
+    case walletDatabaseNotInitialized
+}
+
 /// The wallet a round reads notes from, the sidecar it persists to, and the
 /// session over both.
 private struct VotingSessionFixture {
@@ -54,8 +61,10 @@ final class VotingRoundSessionTests: XCTestCase {
             networkType: .testnet
         )
 
-        guard case .success = try await rustBackend.initDataDb(seed: nil) else {
-            throw XCTSkip("the wallet database could not be initialized")
+        let initialized = try await rustBackend.initDataDb(seed: nil)
+        guard case .success = initialized else {
+            XCTFail("the fixture wallet database did not initialize: \(initialized)")
+            throw VotingFixtureFailure.walletDatabaseNotInitialized
         }
 
         // A birthday one block above the snapshot puts the wallet's fully
@@ -71,9 +80,7 @@ final class VotingRoundSessionTests: XCTestCase {
         )
 
         let accounts = try await rustBackend.listAccounts()
-        guard let account = accounts.first else {
-            throw XCTSkip("the fixture wallet holds no account")
-        }
+        let account = try XCTUnwrap(accounts.first, "the fixture wallet holds no account")
 
         let backend = VotingRustBackend()
         let sidecar = root.appendingPathComponent("voting.sqlite3")
@@ -83,7 +90,7 @@ final class VotingRoundSessionTests: XCTestCase {
 
         let roundId = hexRoundId(tag)
         let inputs = VotingSessionInputs(
-            accountUUID: account.id.votingUUIDString,
+            accountUUID: try account.id.votingUUIDString(),
             walletDbPath: walletDb.path,
             roundParams: VotingRoundParameters(
                 voteRoundId: roundId,
@@ -303,6 +310,18 @@ final class VotingRoundSessionTests: XCTestCase {
 
         XCTAssertEqual(VotingRustBackend.interactiveProvingBoostCount(), 0)
         await fixture.session.close()
+    }
+
+    /// The account id crosses as UUID text, and an id that is not 16 bytes is
+    /// refused rather than read off the end of its array. `AccountUUID` is
+    /// `Codable`, so a decoded one never passed the initializer that checks.
+    func testAccountUUIDTextRefusesAnIdThatIsNotAUUID() throws {
+        let account = try JSONDecoder().decode(AccountUUID.self, from: Data(#"{"id":[1,2,3]}"#.utf8))
+
+        XCTAssertThrowsError(try account.votingUUIDString()) { error in
+            guard let votingError = error as? VotingError else { return XCTFail("expected VotingError, got \(error)") }
+            XCTAssertEqual(votingError.kind, .invalidInput)
+        }
     }
 
     /// A batch that names no bundle is refused by the crate rather than
