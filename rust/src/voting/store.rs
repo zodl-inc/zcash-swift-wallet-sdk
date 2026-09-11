@@ -415,6 +415,112 @@ mod tests {
         assert!(list_rounds(&handle).unwrap().is_empty());
     }
 
+    /// A schema-13 sidecar left by an older core opens, migrates in place to
+    /// the schema this crate speaks, and keeps the rows it carried.
+    ///
+    /// The upgrade is one-way — a migrated file cannot be reopened by the core
+    /// that wrote it — so what has to hold is that nothing is lost on the way
+    /// through. The fixture is the schema-13 DDL verbatim; the rows and the
+    /// `user_version` stamp are set here, because that is what a sidecar in the
+    /// field carries and a bare DDL file does not.
+    ///
+    /// A characterization test: it pins the migration the crate performs, not
+    /// behaviour this SDK implements, so a change upstream that drops rows or
+    /// lands on a different schema version fails here rather than on a device.
+    #[test]
+    fn opening_a_version_13_sidecar_migrates_to_24_and_keeps_rows() {
+        const FIXTURE_WALLET: &str = "schema13-wallet";
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voting.sqlite3");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(include_str!("fixtures/schema13.sql"))
+                .unwrap();
+            conn.pragma_update(None, "user_version", 13).unwrap();
+            // Two rounds of one wallet, one of them carrying a bundle: enough
+            // for a migration that dropped rows, renamed the wallet scope or
+            // broke the bundle foreign key to show up as a count. The bundle
+            // carries a value so the contents can be read back too — a
+            // migration that rebuilt the table with the right row count but
+            // the wrong columns would otherwise pass.
+            for tag in [0x51u8, 0x52] {
+                conn.execute(
+                    "INSERT INTO rounds(round_id, wallet_id, network, snapshot_height, \
+                     ea_pk, nc_root, nullifier_imt_root, created_at) \
+                     VALUES (?1, ?2, 'mainnet', 4200000, ?3, ?3, ?3, 1)",
+                    (hex_round_id(tag), FIXTURE_WALLET, vec![tag; 32]),
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO bundles(round_id, wallet_id, bundle_index, total_note_value) \
+                 VALUES (?1, ?2, 0, 12500000)",
+                (hex_round_id(0x51), FIXTURE_WALLET),
+            )
+            .unwrap();
+
+            let version: u32 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, 13, "the fixture is a version-13 sidecar");
+        }
+
+        let counts_before = sidecar_counts(&path);
+        assert!(counts_before.0 >= 1, "the fixture carries rounds to keep");
+
+        let handle = VotingDatabaseHandle::open(path.to_str().unwrap(), crate::NETWORK_ID_MAINNET)
+            .expect("opening a version-13 sidecar migrates it");
+        handle.set_wallet_id(FIXTURE_WALLET).unwrap();
+
+        let version: u32 = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 24, "the sidecar is migrated in place");
+
+        let counts_after = sidecar_counts(&path);
+        assert_eq!(
+            counts_after, counts_before,
+            "the migration kept every round and bundle row"
+        );
+
+        let total_note_value: i64 = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT total_note_value FROM bundles WHERE round_id = ?1 AND bundle_index = 0",
+                (hex_round_id(0x51),),
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            total_note_value, 12_500_000,
+            "the migration kept the bundle's stored value, not just its row"
+        );
+
+        // The rows are not merely present but readable as this wallet's: the
+        // migration preserved the wallet scope the fixture rows were written
+        // under.
+        let listed = list_rounds(&handle).unwrap();
+        assert_eq!(listed.len() as i64, counts_after.0);
+        let mut ids = listed
+            .iter()
+            .map(|r| r.round_id.as_str())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![hex_round_id(0x51), hex_round_id(0x52)]);
+    }
+
+    /// `(rounds, bundles)` row counts read from a fresh connection.
+    fn sidecar_counts(path: &std::path::Path) -> (i64, i64) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let count = |table: &str| {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        (count("rounds"), count("bundles"))
+    }
+
     #[test]
     fn keystone_signatures_and_clear_intents_on_fresh_round() {
         let handle = open_memory_store(crate::NETWORK_ID_MAINNET, "w");
