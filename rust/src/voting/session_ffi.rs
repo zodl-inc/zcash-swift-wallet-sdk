@@ -477,7 +477,8 @@ pub unsafe extern "C" fn zcashlc_voting_session_store_keystone_signatures(
 /// default policy respectively. `signer_json` is a `SignerDto` and is never
 /// empty: a run without delegation is `{"kind":"none"}`, stated by the host
 /// rather than inferred from a missing argument. A software seed lives in the
-/// SDK's signer for this call only, and never reaches Swift.
+/// SDK's signer for this call only, and never reaches Swift; it is moved into
+/// a buffer that wipes itself as soon as it is decoded.
 ///
 /// The driver itself does not fail — a run that could do nothing says why
 /// through the report's quiescence — so null here means the call around it
@@ -520,7 +521,13 @@ pub unsafe extern "C" fn zcashlc_voting_session_run(
                 r#"a run names its signer; pass {"kind":"none"} to run without one"#,
             ));
         }
-        let signer: SignerDto = unsafe { json_from_ptr(signer_json, signer_json_len, "signer") }?;
+        // Moved into its wiping buffer as it is decoded: `into_signer` is what
+        // takes a software seed out of the plain `Vec` serde built, so nothing
+        // that can still fail below — the policy decode, the session's own
+        // refusals — drops an un-wiped one. serde's intermediate base64
+        // `String` is the one allocation this cannot reach; see `wire::Signer`.
+        let signer = unsafe { json_from_ptr::<SignerDto>(signer_json, signer_json_len, "signer") }?
+            .into_signer();
         let policy: DrivePolicyDto =
             unsafe { json_from_ptr_or_default(policy_json, policy_json_len, "drive policy") }?;
         // SAFETY: the host's callback and context, under this function's

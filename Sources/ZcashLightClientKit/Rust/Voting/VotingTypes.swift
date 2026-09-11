@@ -283,6 +283,14 @@ public enum VotingDelegationSigner: Equatable, Sendable, Encodable, Undescribabl
     /// signature would be needed.
     case none
     /// An in-process software signer for `seed`.
+    ///
+    /// The seed is carried to Rust as base64 inside this value's JSON, and
+    /// that carrier — the encoder's bytes on this side, serde's decoded string
+    /// on the other — is ordinary heap memory that lives until the call
+    /// returns and is freed without being wiped. Only what Rust's signer holds
+    /// is zeroized. Nothing on iOS pages that memory to disk, but a host that
+    /// keeps the seed for longer than one `run` is widening a window this SDK
+    /// closes as soon as it can.
     case software(seed: [UInt8])
     /// A Keystone device whose signatures for this round are already stored.
     case keystoneStored

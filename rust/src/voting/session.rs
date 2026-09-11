@@ -47,7 +47,7 @@ use super::wire::{
     BallotIntentDto, BundleLayoutDto, DelegationProgressDto, DrivePolicyDto, EligibilityDto,
     HostOverridesDto, KeystoneSignatureBatchResultDto, KeystoneSignedBundleDto,
     KeystoneSigningRequestDto, PirPrecomputeDto, ProofStatusDto, SessionBindingDto,
-    SessionEventDto, SessionInputsDto, ShareTrackingPolicyDto, SignerDto, plan_view,
+    SessionEventDto, SessionInputsDto, ShareTrackingPolicyDto, Signer, plan_view,
 };
 
 /// Stack the delegation proving thread is created with.
@@ -578,8 +578,9 @@ impl VotingSession {
     /// driver reports the bundles that owe a signature instead of dispatching
     /// them; with a software seed, the seed goes into [`SeedSpendAuthSigner`]
     /// and nowhere else — never into Swift, and never into a sighash, alpha or
-    /// PCZT the host could see — and its `Zeroizing` buffer is wiped when this
-    /// run's delegation inputs drop with the spawned task.
+    /// PCZT the host could see. It is in a `Zeroizing` buffer from the moment
+    /// the FFI decoded it, and that buffer is wiped when this run's delegation
+    /// inputs drop with the spawned task.
     ///
     /// The driver itself never fails: a run that could do nothing says why
     /// through the report's quiescence. What can fail is either side of it —
@@ -588,7 +589,7 @@ impl VotingSession {
     pub(super) fn run(
         self: &Arc<Self>,
         overrides: HostOverridesDto,
-        signer: SignerDto,
+        signer: Signer,
         policy: DrivePolicyDto,
         sink: EventSink,
     ) -> anyhow::Result<zcash_voting::wire::RoundRunReportView> {
@@ -599,20 +600,18 @@ impl VotingSession {
         // would have to already be one.
         let driver: Arc<dyn zcash_voting::DelegationDriver> = self.pipeline.clone();
         let delegation = match signer {
-            SignerDto::None => None,
-            SignerDto::Software { seed } => {
-                Some(zcash_voting::DelegationSigner::Software(Arc::new(
-                    // `SeedSpendAuthSigner::new` rejects a seed it cannot derive
-                    // from with a bare message, which has to reach Swift as the
-                    // typed envelope the rest of the session uses — but the
-                    // network check it delegates already returns one, so wrapping
-                    // unconditionally would nest that envelope's JSON inside a
-                    // second one's message.
-                    SeedSpendAuthSigner::new(seed, self.network_id, self.network)
-                        .map_err(envelope_or_invalid_input)?,
-                )))
-            }
-            SignerDto::KeystoneStored => Some(zcash_voting::DelegationSigner::Keystone(
+            Signer::None => None,
+            Signer::Software(seed) => Some(zcash_voting::DelegationSigner::Software(Arc::new(
+                // `SeedSpendAuthSigner::new` rejects a seed it cannot derive
+                // from with a bare message, which has to reach Swift as the
+                // typed envelope the rest of the session uses — but the
+                // network check it delegates already returns one, so wrapping
+                // unconditionally would nest that envelope's JSON inside a
+                // second one's message.
+                SeedSpendAuthSigner::new(seed, self.network_id, self.network)
+                    .map_err(envelope_or_invalid_input)?,
+            ))),
+            Signer::KeystoneStored => Some(zcash_voting::DelegationSigner::Keystone(
                 zcash_voting::KeystoneSignatureSource::Stored,
             )),
         }
@@ -699,10 +698,11 @@ impl VotingSession {
     }
 
     /// The round this session is bound to.
-    // No caller outside the tests: every step here reaches the round through
-    // the field, and the C surface hands Swift the round id inside the plan
-    // and the reports rather than on its own.
-    #[allow(dead_code)]
+    ///
+    /// Test-only, like [`EventSink::none`]: every step here reaches the round
+    /// through the field, and the C surface hands Swift the round id inside the
+    /// plan and the reports rather than on its own.
+    #[cfg(test)]
     pub(super) fn round_id(&self) -> &str {
         &self.round_id
     }
@@ -1186,7 +1186,7 @@ mod tests {
         let report = session
             .run(
                 HostOverridesDto::default(),
-                SignerDto::None,
+                Signer::None,
                 DrivePolicyDto::default(),
                 EventSink::collecting(&seen),
             )
@@ -1215,7 +1215,7 @@ mod tests {
         let err = session
             .run(
                 HostOverridesDto::default(),
-                SignerDto::Software { seed: vec![0u8; 8] },
+                Signer::Software(Zeroizing::new(vec![0u8; 8])),
                 DrivePolicyDto::default(),
                 EventSink::none(),
             )
@@ -1245,7 +1245,7 @@ mod tests {
         let report = session
             .run(
                 HostOverridesDto::default(),
-                SignerDto::None,
+                Signer::None,
                 DrivePolicyDto::default(),
                 EventSink::collecting(&seen),
             )
@@ -1300,7 +1300,7 @@ mod tests {
         let report = session
             .run(
                 HostOverridesDto::default(),
-                SignerDto::None,
+                Signer::None,
                 DrivePolicyDto::default(),
                 EventSink::none(),
             )

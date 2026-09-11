@@ -52,16 +52,20 @@ impl SeedSpendAuthSigner {
     /// A signer over `seed`, rejecting anything too short to derive from and
     /// any `network_id` / `network` pair that does not name one chain.
     ///
-    /// The seed is wrapped before it is checked, so even a rejected one is
-    /// wiped when this returns rather than left in a freed allocation.
+    /// The seed arrives already wrapped — the FFI moves it into [`Zeroizing`]
+    /// the moment it is decoded — so even a rejected one is wiped when this
+    /// returns rather than left in a freed allocation.
     ///
     /// The pair is checked once, here, rather than on every signature: it is
     /// what makes deriving through the SDK's numeric network equivalent to
     /// deriving through the network each request names, and the session builds
     /// both from one value, so a disagreement is a host bug and not something
     /// a request can provoke.
-    pub(super) fn new(seed: Vec<u8>, network_id: u32, network: Network) -> anyhow::Result<Self> {
-        let seed = Zeroizing::new(seed);
+    pub(super) fn new(
+        seed: Zeroizing<Vec<u8>>,
+        network_id: u32,
+        network: Network,
+    ) -> anyhow::Result<Self> {
         if seed.len() < MIN_SEED_LEN {
             return Err(anyhow::anyhow!(
                 "seed must be at least {} bytes, got {}",
@@ -329,7 +333,7 @@ mod tests {
         // The signer holds seed material and so has no `Debug`, which is what
         // keeps the success arm out of `unwrap_err`.
         let err = match SeedSpendAuthSigner::new(
-            vec![1u8; 16],
+            Zeroizing::new(vec![1u8; 16]),
             crate::NETWORK_ID_TESTNET,
             Network::Testnet,
         ) {
@@ -346,7 +350,7 @@ mod tests {
     #[test]
     fn seed_signer_rejects_a_network_pair_that_disagrees() {
         let err = match SeedSpendAuthSigner::new(
-            vec![1u8; 32],
+            Zeroizing::new(vec![1u8; 32]),
             crate::NETWORK_ID_MAINNET,
             Network::Testnet,
         ) {
@@ -364,9 +368,12 @@ mod tests {
         let seed = [1u8; 32];
         let alpha = pasta_curves::pallas::Scalar::from(9u64);
         let request = request_for(&seed, ff::PrimeField::to_repr(&alpha));
-        let signer =
-            SeedSpendAuthSigner::new(seed.to_vec(), crate::NETWORK_ID_TESTNET, Network::Testnet)
-                .unwrap();
+        let signer = SeedSpendAuthSigner::new(
+            Zeroizing::new(seed.to_vec()),
+            crate::NETWORK_ID_TESTNET,
+            Network::Testnet,
+        )
+        .unwrap();
 
         let sig = zcash_voting::SpendAuthSigner::sign(&signer, request).unwrap();
 
@@ -388,9 +395,12 @@ mod tests {
     fn seed_signer_rejects_a_request_for_another_network() {
         let seed = [1u8; 32];
         let request = request_for(&seed, [0u8; 32]);
-        let signer =
-            SeedSpendAuthSigner::new(seed.to_vec(), crate::NETWORK_ID_MAINNET, Network::Mainnet)
-                .unwrap();
+        let signer = SeedSpendAuthSigner::new(
+            Zeroizing::new(seed.to_vec()),
+            crate::NETWORK_ID_MAINNET,
+            Network::Mainnet,
+        )
+        .unwrap();
 
         let err = zcash_voting::SpendAuthSigner::sign(&signer, request).unwrap_err();
 

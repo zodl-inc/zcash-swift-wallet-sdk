@@ -7,6 +7,7 @@
 //! alongside each DTO so the boundary logic stays in one place.
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use super::errors::VotingResultExt;
 
@@ -152,11 +153,28 @@ pub(super) struct RosterEntryDto {
 
 /// The authenticated roster plus an optional stored hotkey secret to bind a
 /// session to a previously generated hotkey.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+///
+/// No derived `Debug`: `hotkey_secret` is key material, and a derived
+/// rendering would print it. The hand-written one below redacts it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub(super) struct SessionBindingDto {
     pub roster: Vec<RosterEntryDto>,
     #[serde(default, with = "b64_opt")]
     pub hotkey_secret: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for SessionBindingDto {
+    /// Names each field rather than deriving: a field added without a thought
+    /// for this impl goes missing from the rendering instead of into it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionBindingDto")
+            .field("roster", &self.roster)
+            .field(
+                "hotkey_secret",
+                &self.hotkey_secret.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
 }
 
 /// A voter's decision for one proposal, internally tagged by `"decision"`.
@@ -187,9 +205,16 @@ impl BallotIntentDto {
     }
 }
 
-/// Which signer backs a session: none yet, an in-process software seed, or a
-/// Keystone hardware signer whose signatures are already stored.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+/// Which signer backs a session, as it arrives on the wire: none yet, an
+/// in-process software seed, or a Keystone hardware signer whose signatures are
+/// already stored.
+///
+/// The wire shape only. [`SignerDto::into_signer`] is called on it the moment
+/// it is decoded, and [`Signer`] is what the session runs with.
+///
+/// No derived `Debug`: the software variant carries the wallet seed, and a
+/// derived rendering would print it. The hand-written one below redacts it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum SignerDto {
     None,
@@ -198,6 +223,54 @@ pub(super) enum SignerDto {
         seed: Vec<u8>,
     },
     KeystoneStored,
+}
+
+impl std::fmt::Debug for SignerDto {
+    /// Matches the software variant without binding its field, so no field of
+    /// it can reach the formatter, now or after someone adds one.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SignerDto::None => f.write_str("SignerDto::None"),
+            SignerDto::Software { .. } => f.write_str("SignerDto::Software { seed: [redacted] }"),
+            SignerDto::KeystoneStored => f.write_str("SignerDto::KeystoneStored"),
+        }
+    }
+}
+
+/// Which signer backs a session, as the session holds it: the software seed
+/// has been moved into a buffer that wipes itself when dropped.
+///
+/// The move happens as soon as the JSON is decoded, so everything that can
+/// still fail after that — another argument that will not decode, a session
+/// that refuses the call, a signer that will not build — drops a wiped buffer
+/// rather than leaving the seed in freed memory.
+///
+/// What this cannot cover is serde's own intermediate. The seed arrives as
+/// base64 text, and the `String` `serde_json` allocates while decoding it is
+/// dropped without being wiped; serde offers no hook to change that. Closing
+/// that last gap would mean the seed crossing as its own `(ptr, len)`
+/// argument, which is a change to the C surface.
+///
+/// Deliberately no `Debug`: `Zeroizing<Vec<u8>>` renders as its bytes.
+pub(super) enum Signer {
+    None,
+    Software(Zeroizing<Vec<u8>>),
+    KeystoneStored,
+}
+
+impl SignerDto {
+    /// Moves a software seed out of the decoded DTO and into a buffer that
+    /// wipes itself.
+    pub(super) fn into_signer(self) -> Signer {
+        match self {
+            SignerDto::None => Signer::None,
+            // `Zeroizing::new` takes the `Vec` by value, so this is the same
+            // allocation — now wiped on drop — rather than a second copy of
+            // the seed.
+            SignerDto::Software { seed } => Signer::Software(Zeroizing::new(seed)),
+            SignerDto::KeystoneStored => Signer::KeystoneStored,
+        }
+    }
 }
 
 /// How the round driver paces itself between steps and isolates failures.
@@ -592,6 +665,33 @@ mod tests {
 
         let signer: SignerDto = serde_json::from_value(json).expect("decode");
         assert_eq!(signer, SignerDto::Software { seed });
+    }
+
+    /// Neither secret-bearing DTO renders what it carries. Both are formatted
+    /// nowhere today; what this pins is that adding a `{:?}` somewhere cannot
+    /// turn into a printed seed or hotkey secret.
+    #[test]
+    fn secret_bearing_dtos_redact_their_debug_rendering() {
+        let signer = SignerDto::Software {
+            seed: vec![9u8; 32],
+        };
+        let rendered = format!("{signer:?}");
+        assert!(rendered.contains("[redacted]"), "unexpected: {rendered}");
+        assert!(!rendered.contains('9'), "unexpected: {rendered}");
+
+        let binding = SessionBindingDto {
+            roster: vec![RosterEntryDto {
+                proposal_id: 1,
+                num_options: 2,
+            }],
+            hotkey_secret: Some(vec![7u8; 32]),
+        };
+        let rendered = format!("{binding:?}");
+        assert!(rendered.contains("[redacted]"), "unexpected: {rendered}");
+        assert!(!rendered.contains('7'), "unexpected: {rendered}");
+        // Whether a secret is bound at all is not the secret, and a host
+        // debugging a binding needs it.
+        assert!(rendered.contains("Some"), "unexpected: {rendered}");
     }
 
     #[test]
