@@ -732,6 +732,107 @@ final class VotingTypesTests: XCTestCase {
         XCTAssertEqual(String(reflecting: signer), "--redacted--")
     }
 
+    // MARK: - Absent serde-default fields
+
+    // The crate marks these fields `#[serde(default)]` so a payload missing one
+    // still parses. A strict Swift decode would lose the whole plan or report
+    // over a single absent list, so each one falls back to the Rust default.
+
+    func testDecodesRoundPlanWithDefaultedListsAbsent() throws {
+        let json = """
+        {
+          "round_id": "round-2",
+          "pending_recovery": false,
+          "blocking_recovery": false,
+          "blocking_share_work": false,
+          "has_unconfirmed_shares": false,
+          "hotkey_bound": true,
+          "completed_for_display": false,
+          "completed_vote_display": null,
+          "needs_draft_setup": false,
+          "needs_bundle_setup": false,
+          "needs_delegation_signing": false,
+          "has_in_flight_delegation": false,
+          "needs_vote_polling": false,
+          "has_remaining_vote_or_share_work": false,
+          "has_recoverable_vote_or_share_work": false,
+          "primary_action": "idle",
+          "delegation_statuses": [],
+          "open_proposals": [],
+          "immediate_share_confirmed": true,
+          "all_decided": true
+        }
+        """
+
+        let plan = try decode(VotingRoundPlan.self, from: json)
+
+        XCTAssertEqual(plan.roundId, "round-2")
+        XCTAssertTrue(plan.delegationBundlesNeedingWork.isEmpty)
+        XCTAssertTrue(plan.delegationBundlesNeedingSigning.isEmpty)
+        XCTAssertTrue(plan.unrosteredIntents.isEmpty)
+        XCTAssertEqual(plan.primaryAction, .idle)
+        XCTAssertTrue(plan.allDecided)
+    }
+
+    func testDecodesDelegationStatusWithTerminalAbsent() throws {
+        let json = """
+        {"bundle_index": 3, "phase": "confirmed", "tx_hash": "ab"}
+        """
+
+        let status = try decode(VotingDelegationStatus.self, from: json)
+
+        XCTAssertEqual(status.bundleIndex, 3)
+        XCTAssertEqual(status.phase, .confirmed)
+        XCTAssertEqual(status.txHash, "ab")
+        XCTAssertFalse(status.terminal)
+    }
+
+    func testDecodesRoundQuiescenceWithDefaultedListsAbsent() throws {
+        let quiescence = try decode(VotingRoundQuiescence.self, from: #"{"kind": "background_share_work_only"}"#)
+
+        XCTAssertEqual(quiescence.kind, .backgroundShareWorkOnly)
+        XCTAssertTrue(quiescence.openProposals.isEmpty)
+        XCTAssertTrue(quiescence.unrosteredIntents.isEmpty)
+        XCTAssertTrue(quiescence.bundles.isEmpty)
+        XCTAssertTrue(quiescence.shares.isEmpty)
+        XCTAssertTrue(quiescence.remaining.isEmpty)
+        XCTAssertNil(quiescence.step)
+        XCTAssertNil(quiescence.chainOutcome)
+    }
+
+    func testDecodesRoundRunReportWithDefaultedListsAbsent() throws {
+        let json = """
+        {
+          "quiescence": {"kind": "no_work_left"},
+          "tally": {"completed_proposals": 2, "total_proposals": 2, "remaining_obligations": 0}
+        }
+        """
+
+        let report = try decode(VotingRoundRunReport.self, from: json)
+
+        XCTAssertEqual(report.quiescence.kind, .noWorkLeft)
+        XCTAssertNil(report.plan)
+        XCTAssertEqual(report.tally.completedProposals, 2)
+        XCTAssertTrue(report.failures.isEmpty)
+        XCTAssertTrue(report.skippedBundles.isEmpty)
+        XCTAssertTrue(report.chainOutcomes.isEmpty)
+    }
+
+    func testDecodesShareTrackingRunReportWithDefaultedListsAbsent() throws {
+        let json = """
+        {"quiescence": {"kind": "all_confirmed"}, "passes": 1}
+        """
+
+        let report = try decode(VotingShareTrackingRunReport.self, from: json)
+
+        XCTAssertEqual(report.quiescence.kind, .allConfirmed)
+        XCTAssertTrue(report.quiescence.messages.isEmpty)
+        XCTAssertEqual(report.passes, 1)
+        XCTAssertTrue(report.confirmed.isEmpty)
+        XCTAssertTrue(report.unrecoverable.isEmpty)
+        XCTAssertTrue(report.failures.isEmpty)
+    }
+
     // MARK: - Helpers
 
     private func decode<T: Decodable>(_ type: T.Type, from json: String) throws -> T {

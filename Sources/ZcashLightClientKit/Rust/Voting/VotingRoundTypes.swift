@@ -210,6 +210,16 @@ public struct VotingDelegationStatus: Equatable, Sendable, Decodable {
         case txHash = "tx_hash"
         case terminal
     }
+
+    // `terminal` is `#[serde(default)]` upstream: a payload that predates the
+    // field must still decode, and its absence means "not terminal".
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        bundleIndex = try container.decode(UInt32.self, forKey: .bundleIndex)
+        phase = try container.decode(VotingWorkflowPhase.self, forKey: .phase)
+        txHash = try container.decodeIfPresent(String.self, forKey: .txHash)
+        terminal = try container.decodeIfPresent(Bool.self, forKey: .terminal) ?? false
+    }
 }
 
 /// What a round owes and what a host should show for it.
@@ -284,6 +294,37 @@ public struct VotingRoundPlan: Equatable, Sendable, Decodable {
         case immediateShareConfirmed = "immediate_share_confirmed"
         case allDecided = "all_decided"
     }
+
+    // The three per-bundle lists and `unrosteredIntents` are
+    // `#[serde(default)]` upstream: a payload that omits one must still yield a
+    // plan, because losing the whole plan over a missing list is the worse
+    // failure. Everything else the planner always writes.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        roundId = try container.decode(String.self, forKey: .roundId)
+        pendingRecovery = try container.decode(Bool.self, forKey: .pendingRecovery)
+        blockingRecovery = try container.decode(Bool.self, forKey: .blockingRecovery)
+        blockingShareWork = try container.decode(Bool.self, forKey: .blockingShareWork)
+        hasUnconfirmedShares = try container.decode(Bool.self, forKey: .hasUnconfirmedShares)
+        hotkeyBound = try container.decode(Bool.self, forKey: .hotkeyBound)
+        completedForDisplay = try container.decode(Bool.self, forKey: .completedForDisplay)
+        completedVoteDisplay = try container.decodeIfPresent(VotingCompletedVoteDisplay.self, forKey: .completedVoteDisplay)
+        needsDraftSetup = try container.decode(Bool.self, forKey: .needsDraftSetup)
+        needsBundleSetup = try container.decode(Bool.self, forKey: .needsBundleSetup)
+        needsDelegationSigning = try container.decode(Bool.self, forKey: .needsDelegationSigning)
+        hasInFlightDelegation = try container.decode(Bool.self, forKey: .hasInFlightDelegation)
+        delegationBundlesNeedingWork = try container.decodeIfPresent([UInt32].self, forKey: .delegationBundlesNeedingWork) ?? []
+        delegationBundlesNeedingSigning = try container.decodeIfPresent([UInt32].self, forKey: .delegationBundlesNeedingSigning) ?? []
+        needsVotePolling = try container.decode(Bool.self, forKey: .needsVotePolling)
+        hasRemainingVoteOrShareWork = try container.decode(Bool.self, forKey: .hasRemainingVoteOrShareWork)
+        hasRecoverableVoteOrShareWork = try container.decode(Bool.self, forKey: .hasRecoverableVoteOrShareWork)
+        primaryAction = try container.decode(VotingRoundPlanAction.self, forKey: .primaryAction)
+        delegationStatuses = try container.decode([VotingDelegationStatus].self, forKey: .delegationStatuses)
+        openProposals = try container.decode([UInt32].self, forKey: .openProposals)
+        unrosteredIntents = try container.decodeIfPresent([UInt32].self, forKey: .unrosteredIntents) ?? []
+        immediateShareConfirmed = try container.decode(Bool.self, forKey: .immediateShareConfirmed)
+        allDecided = try container.decode(Bool.self, forKey: .allDecided)
+    }
 }
 
 // MARK: - Run report
@@ -338,6 +379,21 @@ public struct VotingRoundQuiescence: Equatable, Sendable, Decodable {
         case step
         case chainOutcome = "chain_outcome"
         case remaining
+    }
+
+    // Every list here is `#[serde(default)]` upstream, and each is populated
+    // only for the kinds that carry it — so a payload for one kind legitimately
+    // omits the others' lists.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try container.decode(VotingRoundQuiescenceKind.self, forKey: .kind)
+        openProposals = try container.decodeIfPresent([UInt32].self, forKey: .openProposals) ?? []
+        unrosteredIntents = try container.decodeIfPresent([UInt32].self, forKey: .unrosteredIntents) ?? []
+        bundles = try container.decodeIfPresent([UInt32].self, forKey: .bundles) ?? []
+        shares = try container.decodeIfPresent([VotingShareKey].self, forKey: .shares) ?? []
+        step = try container.decodeIfPresent(VotingNextStep.self, forKey: .step)
+        chainOutcome = try container.decodeIfPresent(VotingChainSubmissionOutcome.self, forKey: .chainOutcome)
+        remaining = try container.decodeIfPresent([VotingNextStep].self, forKey: .remaining) ?? []
     }
 }
 
@@ -434,5 +490,18 @@ public struct VotingRoundRunReport: Equatable, Sendable, Decodable {
         case failures
         case skippedBundles = "skipped_bundles"
         case chainOutcomes = "chain_outcomes"
+    }
+
+    // `failures`, `skippedBundles` and `chainOutcomes` are `#[serde(default)]`
+    // upstream: a clean run may omit all three, and the report is what a host
+    // acts on, so it must survive their absence.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        quiescence = try container.decode(VotingRoundQuiescence.self, forKey: .quiescence)
+        plan = try container.decodeIfPresent(VotingRoundPlan.self, forKey: .plan)
+        tally = try container.decode(VotingRoundWorkTally.self, forKey: .tally)
+        failures = try container.decodeIfPresent([VotingRoundStepFailureRecord].self, forKey: .failures) ?? []
+        skippedBundles = try container.decodeIfPresent([UInt32].self, forKey: .skippedBundles) ?? []
+        chainOutcomes = try container.decodeIfPresent([VotingRoundChainOutcome].self, forKey: .chainOutcomes) ?? []
     }
 }

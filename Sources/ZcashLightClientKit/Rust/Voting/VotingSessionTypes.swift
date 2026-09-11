@@ -159,6 +159,19 @@ public struct VotingShareTrackingQuiescence: Equatable, Sendable, Decodable {
     public let kind: VotingShareTrackingQuiescenceKind
     /// `failing`: the consecutive failures that ended the run.
     public let messages: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case kind
+        case messages
+    }
+
+    // `messages` is `#[serde(default)]` upstream: every kind but `failing`
+    // leaves it out, and none of them should fail to decode for that.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try container.decode(VotingShareTrackingQuiescenceKind.self, forKey: .kind)
+        messages = try container.decodeIfPresent([String].self, forKey: .messages) ?? []
+    }
 }
 
 /// What one observation from a share-tracking run describes.
@@ -204,6 +217,26 @@ public struct VotingShareTrackingRunReport: Equatable, Sendable, Decodable {
     /// unrecoverable once its material is restored.
     public let unrecoverable: [VotingShareKey]
     public let failures: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case quiescence
+        case passes
+        case confirmed
+        case unrecoverable
+        case failures
+    }
+
+    // The three lists are `#[serde(default)]` upstream: a run that confirmed
+    // nothing and failed at nothing omits them, and the report must still say
+    // why it stopped and how many passes it took.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        quiescence = try container.decode(VotingShareTrackingQuiescence.self, forKey: .quiescence)
+        passes = try container.decode(UInt32.self, forKey: .passes)
+        confirmed = try container.decodeIfPresent([VotingShareKey].self, forKey: .confirmed) ?? []
+        unrecoverable = try container.decodeIfPresent([VotingShareKey].self, forKey: .unrecoverable) ?? []
+        failures = try container.decodeIfPresent([String].self, forKey: .failures) ?? []
+    }
 }
 
 // MARK: - Session event stream
