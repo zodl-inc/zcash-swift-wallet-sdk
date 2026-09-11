@@ -247,7 +247,9 @@ pub unsafe extern "C" fn zcashlc_voting_reset_vote_tree(
 ///
 /// Drops cached tree state and clears locally prepared *unsigned* delegation
 /// setup fields; proved or submitted bundles, imported capabilities and stored
-/// signatures survive. Returns 0 on success, -1 on error.
+/// signatures survive. A zero-length `round_id` resets only the cached tree
+/// state, wallet-wide, and clears no persisted column. Returns 0 on success,
+/// -1 on error.
 ///
 /// # Safety
 ///
@@ -361,8 +363,11 @@ pub unsafe extern "C" fn zcashlc_voting_retry_blocked_combined_cast(
 
 /// Clear the stored ballot intents named by `proposal_ids_json`.
 ///
-/// `proposal_ids_json` is a JSON array of proposal ids. A proposal whose vote
-/// the chain lifecycle already owns fails the whole call. Returns 0 on
+/// `proposal_ids_json` is a JSON array of proposal ids, cleared one at a time:
+/// the crate has no batch form, so a proposal whose vote the chain lifecycle
+/// already owns fails the call with the proposals before it already cleared.
+/// Re-running is safe — clearing an intent that is not there is not an error —
+/// so the remedy is to drop the offending id and call again. Returns 0 on
 /// success, -1 on error.
 ///
 /// # Safety
@@ -469,6 +474,9 @@ mod tests {
         let handle =
             unsafe { zcashlc_voting_db_open(invalid_path.as_ptr(), invalid_path.len(), 1) };
         assert!(handle.is_null());
+        // Decoding failures are typed JSON too, not a bare message: Swift
+        // reads one envelope for every failure this boundary can produce.
+        assert_eq!(last_error_kind(), "invalid_input");
     }
 
     #[test]

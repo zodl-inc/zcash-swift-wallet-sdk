@@ -6,7 +6,7 @@ use zcash_voting as voting;
 use zip32::AccountId;
 
 use super::constants::MIN_SEED_LEN;
-use super::errors::invalid_input;
+use super::errors::{internal, invalid_input};
 use super::ffi_types::FfiVotingHotkey;
 
 // =============================================================================
@@ -45,14 +45,20 @@ pub(super) unsafe fn bytes_from_ptr<'a>(ptr: *const u8, len: usize) -> anyhow::R
 /// Same contract as `bytes_from_ptr`.
 pub(super) unsafe fn str_from_ptr(ptr: *const u8, len: usize) -> anyhow::Result<String> {
     let bytes = unsafe { bytes_from_ptr(ptr, len) }?;
-    Ok(std::str::from_utf8(bytes)?.to_string())
+    let text = std::str::from_utf8(bytes)
+        .map_err(|e| invalid_input(format!("FFI string is not valid UTF-8: {e}")))?;
+    Ok(text.to_string())
 }
 
 /// Return JSON-serialized bytes as `*mut ffi::BoxedSlice`.
+///
+/// A DTO this crate defines that will not serialize is this crate's fault, not
+/// the host's, so the failure crosses as `internal` rather than `invalid_input`.
 pub(super) fn json_to_boxed_slice<T: Serialize>(
     value: &T,
 ) -> anyhow::Result<*mut crate::ffi::BoxedSlice> {
-    let json = serde_json::to_vec(value)?;
+    let json =
+        serde_json::to_vec(value).map_err(|e| internal(format!("failed to encode JSON: {e}")))?;
     Ok(crate::ffi::BoxedSlice::some(json))
 }
 
@@ -117,7 +123,12 @@ pub(super) fn voting_network(network_id: u32) -> anyhow::Result<voting::Network>
         crate::NETWORK_ID_MAINNET => Ok(voting::Network::Mainnet),
         crate::NETWORK_ID_REGTEST => {
             use zcash_protocol::consensus::{NetworkType, Parameters};
-            match crate::parse_network(network_id)?.network_type() {
+            // `parse_network` reports an unconfigured custom slot as a bare
+            // message; re-wrap it so this failure reaches Swift as typed JSON
+            // like every other one.
+            let params =
+                crate::parse_network(network_id).map_err(|e| invalid_input(e.to_string()))?;
+            match params.network_type() {
                 NetworkType::Main => Ok(voting::Network::Mainnet),
                 NetworkType::Test => Ok(voting::Network::Testnet),
                 NetworkType::Regtest => Ok(voting::Network::Regtest),

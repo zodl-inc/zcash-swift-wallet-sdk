@@ -5,9 +5,9 @@
 //! app's lifetime. It keeps the *unscoped* root connection plus the wallet id
 //! Swift sets after opening, and hands out a scoped `VotingDb` per call: the
 //! crate scopes rows per wallet, so nothing below this module may run against
-//! a handle whose wallet id is unset. Scoping is cheap — every scoped handle
-//! shares the root's connection — so there is no handle to cache and no
-//! lifetime to manage beyond this one.
+//! a handle whose wallet id is unset. Scoping is cheap — a scoped handle
+//! clones the root's connection handle rather than opening one — so there is
+//! nothing to cache and no lifetime to manage beyond this one.
 //!
 //! Everything here is synchronous and short: these are the reads and the
 //! destructive edits a screen performs directly. Driving a round (proving,
@@ -31,8 +31,10 @@ use super::wire::{KeystoneSignatureRecordDto, RoundSummaryDto};
 /// which fails with typed JSON while the wallet id is still unset.
 pub struct VotingDatabaseHandle {
     /// The unscoped connection to the sidecar. Every scoped handle derived
-    /// from it shares this one connection, so in-process writers serialize on
-    /// it instead of contending for the file.
+    /// from it shares this one connection, so writers reached through this
+    /// handle serialize on it instead of contending for the file. A second
+    /// `zcashlc_voting_db_open` on the same path gets its own connection;
+    /// the SDK opens one handle per sidecar and keeps it.
     root: Arc<VotingDb>,
     /// The wallet whose rows this handle reads and writes. `None` until Swift
     /// calls `zcashlc_voting_set_wallet_id`; a `Mutex` because the handle is
@@ -146,8 +148,11 @@ pub(super) fn pending_share_rounds(
 /// Sync the round's vote-commitment tree from `node_url`, returning the height
 /// synced to.
 ///
-/// Vote-tree traffic uses the crate's own direct transport (spec D12), never
-/// the session's selected route.
+/// The crate resolves the transport itself (spec D12): it reuses the wallet's
+/// tree client that already holds this round, whatever transport that client
+/// was built on, and otherwise opens one over its own direct transport. There
+/// is no route argument here by design — vote-tree traffic is not the chain
+/// and helper traffic the session's route governs.
 pub(super) fn sync_vote_tree(
     h: &VotingDatabaseHandle,
     round_id: &str,
@@ -173,10 +178,13 @@ pub(super) fn reset_vote_tree(h: &VotingDatabaseHandle, round_id: &str) -> anyho
 /// delegation setup fields, so an abandoned Keystone request can be rebuilt.
 /// Proved or submitted bundles, imported capabilities and stored signatures
 /// survive: this is a retry, not a deletion.
+///
+/// An empty `round_id` resets only the cached tree state, wallet-wide, and
+/// clears no persisted column — the crate's guard, which is why this calls the
+/// crate's combined entry point rather than its two halves.
 pub(super) fn reset_session_state(h: &VotingDatabaseHandle, round_id: &str) -> anyhow::Result<()> {
     let db = h.scoped()?;
-    zcash_voting::precompute::reset_vote_tree(&db, round_id).ffi()?;
-    db.clear_unsigned_delegation_setup_fields(round_id).ffi()
+    zcash_voting::precompute::reset_voting_session_state(&db, round_id).ffi()
 }
 
 /// Delete one round.
@@ -337,6 +345,19 @@ mod tests {
             serde_json::from_str(&err.to_string()).expect("json error");
         assert_eq!(serde_json::to_value(view.kind).unwrap(), "invalid_input");
         assert!(!view.message.is_empty());
+    }
+
+    /// `share::pending_rounds_for_accounts` silently drops empty wallet ids,
+    /// so a handle that failed to plumb one through would answer `[]` and look
+    /// healthy. Asserting that an unbound handle *fails* is what distinguishes
+    /// "no pending rounds" from "asked about no wallet".
+    #[test]
+    fn pending_share_rounds_requires_a_bound_wallet() {
+        let handle = VotingDatabaseHandle::open(":memory:", crate::NETWORK_ID_MAINNET).unwrap();
+        let err = pending_share_rounds(&handle).unwrap_err();
+        let view: zcash_voting::VotingErrorView =
+            serde_json::from_str(&err.to_string()).expect("json error");
+        assert_eq!(serde_json::to_value(view.kind).unwrap(), "invalid_input");
     }
 
     #[test]
