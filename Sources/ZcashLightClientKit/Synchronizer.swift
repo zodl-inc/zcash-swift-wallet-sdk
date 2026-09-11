@@ -653,9 +653,13 @@ public protocol Synchronizer: AnyObject {
     /// The route is fixed for the session's whole life. `.tor` requires an
     /// enabled Tor client and never falls back to a direct connection: a
     /// synchronizer that cannot provide one throws rather than opening the
-    /// round over plain HTTP. The Tor runtime stays owned by the synchronizer —
-    /// it is lent to the crate for the duration of this call, which reaches no
-    /// network.
+    /// round over plain HTTP. The Tor runtime stays owned by the synchronizer,
+    /// and is lent to the crate for the duration of this call.
+    ///
+    /// Opening the session reaches no network. The `.tor` route may still take
+    /// as long as reaching the Tor network takes: the first round session on a
+    /// synchronizer whose Tor client has not been started yet bootstraps that
+    /// client before the session is opened.
     ///
     /// - Parameters:
     ///    - backend: The voting backend whose sidecar the round persists to.
@@ -1839,9 +1843,12 @@ public extension Synchronizer {
 }
 
 public extension ClosureSynchronizer {
+    // Disabled around the declaration rather than on the line before it: a
+    // `disable:next` between the doc comment and the symbol detaches the two.
+    // swiftlint:disable function_parameter_count
+
     /// Alternate conformers open direct-route sessions and explicitly refuse the Tor route,
     /// matching `Synchronizer`'s own default.
-    // swiftlint:disable:next function_parameter_count
     func makeVotingRoundSession(
         backend: VotingRustBackend,
         inputs: VotingSessionInputs,
@@ -1859,6 +1866,7 @@ public extension ClosureSynchronizer {
             }
         }
     }
+    // swiftlint:enable function_parameter_count
 
     /// Default implementation so adding `broadcaster` to the protocol is not a
     /// source-breaking change for downstream conformers. Conformers with broadcast

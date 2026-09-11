@@ -77,8 +77,12 @@ public actor TorClient {
     /// The runtime is lent for the duration of the call only: the crate takes
     /// an isolated client of its own while opening, so the round's circuits are
     /// not linkable to the rest of the wallet's Tor use and this actor keeps
-    /// sole ownership of the runtime it can later close. Nothing here reaches
-    /// the network.
+    /// sole ownership of the runtime it can later close.
+    ///
+    /// Opening the session reaches no network. Getting to it may: on a client
+    /// with no runtime yet, `resolveRuntime()` creates the Tor directory and
+    /// bootstraps Arti first, which takes as long as reaching the Tor network
+    /// takes and holds this actor for all of it.
     func makeVotingRoundSession(
         backend: VotingRustBackend,
         inputs: VotingSessionInputs,
