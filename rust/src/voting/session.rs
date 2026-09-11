@@ -520,16 +520,23 @@ impl VotingSession {
     /// Lifts the signatures off the PCZTs a Keystone device returned and
     /// stores them for this round.
     ///
-    /// Each signed PCZT is verified against the request this wallet built for
-    /// that bundle — the signature is taken from the action the request named,
-    /// and paired with the sighash and `rk` the request carried — so a PCZT
-    /// from another bundle or another round is refused instead of stored.
-    /// Rebuilding the requests here rather than trusting the host to hand them
-    /// back is what makes that check the wallet's own.
+    /// The signature bytes are the only thing taken from the host's PCZT. The
+    /// sighash and `rk` stored beside each one come from the request this
+    /// wallet rebuilds here, which is why the requests are rebuilt rather than
+    /// handed back by the host: what a stored signature is later verified
+    /// against is then the wallet's own, whatever the device returned.
     ///
-    /// The write is one atomic idempotent batch, so a retry after a QR session
-    /// that was interrupted halfway reports what was already there rather than
-    /// failing on it.
+    /// Nothing here checks that the signature signs that sighash. It is lifted
+    /// out of the PCZT at the action index the request named and stored as
+    /// given, so a syntactically valid PCZT for another bundle is stored
+    /// rather than refused; it is caught when the stored signature is verified
+    /// for proving. The store's own check — that the bundle row still carries
+    /// this sighash and `rk` — is about this wallet's state, a bundle rebuilt
+    /// since the request was made, not about the host's bytes.
+    ///
+    /// The write is one atomic idempotent batch: every named bundle is stored
+    /// or none is, and a retry after a QR session that was interrupted halfway
+    /// reports what was already there rather than failing on it.
     pub(super) fn store_keystone_signatures(
         &self,
         signed: Vec<KeystoneSignedBundleDto>,
