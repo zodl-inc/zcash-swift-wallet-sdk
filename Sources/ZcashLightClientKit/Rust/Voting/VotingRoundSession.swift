@@ -173,6 +173,14 @@ public final class VotingRoundSession: @unchecked Sendable {
     /// The whole batch is resolved against the bound roster before anything is
     /// written, so a decision for a proposal outside it leaves durable intent
     /// untouched.
+    ///
+    /// - Important: ``setupBundles()`` must have run on this round first. An
+    /// intent is recorded against the round's row, and `setupBundles()` is what
+    /// creates that row — it writes it before it reads the wallet, so the row
+    /// survives even the refusal an account with nothing eligible gets. Called
+    /// on a round the sidecar has never seen, this fails on that foreign key
+    /// and arrives as ``VotingErrorKind/storage`` carrying the sidecar's own
+    /// message, which says nothing about the ordering.
     public func setBallotIntents(_ intents: [VotingBallotIntent]) throws -> VotingRoundPlan {
         let json = try VotingRustBackend.encodeJSON(intents, describing: "ballot intents")
 

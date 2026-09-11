@@ -202,9 +202,27 @@ let session = try await synchronizer.makeVotingRoundSession(
     epoch: operationEpoch
 )
 
-// Record the ballot against the roster the host authenticated, then lay out the
-// bundles it needs. Both answer the refreshed plan.
-var plan = try session.setBallotIntents([
+// Lay the round out before recording anything against it. `setupBundles()` is
+// what creates the round's row — it writes the row before it reads the wallet —
+// and every later write needs that row: a `setBallotIntents` on a round the
+// sidecar has never seen fails on its foreign key as `VotingErrorKind.storage`.
+var plan = try session.plan()
+if plan.needsDraftSetup || plan.needsBundleSetup {
+    do {
+        _ = try await session.setupBundles()
+    } catch let error as VotingError {
+        // An account with nothing eligible is a state to show, not a fault, and
+        // the round row it created survives the refusal — so the ballot can
+        // still be recorded below.
+        guard error.kind == .noSpendableNotes || error.kind == .insufficientEligibility else { throw error }
+        showNotEligible()
+    }
+}
+
+// Record the ballot against the roster the host authenticated; it answers the
+// refreshed plan. A round whose bundles could not be laid out yet still owes
+// them, and says so through `needsBundleSetup`.
+plan = try session.setBallotIntents([
     VotingBallotIntent(proposalId: 1, decision: .choice(0)),
     VotingBallotIntent(proposalId: 2, decision: .skipped)
 ])
