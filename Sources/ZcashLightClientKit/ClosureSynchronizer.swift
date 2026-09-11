@@ -205,6 +205,16 @@ public protocol ClosureSynchronizer {
 
     func estimateBirthdayHeight(for date: Date, completion: @escaping (BlockHeight) -> Void)
 
+    // swiftlint:disable:next function_parameter_count
+    func makeVotingRoundSession(
+        backend: VotingRustBackend,
+        inputs: VotingSessionInputs,
+        binding: VotingSessionBinding,
+        route: VotingTransportRoute,
+        epoch: UInt64,
+        completion: @escaping (Result<VotingRoundSession, Error>) -> Void
+    )
+
     func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8, completion: @escaping (Result<(data: Data, response: HTTPURLResponse), Error>) -> Void)
 
     var broadcaster: Broadcaster { get }

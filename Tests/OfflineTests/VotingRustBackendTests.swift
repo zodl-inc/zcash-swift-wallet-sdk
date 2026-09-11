@@ -6,18 +6,6 @@
 import XCTest
 @testable import ZcashLightClientKit
 
-/// A well-formed round id carrying `tag` in its first byte.
-///
-/// The remaining 31 bytes are zero, so the little-endian value is `tag` itself:
-/// a canonical Pallas base-field encoding, which is what the crate requires of
-/// every round id. One tag per test keeps rounds distinct within a store.
-///
-/// Deliberately not `private`: `VotingRoundSessionTests` names its rounds the
-/// same way, and two copies of this would be two things to keep in step.
-func hexRoundId(_ tag: UInt8) -> String {
-    String(format: "%02x", tag) + String(repeating: "00", count: 31)
-}
-
 /// The store half of the voting FFI: the database-bound reads and maintenance
 /// calls a host makes without a round session, plus the process-wide proving
 /// configuration.

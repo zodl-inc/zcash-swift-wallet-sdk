@@ -4,32 +4,9 @@
 //
 
 import XCTest
-import SwiftProtobuf
-@testable import TestUtils
 @testable import ZcashLightClientKit
 
-/// Snapshot height every fixture here votes at.
-///
-/// Not arbitrary: note selection resolves the voting note version from the
-/// snapshot height and the crate accepts only Ironwood (NU6.3) notes, so a
-/// height below that activation is refused before the wallet is read at all.
-/// This one is above NU6.3 on testnet (4_134_000) and mainnet (3_428_143).
-private let votingSnapshotHeight: UInt64 = 4_200_000
-
-/// Port 9 is the discard port: nothing listens, and a connection to loopback
-/// there is refused at once rather than hanging. Opening a session dials
-/// nothing, so this is never contacted; it exists so a test that accidentally
-/// performs I/O fails fast instead of reaching a real host.
-private let unroutableEndpoint = "http://127.0.0.1:9/"
-
 private let sessionWalletId = "voting-session-tests"
-
-/// A fixture that cannot be built is a failure rather than an unsupported
-/// environment: `XCTFail` records where, and throwing this stops the test
-/// instead of letting it run against half a wallet.
-private enum VotingFixtureFailure: Error {
-    case walletDatabaseNotInitialized
-}
 
 /// The wallet a round reads notes from, the sidecar it persists to, and the
 /// session over both.
@@ -50,85 +27,15 @@ final class VotingRoundSessionTests: XCTestCase {
     // MARK: - Fixture
 
     private func makeFixture(tag: UInt8) async throws -> VotingSessionFixture {
-        let root = Environment.uniqueTestTempDirectory
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
-
-        let walletDb = root.appendingPathComponent("data.db")
-        let rustBackend = ZcashRustBackend.makeForTests(
-            dbData: walletDb,
-            fsBlockDbRoot: root.appendingPathComponent("fsblocks"),
-            networkType: .testnet
+        let environment = try await makeVotingSessionEnvironment(tag: tag, walletId: sessionWalletId)
+        let session = try environment.backend.makeSession(
+            inputs: environment.inputs,
+            binding: environment.binding,
+            torRuntime: nil,
+            epoch: 1
         )
 
-        let initialized = try await rustBackend.initDataDb(seed: nil)
-        guard case .success = initialized else {
-            XCTFail("the fixture wallet database did not initialize: \(initialized)")
-            throw VotingFixtureFailure.walletDatabaseNotInitialized
-        }
-
-        // A birthday one block above the snapshot puts the wallet's fully
-        // scanned height — the block below the birthday, with no scanned
-        // blocks — at or above the round's snapshot, which the crate requires
-        // before it will select notes at all.
-        _ = try await rustBackend.createAccount(
-            seed: Environment.seedBytes,
-            treeState: treeState(height: votingSnapshotHeight + 1),
-            recoverUntil: nil,
-            name: "voting",
-            keySource: nil
-        )
-
-        let accounts = try await rustBackend.listAccounts()
-        let account = try XCTUnwrap(accounts.first, "the fixture wallet holds no account")
-
-        let backend = VotingRustBackend()
-        let sidecar = root.appendingPathComponent("voting.sqlite3")
-        try backend.open(path: sidecar.path, networkId: NetworkType.testnet.networkId)
-        addTeardownBlock { backend.close() }
-        try backend.setWalletId(sessionWalletId)
-
-        let roundId = hexRoundId(tag)
-        let inputs = VotingSessionInputs(
-            accountUUID: try account.id.votingUUIDString(),
-            walletDbPath: walletDb.path,
-            roundParams: VotingRoundParameters(
-                voteRoundId: roundId,
-                snapshotHeight: votingSnapshotHeight,
-                eaPk: Data(repeating: 7, count: 32),
-                ncRoot: Data(repeating: 8, count: 32),
-                nullifierImtRoot: Data(repeating: 9, count: 32)
-            ),
-            roundName: "synthetic round \(tag)",
-            anchorTreeState: try treeState(height: votingSnapshotHeight).serializedData(),
-            chainEndpoints: [unroutableEndpoint],
-            voteTreeNodeUrls: [unroutableEndpoint],
-            helperUrls: [unroutableEndpoint],
-            pirEndpoints: [unroutableEndpoint],
-            // The production layout the crate compiles against. Not decorative:
-            // the fleet validates it against YPIR's minima, so a made-up shape
-            // fails at session open.
-            pirLayout: VotingPirLayout(pirDepth: 19, tier0Layers: 12, tier1Layers: 7, polyLen: 4096),
-            ceremonyStartSeconds: 1_000,
-            voteEndTimeSeconds: 2_000_000_000
-        )
-        let binding = VotingSessionBinding(roster: [VotingProposalRosterEntry(proposalId: 1, numOptions: 3)])
-
-        let session = try backend.makeSession(inputs: inputs, binding: binding, torRuntime: nil, epoch: 1)
-        return VotingSessionFixture(backend: backend, session: session, roundId: roundId)
-    }
-
-    /// A lightwalletd `TreeState` for `height` with empty commitment trees.
-    ///
-    /// Empty tree strings decode to empty trees rather than failing, so this
-    /// serves as a usable anchor and a usable account birthday without real
-    /// frontier bytes. The hash is 32 zero bytes because the wallet parses it.
-    private func treeState(height: UInt64) -> TreeState {
-        var state = TreeState()
-        state.network = "test"
-        state.height = height
-        state.hash = String(repeating: "00", count: 32)
-        return state
+        return VotingSessionFixture(backend: environment.backend, session: session, roundId: environment.roundId)
     }
 
     /// The refusal a wallet with nothing to vote with produces. Which of the
@@ -179,7 +86,7 @@ final class VotingRoundSessionTests: XCTestCase {
         let rounds = try fixture.backend.listRounds()
         XCTAssertEqual(rounds.map(\.roundId), [fixture.roundId])
         XCTAssertEqual(rounds.first?.walletId, sessionWalletId)
-        XCTAssertEqual(rounds.first?.snapshotHeight, votingSnapshotHeight)
+        XCTAssertEqual(rounds.first?.snapshotHeight, votingFixtureSnapshotHeight)
         XCTAssertEqual(try fixture.backend.keystoneSignatures(roundId: fixture.roundId), [])
 
         let storePlan = try fixture.backend.roundPlan(roundId: fixture.roundId, proposalIds: [1])

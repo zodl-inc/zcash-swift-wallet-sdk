@@ -72,6 +72,22 @@ public actor TorClient {
         return runtimePtr
     }
 
+    /// Open a voting round session that rides this client's Tor runtime.
+    ///
+    /// The runtime is lent for the duration of the call only: the crate takes
+    /// an isolated client of its own while opening, so the round's circuits are
+    /// not linkable to the rest of the wallet's Tor use and this actor keeps
+    /// sole ownership of the runtime it can later close. Nothing here reaches
+    /// the network.
+    func makeVotingRoundSession(
+        backend: VotingRustBackend,
+        inputs: VotingSessionInputs,
+        binding: VotingSessionBinding,
+        epoch: UInt64
+    ) throws -> VotingRoundSession {
+        try backend.makeSession(inputs: inputs, binding: binding, torRuntime: resolveRuntime(), epoch: epoch)
+    }
+
     public func isolatedClient() throws -> TorClient {
         let runtime = try resolveRuntime()
 

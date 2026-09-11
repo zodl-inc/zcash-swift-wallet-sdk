@@ -648,6 +648,29 @@ public protocol Synchronizer: AnyObject {
     ///    - retryLimit: How many times the request will be retried in case of failure
     func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse)
 
+    /// Open a voting round session on the explicitly selected route.
+    ///
+    /// The route is fixed for the session's whole life. `.tor` requires an
+    /// enabled Tor client and never falls back to a direct connection: a
+    /// synchronizer that cannot provide one throws rather than opening the
+    /// round over plain HTTP. The Tor runtime stays owned by the synchronizer —
+    /// it is lent to the crate for the duration of this call, which reaches no
+    /// network.
+    ///
+    /// - Parameters:
+    ///    - backend: The voting backend whose sidecar the round persists to.
+    ///    - inputs: The round's parameters and endpoints.
+    ///    - binding: The proposal roster the session is bound to.
+    ///    - route: Which route the session's chain and helper traffic takes.
+    ///    - epoch: The submission epoch the session starts at.
+    func makeVotingRoundSession(
+        backend: VotingRustBackend,
+        inputs: VotingSessionInputs,
+        binding: VotingSessionBinding,
+        route: VotingTransportRoute,
+        epoch: UInt64
+    ) async throws -> VotingRoundSession
+
     /// Performs an `sql` query on a database and returns some output as a string
     /// Use cautiously!
     /// The connection to the database is created in a read-only mode. it's a hard requirement.
@@ -1565,6 +1588,26 @@ private final class UnimplementedBroadcaster: Broadcaster {
 }
 
 public extension Synchronizer {
+    /// Alternate conformers open direct-route sessions and explicitly refuse the Tor route.
+    ///
+    /// Only a conformer that owns a Tor client can open a round on Tor, and the refusal is the
+    /// point: falling through to the direct route would put a voter who asked for Tor on plain
+    /// HTTP without saying so.
+    func makeVotingRoundSession(
+        backend: VotingRustBackend,
+        inputs: VotingSessionInputs,
+        binding: VotingSessionBinding,
+        route: VotingTransportRoute,
+        epoch: UInt64
+    ) async throws -> VotingRoundSession {
+        switch route {
+        case .direct:
+            return try backend.makeSession(inputs: inputs, binding: binding, torRuntime: nil, epoch: epoch)
+        case .tor:
+            throw ZcashError.torClientUnavailable
+        }
+    }
+
     /// Alternate synchronizer implementations that do not provide a durable local snapshot remain
     /// source-compatible and report that the capability is unavailable.
     func getLocalAccountBalances() async throws -> [AccountUUID: AccountBalance]? {
@@ -1796,6 +1839,27 @@ public extension Synchronizer {
 }
 
 public extension ClosureSynchronizer {
+    /// Alternate conformers open direct-route sessions and explicitly refuse the Tor route,
+    /// matching `Synchronizer`'s own default.
+    // swiftlint:disable:next function_parameter_count
+    func makeVotingRoundSession(
+        backend: VotingRustBackend,
+        inputs: VotingSessionInputs,
+        binding: VotingSessionBinding,
+        route: VotingTransportRoute,
+        epoch: UInt64,
+        completion: @escaping (Result<VotingRoundSession, Error>) -> Void
+    ) {
+        AsyncToClosureGateway.executeThrowingAction(completion) {
+            switch route {
+            case .direct:
+                return try backend.makeSession(inputs: inputs, binding: binding, torRuntime: nil, epoch: epoch)
+            case .tor:
+                throw ZcashError.torClientUnavailable
+            }
+        }
+    }
+
     /// Default implementation so adding `broadcaster` to the protocol is not a
     /// source-breaking change for downstream conformers. Conformers with broadcast
     /// support override this; mocks, stubs, and alternate transports can fall
@@ -1817,6 +1881,25 @@ public extension ClosureSynchronizer {
 }
 
 public extension CombineSynchronizer {
+    /// Alternate conformers open direct-route sessions and explicitly refuse the Tor route,
+    /// matching `Synchronizer`'s own default.
+    func makeVotingRoundSession(
+        backend: VotingRustBackend,
+        inputs: VotingSessionInputs,
+        binding: VotingSessionBinding,
+        route: VotingTransportRoute,
+        epoch: UInt64
+    ) -> SinglePublisher<VotingRoundSession, Error> {
+        AsyncToCombineGateway.executeThrowingAction {
+            switch route {
+            case .direct:
+                return try backend.makeSession(inputs: inputs, binding: binding, torRuntime: nil, epoch: epoch)
+            case .tor:
+                throw ZcashError.torClientUnavailable
+            }
+        }
+    }
+
     /// Default implementation so adding `broadcaster` to the protocol is not a
     /// source-breaking change for downstream conformers. Conformers with broadcast
     /// support override this; mocks, stubs, and alternate transports can fall

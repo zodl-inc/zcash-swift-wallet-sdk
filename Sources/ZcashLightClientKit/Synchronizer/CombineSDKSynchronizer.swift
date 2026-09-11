@@ -303,6 +303,24 @@ extension CombineSDKSynchronizer: CombineSynchronizer {
         return subject.eraseToAnyPublisher()
     }
 
+    public func makeVotingRoundSession(
+        backend: VotingRustBackend,
+        inputs: VotingSessionInputs,
+        binding: VotingSessionBinding,
+        route: VotingTransportRoute,
+        epoch: UInt64
+    ) -> SinglePublisher<VotingRoundSession, Error> {
+        AsyncToCombineGateway.executeThrowingAction {
+            try await self.synchronizer.makeVotingRoundSession(
+                backend: backend,
+                inputs: inputs,
+                binding: binding,
+                route: route,
+                epoch: epoch
+            )
+        }
+    }
+
     public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) -> SinglePublisher<(data: Data, response: HTTPURLResponse), Error> {
         AsyncToCombineGateway.executeThrowingAction() {
             try await self.synchronizer.httpRequestOverTor(for: request, retryLimit: retryLimit)
