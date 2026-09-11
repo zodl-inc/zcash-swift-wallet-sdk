@@ -2767,6 +2767,40 @@ public actor SlipstreamSynchronizer: Synchronizer {
         return await sdkFlags.torClientInitializationSuccessfullyDone
     }
 
+    /// This synchronizer owns a Tor client of its own, so it makes the Tor decision itself
+    /// rather than taking the protocol default's blanket refusal — the same gate and the same
+    /// ownership as `SDKSynchronizer`. The runtime never leaves the `TorClient` actor: it opens
+    /// the session, and the crate takes an isolated client of its own while doing so.
+    public func makeVotingRoundSession(
+        backend: VotingRustBackend,
+        inputs: VotingSessionInputs,
+        binding: VotingSessionBinding,
+        route: VotingTransportRoute,
+        epoch: UInt64
+    ) async throws -> VotingRoundSession {
+        switch route {
+        case .direct:
+            return try backend.makeSession(inputs: inputs, binding: binding, torRuntime: nil, epoch: epoch)
+        case .tor:
+            let sdkFlags = initializer.container.resolve(SDKFlags.self)
+            let torEnabled = await sdkFlags.torEnabled
+            let exchangeRateEnabled = await sdkFlags.exchangeRateEnabled
+
+            guard torEnabled || exchangeRateEnabled else {
+                throw ZcashError.torNotEnabled
+            }
+
+            let torClient = initializer.container.resolve(TorClient.self)
+
+            return try await torClient.makeVotingRoundSession(
+                backend: backend,
+                inputs: inputs,
+                binding: binding,
+                epoch: epoch
+            )
+        }
+    }
+
     public func httpRequestOverTor(for request: URLRequest, retryLimit: UInt8) async throws -> (data: Data, response: HTTPURLResponse) {
         let sdkFlags = initializer.container.resolve(SDKFlags.self)
         let torEnabled = await sdkFlags.torEnabled

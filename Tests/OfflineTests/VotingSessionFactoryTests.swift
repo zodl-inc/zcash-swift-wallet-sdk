@@ -68,6 +68,50 @@ final class VotingSessionFactoryTests: ZcashTestCase {
         await session.close()
     }
 
+    // MARK: - Slipstream
+
+    /// `SlipstreamSynchronizer` owns a Tor client of its own, so it makes the same decision
+    /// `SDKSynchronizer` makes rather than falling through to the protocol default. The two
+    /// refusals are distinguishable on purpose: `torClientUnavailable` here would mean a
+    /// synchronizer that has Tor is reporting that it has none.
+    func testSlipstreamRefusesTheTorRouteWhenTorIsDisabled() async throws {
+        let environment = try await makeVotingSessionEnvironment(tag: 0x55, walletId: walletId)
+        let synchronizer = SlipstreamSynchronizer(initializer: try makeSlipstreamInitializer())
+
+        do {
+            _ = try await synchronizer.makeVotingRoundSession(
+                backend: environment.backend,
+                inputs: environment.inputs,
+                binding: environment.binding,
+                route: .tor,
+                epoch: 1
+            )
+            XCTFail("a synchronizer with Tor disabled cannot open a round on Tor")
+        } catch let error as ZcashError {
+            guard case .torNotEnabled = error else {
+                return XCTFail("expected torNotEnabled, got \(error)")
+            }
+        }
+
+        XCTAssertEqual(try environment.backend.listRounds(), [])
+    }
+
+    func testSlipstreamOpensADirectSessionForTheSyntheticRound() async throws {
+        let environment = try await makeVotingSessionEnvironment(tag: 0x56, walletId: walletId)
+        let synchronizer = SlipstreamSynchronizer(initializer: try makeSlipstreamInitializer())
+
+        let session = try await synchronizer.makeVotingRoundSession(
+            backend: environment.backend,
+            inputs: environment.inputs,
+            binding: environment.binding,
+            route: .direct,
+            epoch: 1
+        )
+
+        XCTAssertEqual(session.roundId, environment.roundId)
+        await session.close()
+    }
+
     // MARK: - Adapters
 
     /// The closure and Combine adapters are pass-throughs; what they have to
@@ -173,6 +217,27 @@ final class VotingSessionFactoryTests: ZcashTestCase {
         )
 
         return SDKSynchronizer(initializer: initializer)
+    }
+
+    /// A throwaway `Initializer` over temp databases, with both Tor flags off — the engine
+    /// handle is never opened, matching how the Slipstream offline suites build one.
+    private func makeSlipstreamInitializer() throws -> Initializer {
+        let databases = TemporaryDbBuilder.build()
+
+        return Initializer(
+            cacheDbURL: nil,
+            fsBlockDbRoot: databases.fsCacheDbRoot,
+            generalStorageURL: databases.generalStorageURL,
+            dataDbURL: databases.dataDB,
+            torDirURL: databases.torDir,
+            endpoint: LightWalletEndpointBuilder.default,
+            network: ZcashNetworkBuilder.network(for: .testnet),
+            spendParamsURL: try __spendParamsURL(),
+            outputParamsURL: try __outputParamsURL(),
+            saplingParamsSourceURL: SaplingParamsSourceURL.tests,
+            isTorEnabled: false,
+            isExchangeRateEnabled: false
+        )
     }
 
     /// The one value a `SinglePublisher` carries, or the failure it completes
