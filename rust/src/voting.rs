@@ -1,27 +1,26 @@
-//! C FFI for the voting functionality, backed by upstream `zcash_voting` 1.0.
+//! C FFI for coinholder voting.
 //!
-//! Implementation is split into submodules for navigation. Exported FFI functions
-//! keep their stable C symbols with `#[unsafe(no_mangle)]`. Entry points that the
-//! crate's 1.0 one-shot commit flow absorbed (`encrypt_shares`, `sign_cast_vote`,
-//! `store_commitment_bundle`, `decompose_weight`, `generate_delegation_inputs`)
-//! keep their symbols as honest "superseded" error stubs.
+//! The SDK hosts the `zcash_voting` 4.0 native round driver: it owns the
+//! sidecar handle, a per-round session (executor, driver, delegation pipeline,
+//! chain and helper clients, PIR fleet, cancellation control), the transport
+//! route, the wallet-database opener and the software signer. Orchestration,
+//! chain submission, helper delivery, share tracking and recovery planning are
+//! the crate's.
 
-pub mod capability;
-pub mod confirmation;
-mod constants;
-pub mod db;
-pub mod delegation;
+pub mod constants;
+pub mod errors;
 pub mod ffi_types;
 pub mod helpers;
-pub mod json;
-pub mod notes;
-pub mod progress;
-pub mod recovery;
-pub mod rounds;
-pub mod share_tracking;
-pub mod signing;
+pub mod hotkey;
+pub mod keys;
+pub mod route;
+pub mod runtime;
+pub mod session;
+pub mod session_ffi;
+pub mod signer;
+pub mod store;
+pub mod store_ffi;
 #[cfg(test)]
-pub(crate) mod test_helpers;
-pub mod tree;
-pub mod util;
-pub mod vote;
+pub(crate) mod test_support;
+pub mod wallet_access;
+pub mod wire;

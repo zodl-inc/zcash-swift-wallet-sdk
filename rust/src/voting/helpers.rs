@@ -48,6 +48,8 @@ pub(super) unsafe fn str_from_ptr(ptr: *const u8, len: usize) -> anyhow::Result<
 }
 
 /// Return JSON-serialized bytes as `*mut ffi::BoxedSlice`.
+// Consumed by the session and store FFI, which land in a later change.
+#[allow(dead_code)]
 pub(super) fn json_to_boxed_slice<T: Serialize>(
     value: &T,
 ) -> anyhow::Result<*mut crate::ffi::BoxedSlice> {
@@ -60,6 +62,8 @@ pub(super) fn json_to_boxed_slice<T: Serialize>(
 /// The store is parameterized by `NetworkParams` rather than `Network` so that a
 /// custom (modified-mainnet or regtest) chain resolves its consensus parameters
 /// the same way every other `zcashlc_*` entry point does.
+// Consumed by the session and store FFI, which land in a later change.
+#[allow(dead_code)]
 pub(super) fn open_wallet_db(
     wallet_db_path: &str,
     network_id: u32,
@@ -76,19 +80,8 @@ pub(super) fn open_wallet_db(
         .map_err(|e| anyhow!("failed to open wallet DB: {}", e))
 }
 
+// Consumed by the session and store FFI, which land in a later change.
 #[allow(dead_code)]
-pub(super) fn round_phase_to_u32(phase: voting::storage::RoundPhase) -> u32 {
-    use voting::storage::RoundPhase::*;
-
-    match phase {
-        Initialized => 0,
-        HotkeyGenerated => 1,
-        DelegationConstructed => 2,
-        DelegationProved => 3,
-        VoteReady => 4,
-    }
-}
-
 pub(super) fn usk_from_seed(
     network_id: u32,
     seed: &[u8],
@@ -109,12 +102,6 @@ pub(super) fn usk_from_seed(
     Ok(usk)
 }
 
-pub(super) struct HotkeySideInputs {
-    pub(super) g_d_new_x: Vec<u8>,
-    pub(super) pk_d_new_x: Vec<u8>,
-    pub(super) hotkey_raw_address: Vec<u8>,
-}
-
 /// Map the SDK's numeric network id onto `zcash_voting`'s network selector.
 ///
 /// `zcash_voting` replaced the numeric `network_id` convention with a typed
@@ -132,32 +119,6 @@ pub(super) fn voting_network(network_id: u32) -> anyhow::Result<voting::Network>
     }
 }
 
-/// Derive the delegation side inputs implied by a stored voting-hotkey secret.
-///
-/// `hotkey_stored_secret` is the app-owned random material previously returned
-/// as `FfiVotingHotkey::stored_secret`, not wallet seed material: `zcash_voting`
-/// derives the hotkey's Orchard address from it at a fixed account and address
-/// index, so no wallet key derivation is involved.
-pub(super) fn derive_hotkey_side_inputs(
-    hotkey_stored_secret: &[u8],
-    network_id: u32,
-) -> anyhow::Result<HotkeySideInputs> {
-    let network = voting_network(network_id)?;
-    let hotkey = voting::VotingHotkey::from_stored_secret(hotkey_stored_secret, network)
-        .map_err(|e| anyhow!("failed to reconstruct voting hotkey: {}", e))?;
-
-    let hotkey_addr_bytes = hotkey.raw_orchard_address();
-    let (g_d_new_x, pk_d_new_x) =
-        voting::action::derive_hotkey_x_coords_from_raw_address(hotkey_addr_bytes)
-            .map_err(|e| anyhow!("derive_hotkey_x_coords failed: {}", e))?;
-
-    Ok(HotkeySideInputs {
-        g_d_new_x: g_d_new_x.to_vec(),
-        pk_d_new_x: pk_d_new_x.to_vec(),
-        hotkey_raw_address: hotkey_addr_bytes.to_vec(),
-    })
-}
-
 // =============================================================================
 // Internal helpers
 // =============================================================================
@@ -166,7 +127,6 @@ pub(super) fn derive_hotkey_side_inputs(
 ///
 /// The caller owns the returned allocation and must release it with
 /// `zcashlc_voting_free_hotkey`, which zeroizes the secret.
-#[allow(dead_code)]
 pub(super) fn voting_hotkey_to_ffi(
     hotkey: voting::VotingHotkey,
 ) -> anyhow::Result<FfiVotingHotkey> {
