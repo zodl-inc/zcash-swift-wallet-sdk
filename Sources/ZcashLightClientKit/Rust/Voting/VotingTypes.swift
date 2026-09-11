@@ -503,13 +503,41 @@ public enum VotingErrorKind: String, Equatable, Sendable, Decodable {
 /// ``VotingErrorKind/pirUnavailable``. `retryable` says whether the same call
 /// can be repeated as it stands; it is the crate's answer, not an inference
 /// from `kind`.
-public struct VotingError: Error, Equatable, Sendable, Decodable {
+public struct VotingError: Error, Equatable, Sendable, Decodable, LocalizedError {
     public let kind: VotingErrorKind
     public let retryable: Bool
     public let message: String
     public let bundleIndex: UInt32?
     public let httpStatus: UInt16?
     public let endpoint: String?
+
+    /// The crate's own message, which is written to be read by a person, so a
+    /// host with nothing more specific to show can show it.
+    public var errorDescription: String? {
+        message
+    }
+
+    /// A voting failure this SDK raised itself, in the shape the crate uses.
+    ///
+    /// The wrapper refuses a few calls before they reach the FFI — an argument
+    /// whose meaning would silently widen on the way through, say — and a host
+    /// branching on ``kind`` should not have to tell those apart from the
+    /// crate's own refusals.
+    public init(
+        kind: VotingErrorKind,
+        retryable: Bool = false,
+        message: String,
+        bundleIndex: UInt32? = nil,
+        httpStatus: UInt16? = nil,
+        endpoint: String? = nil
+    ) {
+        self.kind = kind
+        self.retryable = retryable
+        self.message = message
+        self.bundleIndex = bundleIndex
+        self.httpStatus = httpStatus
+        self.endpoint = endpoint
+    }
 
     private enum CodingKeys: String, CodingKey {
         case kind
